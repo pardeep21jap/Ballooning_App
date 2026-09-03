@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# BalloonApp requirements
+#
+# Install core dependencies only:
+#   pip install -r requirements.txt
+#
+# The optional/developer extras below are OFF by default. Uncomment the
+# lines you want, or install them individually. The application is designed
+# to start and run its core workflow (manual ballooning, Excel export,
+# ballooned PDF export) even when every optional package is missing.
+# ---------------------------------------------------------------------------
+
+# ---- Core (required) -------------------------------------------------------
+PyQt6>=6.6.0
+PyMuPDF>=1.23.0
+Pillow>=10.0.0
+openpyxl>=3.1.0
+numpy>=1.26.0
+pytesseract>=0.3.10
+opencv-python>=4.9.0
+
+# ---- Optional: future YOLO object-detection model ---------------------------
+# Needed only if you load a trained .pt model in Settings -> Detector.
+# Without this installed, the app silently falls back to the rules/OCR
+# detector -- nothing breaks.
+# ultralytics>=8.1.0
+
+# ---- Optional: convenience data handling ------------------------------------
+# Only used by a couple of manifest/report helpers if present.
+# pandas>=2.1.0
+
+# ---- Developer / testing ----------------------------------------------------
+# pytest>=8.0.0
+
+# ---- Packaging ---------------------------------------------------------------
+# pyinstaller>=6.3.0

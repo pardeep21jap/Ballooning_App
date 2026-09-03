@@ -1,0 +1,50 @@
+## Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+## Virtual environments
+.venv/
+venv/
+env/
+
+## PyInstaller
+*.manifest
+*.spec.bak
+
+## Logs
+*.log
+logs/
+
+## App data (local, user-specific)
+projects/*
+!projects/.gitkeep
+datasets/images/*
+datasets/labels/*
+datasets/crops/*
+datasets/manifests/*
+!datasets/images/.gitkeep
+!datasets/labels/.gitkeep
+!datasets/crops/.gitkeep
+!datasets/manifests/.gitkeep
+models/*.pt
+models/*.onnx
+!models/.gitkeep
+
+## OS / editor
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+*.swp
+
+## Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/

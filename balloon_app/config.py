@@ -1,0 +1,203 @@
+"""Application-wide configuration, paths, and persistent user settings.
+
+All paths are resolved relative to the project root (the directory that
+contains ``main.py``) so the application behaves consistently whether it is
+run with ``python main.py`` or packaged with PyInstaller.
+"""
+
+from __future__ import annotations
+
+import logging
+import logging.handlers
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from PyQt6.QtCore import QSettings
+
+APP_NAME = "BalloonApp"
+APP_ORG = "BalloonApp"
+APP_VERSION = "0.1.0"
+
+
+def get_base_dir() -> Path:
+    """Return the application's base directory.
+
+    When frozen by PyInstaller, resources are unpacked next to the .exe
+    (or in ``sys._MEIPASS`` for the one-file build); otherwise it is the
+    project root two levels above this file (``BalloonApp/``).
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+BASE_DIR = get_base_dir()
+PROJECTS_DIR = BASE_DIR / "projects"
+DATASETS_DIR = BASE_DIR / "datasets"
+DATASETS_IMAGES_DIR = DATASETS_DIR / "images"
+DATASETS_LABELS_DIR = DATASETS_DIR / "labels"
+DATASETS_CROPS_DIR = DATASETS_DIR / "crops"
+DATASETS_MANIFESTS_DIR = DATASETS_DIR / "manifests"
+MODELS_DIR = BASE_DIR / "models"
+LOGS_DIR = BASE_DIR / "logs"
+
+for _dir in (
+    PROJECTS_DIR,
+    DATASETS_IMAGES_DIR,
+    DATASETS_LABELS_DIR,
+    DATASETS_CROPS_DIR,
+    DATASETS_MANIFESTS_DIR,
+    MODELS_DIR,
+    LOGS_DIR,
+):
+    _dir.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Rendering / detection defaults
+# ---------------------------------------------------------------------------
+DEFAULT_RENDER_DPI = 200
+AUTO_BALLOON_DPI = 300
+MIN_ZOOM = 0.1
+MAX_ZOOM = 8.0
+DEFAULT_CONFIDENCE_THRESHOLD = 0.6
+BALLOON_RADIUS_PDF_POINTS = 9.0
+
+RULES_OCR_MODEL_VERSION = "rules_ocr_v1"
+
+# ---------------------------------------------------------------------------
+# Balloon status colors (RGBA) - used consistently across the graphics view,
+# review table, and PDF export.
+# ---------------------------------------------------------------------------
+COLOR_PENDING = (255, 165, 0, 255)       # orange - auto-proposed, pending review
+COLOR_ACCEPTED = (46, 160, 67, 255)      # green
+COLOR_MANUAL = (33, 110, 220, 255)       # blue - manually added
+COLOR_REJECTED = (170, 60, 60, 255)      # muted red
+COLOR_EDITED = (46, 160, 67, 255)        # treated visually like accepted
+COLOR_SELECTED_OUTLINE = (255, 0, 255, 255)  # magenta selection outline
+
+
+def status_color(source: str, status: str) -> tuple[int, int, int, int]:
+    """Return the RGBA display color for a balloon given its source/status."""
+    if status == "rejected":
+        return COLOR_REJECTED
+    if status == "pending":
+        return COLOR_PENDING
+    if source == "manual" and status == "accepted":
+        return COLOR_MANUAL
+    if status in ("accepted", "edited"):
+        return COLOR_ACCEPTED
+    return COLOR_PENDING
+
+
+# ---------------------------------------------------------------------------
+# Characteristic type -> class id mapping for YOLO export. Keep stable once
+# any dataset has been exported, since class ids are baked into label files.
+# ---------------------------------------------------------------------------
+CHARACTERISTIC_CLASSES: list[str] = [
+    "linear_dimension",
+    "diameter",
+    "radius",
+    "angle",
+    "thread",
+    "gdt_frame",
+    "surface_finish",
+    "note",
+    "general_tolerance",
+    "other",
+]
+
+
+@dataclass
+class AppSettings:
+    """User-editable settings, persisted via QSettings (registry-backed)."""
+
+    tesseract_path: str = ""
+    default_dpi: int = DEFAULT_RENDER_DPI
+    auto_balloon_dpi: int = AUTO_BALLOON_DPI
+    confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD
+    yolo_model_path: str = ""
+    use_yolo_if_available: bool = False
+    recent_projects: list[str] = field(default_factory=list)
+    max_recent_projects: int = 10
+
+    @classmethod
+    def load(cls) -> "AppSettings":
+        qs = QSettings(APP_ORG, APP_NAME)
+        recent_raw = qs.value("recent_projects", [], type=list)
+        recent = [str(p) for p in recent_raw] if recent_raw else []
+        return cls(
+            tesseract_path=str(qs.value("tesseract_path", "", type=str)),
+            default_dpi=int(qs.value("default_dpi", DEFAULT_RENDER_DPI, type=int)),
+            auto_balloon_dpi=int(qs.value("auto_balloon_dpi", AUTO_BALLOON_DPI, type=int)),
+            confidence_threshold=float(
+                qs.value("confidence_threshold", DEFAULT_CONFIDENCE_THRESHOLD, type=float)
+            ),
+            yolo_model_path=str(qs.value("yolo_model_path", "", type=str)),
+            use_yolo_if_available=bool(
+                qs.value("use_yolo_if_available", False, type=bool)
+            ),
+            recent_projects=recent,
+        )
+
+    def save(self) -> None:
+        qs = QSettings(APP_ORG, APP_NAME)
+        qs.setValue("tesseract_path", self.tesseract_path)
+        qs.setValue("default_dpi", self.default_dpi)
+        qs.setValue("auto_balloon_dpi", self.auto_balloon_dpi)
+        qs.setValue("confidence_threshold", self.confidence_threshold)
+        qs.setValue("yolo_model_path", self.yolo_model_path)
+        qs.setValue("use_yolo_if_available", self.use_yolo_if_available)
+        qs.setValue("recent_projects", self.recent_projects)
+        qs.sync()
+
+    def add_recent_project(self, path: str) -> None:
+        path = str(path)
+        if path in self.recent_projects:
+            self.recent_projects.remove(path)
+        self.recent_projects.insert(0, path)
+        self.recent_projects = self.recent_projects[: self.max_recent_projects]
+        self.save()
+
+    def effective_tesseract_path(self) -> str | None:
+        """Resolve the Tesseract executable path.
+
+        Priority: explicit setting -> ``TESSERACT_PATH`` env var -> ``None``
+        (meaning "search system PATH", handled by pytesseract itself).
+        """
+        if self.tesseract_path and Path(self.tesseract_path).exists():
+            return self.tesseract_path
+        env_path = os.environ.get("TESSERACT_PATH")
+        if env_path and Path(env_path).exists():
+            return env_path
+        return None
+
+
+def setup_logging() -> logging.Logger:
+    """Configure root logging to a rotating local file plus console."""
+    log_file = LOGS_DIR / "balloon_app.log"
+    logger = logging.getLogger("balloon_app")
+    if logger.handlers:
+        return logger  # already configured (e.g. re-entrant import)
+
+    logger.setLevel(logging.DEBUG)
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file, maxBytes=2_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(fmt)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    logger.propagate = False
+    return logger
