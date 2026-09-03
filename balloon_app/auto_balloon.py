@@ -28,35 +28,61 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import cv2
 import numpy as np
 
 from balloon_app.config import AUTO_BALLOON_DPI, BALLOON_RADIUS_PDF_POINTS, CHARACTERISTIC_CLASSES, RULES_OCR_MODEL_VERSION
 from balloon_app.data_model import Balloon, BalloonSource, CharacteristicType, ReviewStatus
 from balloon_app.ocr_parser import parse_characteristic
-from balloon_app.pdf_engine import PdfDocument, TextBlock, rect_pixel_to_pdf
+from balloon_app.pdf_engine import PdfDocument, TextBlock, rect_pdf_to_pixel, rect_pixel_to_pdf
 
 logger = logging.getLogger("balloon_app.auto_balloon")
 
-_CANDIDATE_HINT_RE = re.compile(
-    r"\d|[⌀ØΦ∅]|±|°|\bRa\b|\bDIA\b|UNC|UNF|UNEF|NPT|\||"
+# A *decimal* number (has a decimal point) is a strong dimension signal.
+# A bare integer is not -- it's just as likely to be a sheet zone marker
+# ("1" "2" "3" "4" along the border), a date fragment, a QTY count, a
+# drawing/part number, or a material temper code ("6061 T6").
+_DECIMAL_NUMBER_RE = re.compile(r"\d+\.\d+|\.\d+")
+_SYMBOL_HINT_RE = re.compile(
+    r"[⌀ØΦ∅]|±|°|\bRa\b|\bDIA\b|"
     r"⏤|⏥|○|⌭|⌒|⌓|⟂|∠|∥|⌯|⌖|◎|↗|⌰|⌇",
     re.IGNORECASE,
 )
+_RADIUS_HINT_RE = re.compile(r"(?<![A-Za-z])R(?![a-zA-Z])\s*\d")
+_METRIC_THREAD_HINT_RE = re.compile(r"\bM\d+\.?\d*\s*[xX×]\s*\d")
+_UNIFIED_THREAD_HINT_RE = re.compile(
+    r"\b\d+(?:/\d+)?\s*-\s*\d+\s*(UNC|UNF|UNEF|UN|NPT|NPTF)\b", re.IGNORECASE
+)
+_PIPE_DATUM_HINT_RE = re.compile(r"\d\s*\|\s*[A-Z]")
+# A short, bare integer with nothing else attached: "1", "2", "23", "(4)".
+# These are almost always zone/sheet/revision markers, not dimensions.
+_BARE_SHORT_INTEGER_RE = re.compile(r"^\(?\d{1,2}\)?$")
 
 
 def _looks_like_characteristic(text: str) -> bool:
     """Cheap pre-filter so we don't propose a balloon for every scrap of text.
 
-    A drawing has plenty of text that is never an inspection characteristic
-    (title-block boilerplate, view labels, revision letters). We only treat
-    a chunk as a candidate if it contains a digit, a recognized dimension
-    symbol, or a known thread/GD&T keyword, and is not implausibly long
-    (a full paragraph of general notes).
+    A drawing has plenty of text that is never an inspection characteristic:
+    title-block boilerplate, drawing/part numbers, dates, QTY counts,
+    material codes, and -- notably -- the zone/grid reference numbers
+    printed along a drawing border (ANSI/ISO sheet format), which are bare
+    1-2 digit integers and would otherwise look exactly like a "candidate".
+    We require either a decimal number, a recognized dimension/GD&T/thread
+    symbol or keyword, and reject bare short integers outright.
     """
     text = text.strip()
     if not text or len(text) > 120:
         return False
-    return bool(_CANDIDATE_HINT_RE.search(text))
+    if _BARE_SHORT_INTEGER_RE.match(text):
+        return False
+    return bool(
+        _DECIMAL_NUMBER_RE.search(text)
+        or _SYMBOL_HINT_RE.search(text)
+        or _RADIUS_HINT_RE.search(text)
+        or _METRIC_THREAD_HINT_RE.search(text)
+        or _UNIFIED_THREAD_HINT_RE.search(text)
+        or _PIPE_DATUM_HINT_RE.search(text)
+    )
 
 
 @dataclass
@@ -255,6 +281,31 @@ def _merge_nearby_text_blocks(blocks: list[TextBlock], y_tol: float = 3.0, x_gap
     return merged
 
 
+def _bbox_has_ink(gray_image: np.ndarray, bbox_px: tuple[float, float, float, float], padding: float = 2.0, min_dark_fraction: float = 0.01) -> bool:
+    """OpenCV-based plausibility check: does this bbox actually cover ink?
+
+    A text span's *reported* bounding box can be wrong for reasons that have
+    nothing to do with our regex logic -- a leftover invisible OCR text
+    layer from a "searchable PDF" conversion, a misaligned/hidden layer, or
+    a bad span union from merging. All of these produce a candidate that
+    looks fine on paper (real digits, plausible bbox) but sits over a blank
+    part of the rendered page. Cross-checking against actual rendered pixels
+    catches this regardless of the underlying cause.
+    """
+    height, width = gray_image.shape[:2]
+    x0 = max(0, int(bbox_px[0] - padding))
+    y0 = max(0, int(bbox_px[1] - padding))
+    x1 = min(width, int(bbox_px[2] + padding))
+    y1 = min(height, int(bbox_px[3] + padding))
+    if x1 <= x0 or y1 <= y0:
+        return False
+    region = gray_image[y0:y1, x0:x1]
+    if region.size == 0:
+        return False
+    dark_pixels = int(np.count_nonzero(region < 200))
+    return (dark_pixels / region.size) >= min_dark_fraction
+
+
 def _placement_point(
     bbox: tuple[float, float, float, float],
     occupied: list[tuple[float, float]],
@@ -301,6 +352,18 @@ def auto_balloon_page(
     """
     candidates: list[Detection] = []
 
+    # Render once up front: used both as the OCR fallback's input image and
+    # to sanity-check (via OpenCV) that every candidate -- native-text or
+    # OCR -- actually sits over visible ink, not a blank part of the page.
+    gray_image: Optional[np.ndarray] = None
+    rendered_image: Optional[np.ndarray] = None
+    try:
+        rgb_bytes, width, height = pdf_doc.render_page_rgb(page_number, dpi)
+        rendered_image = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(height, width, 3)
+        gray_image = cv2.cvtColor(rendered_image, cv2.COLOR_RGB2GRAY)
+    except Exception:
+        logger.exception("Failed to render page %d for auto-balloon", page_number)
+
     try:
         native_blocks = pdf_doc.extract_text_blocks(page_number)
     except Exception:
@@ -308,8 +371,14 @@ def auto_balloon_page(
         native_blocks = []
 
     for block in _merge_nearby_text_blocks(native_blocks):
-        if _looks_like_characteristic(block.text):
-            candidates.append(Detection(bbox=block.bbox, label="", confidence=0.0, raw_text=block.text))
+        if not _looks_like_characteristic(block.text):
+            continue
+        if gray_image is not None:
+            bbox_px = rect_pdf_to_pixel(block.bbox, dpi)
+            if not _bbox_has_ink(gray_image, bbox_px):
+                logger.debug("Discarding candidate with no ink under its bbox: %r", block.text)
+                continue
+        candidates.append(Detection(bbox=block.bbox, label="", confidence=0.0, raw_text=block.text))
 
     used_ocr = False
     ocr_available = True
@@ -323,24 +392,20 @@ def auto_balloon_page(
                 "This page has no selectable text and OCR is unavailable. "
                 "Add balloons manually for this page."
             )
+        elif rendered_image is None:
+            message = "Failed to render this page for OCR."
         else:
             used_ocr = True
-            try:
-                rgb_bytes, width, height = pdf_doc.render_page_rgb(page_number, dpi)
-                image = np.frombuffer(rgb_bytes, dtype=np.uint8).reshape(height, width, 3)
-            except Exception:
-                logger.exception("Failed to render page %d for OCR", page_number)
-                image = None
-
-            if image is not None:
-                raw_detections = active_detector.detect(image)
-                for det in raw_detections:
-                    bbox_pdf = rect_pixel_to_pdf(det.bbox, dpi)
-                    candidates.append(
-                        Detection(bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text)
-                    )
-                if not raw_detections:
-                    message = "OCR ran but found no recognizable dimensions/tolerances on this page."
+            raw_detections = active_detector.detect(rendered_image)
+            for det in raw_detections:
+                # OCR boxes are inherently ink-backed (Tesseract only reports
+                # boxes where it found glyphs), so no extra ink check needed.
+                bbox_pdf = rect_pixel_to_pdf(det.bbox, dpi)
+                candidates.append(
+                    Detection(bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text)
+                )
+            if not raw_detections:
+                message = "OCR ran but found no recognizable dimensions/tolerances on this page."
 
     candidates = candidates[:300]  # sanity cap against pathological pages
     candidates.sort(key=lambda d: (round(d.bbox[1] / 10.0), d.bbox[0]))

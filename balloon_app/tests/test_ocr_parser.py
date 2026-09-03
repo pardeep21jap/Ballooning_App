@@ -145,6 +145,33 @@ class TestGeneralToleranceAndFallback:
         assert result.confidence == 0.0
 
 
+class TestAutoBalloonPreFilter:
+    """Regression coverage for balloon_app.auto_balloon._looks_like_characteristic.
+
+    These specific strings were observed causing false-positive balloons on
+    a real title-blocked drawing: bare sheet zone markers, dates, QTY
+    counts, drawing numbers, and material temper codes.
+    """
+
+    def test_rejects_bare_zone_markers(self):
+        from balloon_app.auto_balloon import _looks_like_characteristic
+
+        for text in ["1", "2", "3", "4", "(1)", "23"]:
+            assert _looks_like_characteristic(text) is False, text
+
+    def test_rejects_title_block_noise(self):
+        from balloon_app.auto_balloon import _looks_like_characteristic
+
+        for text in ["3/23/2004", "QTY: 4", "A1539", "6061 T6"]:
+            assert _looks_like_characteristic(text) is False, text
+
+    def test_accepts_real_dimensions(self):
+        from balloon_app.auto_balloon import _looks_like_characteristic
+
+        for text in ["19.43", "0.25", "0.063", "0.75", "R5", "Ø25", "M6 x 1.0", "1/4-20 UNC", "45°"]:
+            assert _looks_like_characteristic(text) is True, text
+
+
 class TestComputeLimits:
     def test_symmetric(self):
         lower, upper = compute_limits(10.0, 0.1, 0.1)
