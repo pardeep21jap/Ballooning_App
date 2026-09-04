@@ -9,6 +9,7 @@ import pytest
 
 from balloon_app.auto_balloon import _bbox_has_ink, auto_balloon_page
 from balloon_app.data_model import CharacteristicType
+from balloon_app.ocr_parser import DefaultTolerances
 from balloon_app.pdf_engine import PdfDocument
 
 fitz = pytest.importorskip("pymupdf")
@@ -157,3 +158,152 @@ class TestCompoundThreadDepthCallout:
             CharacteristicType.DEPTH.value,
             CharacteristicType.THREAD.value,
         ])
+
+
+class TestDefaultTolerances:
+    def test_default_tolerance_backfills_dimension_without_explicit_tolerance(self, tmp_path):
+        """A dimension with no tolerance of its own (e.g. "9X Ø0.250 THRU",
+        relying on the drawing's title-block "X.XXX: ±0.005" note) must get
+        that default tolerance and matching limits when one is supplied.
+        """
+        pdf_path = tmp_path / "no_explicit_tolerance.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 200), "9X Ø0.250 THRU", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        defaults = DefaultTolerances(three_decimal=0.005)
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200, default_tolerances=defaults)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.char_type == CharacteristicType.DIAMETER.value
+        assert balloon.nominal == pytest.approx(0.25)
+        assert balloon.tol_plus == pytest.approx(0.005)
+        assert balloon.tol_minus == pytest.approx(0.005)
+        assert balloon.lower_limit == pytest.approx(0.245)
+        assert balloon.upper_limit == pytest.approx(0.255)
+
+    def test_no_default_tolerances_leaves_dimension_untoleranced(self, tmp_path):
+        pdf_path = tmp_path / "no_defaults_passed.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 200), "9X Ø0.250 THRU", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert result.balloons[0].tol_plus is None
+
+
+class TestCountersinkDiameterAngleCallout:
+    def test_countersink_diameter_and_angle_produce_two_balloons(self, tmp_path):
+        """A countersink callout packs a diameter and an included angle into
+        one line, e.g. "CSK Ø0.507 X 82°" -- must produce two balloons
+        (Countersink diameter, Angle) instead of dropping the angle.
+        """
+        pdf_path = tmp_path / "countersink.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 190), "CSK Ø0.507 X 82°", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 2
+        diameter, angle = result.balloons
+        assert diameter.char_type == CharacteristicType.COUNTERSINK.value
+        assert diameter.nominal == pytest.approx(0.507)
+        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert angle.nominal == pytest.approx(82)
+
+    def test_both_shape_symbols_mangled_still_splits_and_picks_diameter_default(self, tmp_path):
+        """Real-world case: the countersink symbol extracted as "w" and the
+        diameter symbol as "n" (both unrecognizable), leaving raw text
+        "w n 0.507 X 82°". Must still produce two balloons (a value typed
+        as Countersink, and an Angle), with raw_text rewritten to the
+        canonical symbols -- and, critically, the diameter must pick up a
+        *decimal-place* default tolerance, not the angular one (the bug
+        that produced a nonsensical ±0.5 on a 0.507 diameter).
+        """
+        pdf_path = tmp_path / "mangled_countersink.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 190), "w n 0.507 X 82°", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        defaults = DefaultTolerances(three_decimal=0.005, angular=0.5)
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200, default_tolerances=defaults)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 2
+        value, angle = result.balloons
+        assert value.char_type == CharacteristicType.COUNTERSINK.value
+        assert value.nominal == pytest.approx(0.507)
+        assert value.raw_text == "⌵⌀0.507 X 82°"
+        assert value.tol_plus == pytest.approx(0.005)  # decimal-place default, not angular
+        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert angle.nominal == pytest.approx(82)
+
+
+class TestTitleBlockExclusion:
+    def test_title_block_note_is_not_ballooned(self, tmp_path):
+        """A drawing's title block (numeric tolerance table, fractional
+        callouts, etc.) must never be auto-ballooned, even though its text
+        would otherwise look exactly like real dimensions/tolerances.
+        """
+        pdf_path = tmp_path / "with_title_block.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=800)
+        # A real dimension, well above the title block.
+        page.insert_text((50, 200), "0.750 ±0.005", fontsize=12)
+        # The title block: bottom strip of the sheet, ANSI-style.
+        page.insert_text((50, 700), "TOLERANCES UNLESS OTHERWISE NOTED", fontsize=10)
+        page.insert_text((50, 715), "FRACTIONAL: 1/64  DECIMAL: X.XX: 0.0100", fontsize=10)
+        page.insert_text((50, 730), "ANGLES: 0.5  FINISH: 125 MICRO INCHES", fontsize=10)
+        page.insert_text((50, 745), "DRAWN: vernon  DATE: 2/20/2004", fontsize=10)
+        page.insert_text((400, 745), "A2048", fontsize=10)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = [b.raw_text for b in result.balloons]
+        assert any("0.750" in t for t in raw_texts)
+        assert not any("TOLERANCES" in t or "FRACTIONAL" in t or "A2048" in t for t in raw_texts)
+
+    def test_no_title_block_keywords_leaves_page_unaffected(self, tmp_path):
+        pdf_path = tmp_path / "no_title_block.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=800)
+        page.insert_text((50, 200), "0.750 ±0.005", fontsize=12)
+        page.insert_text((50, 700), "0.500 ±0.010", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = [b.raw_text for b in result.balloons]
+        assert any("0.750" in t for t in raw_texts)
+        assert any("0.500" in t for t in raw_texts)

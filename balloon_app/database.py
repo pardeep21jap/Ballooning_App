@@ -52,6 +52,12 @@ CREATE TABLE IF NOT EXISTS drawing (
     page_count INTEGER,
     date_added TEXT,
     last_known_good_path TEXT,
+    tol_one_decimal REAL,
+    tol_two_decimal REAL,
+    tol_three_decimal REAL,
+    tol_four_decimal REAL,
+    tol_angular REAL,
+    tolerances_configured INTEGER,
     FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
 );
 
@@ -113,6 +119,7 @@ class ProjectDatabase:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
         self._migrate_project_columns()
+        self._migrate_drawing_columns()
         self._conn.commit()
 
     def _migrate_project_columns(self) -> None:
@@ -130,6 +137,22 @@ class ProjectDatabase:
         for column, sql_type in new_columns.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE project ADD COLUMN {column} {sql_type}")
+
+    def _migrate_drawing_columns(self) -> None:
+        """Add drawing columns introduced after a project file's schema was created."""
+        assert self._conn is not None
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(drawing)")}
+        new_columns = {
+            "tol_one_decimal": "REAL",
+            "tol_two_decimal": "REAL",
+            "tol_three_decimal": "REAL",
+            "tol_four_decimal": "REAL",
+            "tol_angular": "REAL",
+            "tolerances_configured": "INTEGER",
+        }
+        for column, sql_type in new_columns.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE drawing ADD COLUMN {column} {sql_type}")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -184,8 +207,10 @@ class ProjectDatabase:
                     conn.execute(
                         """INSERT INTO drawing
                            (id, project_id, file_name, original_path, page_count,
-                            date_added, last_known_good_path)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                            date_added, last_known_good_path,
+                            tol_one_decimal, tol_two_decimal, tol_three_decimal,
+                            tol_four_decimal, tol_angular, tolerances_configured)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             d.id,
                             project.id,
@@ -194,6 +219,12 @@ class ProjectDatabase:
                             d.page_count,
                             d.date_added,
                             d.last_known_good_path,
+                            d.tol_one_decimal,
+                            d.tol_two_decimal,
+                            d.tol_three_decimal,
+                            d.tol_four_decimal,
+                            d.tol_angular,
+                            int(d.tolerances_configured),
                         ),
                     )
 
@@ -261,6 +292,12 @@ class ProjectDatabase:
                     page_count=drow["page_count"] or 0,
                     date_added=drow["date_added"] or "",
                     last_known_good_path=drow["last_known_good_path"] or "",
+                    tol_one_decimal=drow["tol_one_decimal"],
+                    tol_two_decimal=drow["tol_two_decimal"],
+                    tol_three_decimal=drow["tol_three_decimal"],
+                    tol_four_decimal=drow["tol_four_decimal"],
+                    tol_angular=drow["tol_angular"],
+                    tolerances_configured=bool(drow["tolerances_configured"]),
                 )
             )
 

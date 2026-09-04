@@ -185,6 +185,18 @@ class Drawing:
     date_added: str = field(default_factory=_now_iso)
     last_known_good_path: str = ""
 
+    # Default/general tolerance table (this drawing's "TOLERANCES UNLESS
+    # OTHERWISE NOTED" convention), keyed by decimal-place count, plus a
+    # separate angular tolerance -- applied to any auto-detected dimension
+    # that has no explicit tolerance of its own. `tolerances_configured`
+    # distinguishes "reviewed and left blank on purpose" from "never asked".
+    tol_one_decimal: Optional[float] = None
+    tol_two_decimal: Optional[float] = None
+    tol_three_decimal: Optional[float] = None
+    tol_four_decimal: Optional[float] = None
+    tol_angular: Optional[float] = None
+    tolerances_configured: bool = False
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

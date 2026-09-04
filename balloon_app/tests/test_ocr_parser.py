@@ -5,7 +5,15 @@ from __future__ import annotations
 import math
 
 from balloon_app.data_model import CharacteristicType
-from balloon_app.ocr_parser import compute_limits, parse_characteristic, parse_characteristics
+from balloon_app.ocr_parser import (
+    DefaultTolerances,
+    ParsedCharacteristic,
+    apply_default_tolerance,
+    compute_limits,
+    parse_characteristic,
+    parse_characteristics,
+    parse_default_tolerances,
+)
 
 
 def _close(a, b, tol=1e-6):
@@ -99,6 +107,58 @@ class TestHoleFeatureModifiers:
         result = parse_characteristic("⌵⌀0.500 X 82°")
         assert result.char_type == CharacteristicType.COUNTERSINK.value
 
+    def test_countersink_diameter_with_angle_splits_into_two(self):
+        # "⌵ Ø0.507 X 82°" -- a countersink's diameter and its included
+        # angle, checked with different gauges, packed into one line.
+        results = parse_characteristics("⌵Ø0.507 X 82°")
+        assert len(results) == 2
+        diameter, angle = results
+        assert diameter.char_type == CharacteristicType.COUNTERSINK.value
+        assert _close(diameter.nominal, 0.507)
+        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert _close(angle.nominal, 82)
+
+    def test_counterbore_diameter_with_angle_splits_into_two(self):
+        results = parse_characteristics("⌴Ø0.750 X 90°")
+        assert len(results) == 2
+        assert results[0].char_type == CharacteristicType.COUNTERBORE.value
+        assert results[1].char_type == CharacteristicType.ANGLE.value
+        assert _close(results[1].nominal, 90)
+
+    def test_bare_diameter_with_trailing_angle_splits_into_two(self):
+        results = parse_characteristics("Ø0.500 X 82°")
+        assert len(results) == 2
+        assert results[0].char_type == CharacteristicType.DIAMETER.value
+        assert results[1].char_type == CharacteristicType.ANGLE.value
+
+    def test_angle_alone_is_not_mistaken_for_a_compound_callout(self):
+        # No preceding shape symbol -- a plain angle dimension must stay one.
+        results = parse_characteristics("45° ±1°")
+        assert len(results) == 1
+        assert results[0].char_type == CharacteristicType.ANGLE.value
+
+    def test_both_shape_symbols_mangled_still_splits_value_and_angle(self):
+        # Real-world case: the countersink symbol extracted as "w" and the
+        # diameter symbol as "n" -- neither recognizable -- but "0.507 X
+        # 82°" is still an unambiguous value-times-angle structural shape,
+        # which is specifically the countersink notation. raw_text is
+        # rewritten to the canonical symbols since the mangled letters
+        # carry no real information.
+        results = parse_characteristics("w n 0.507 X 82°")
+        assert len(results) == 2
+        value, angle = results
+        assert value.char_type == CharacteristicType.COUNTERSINK.value
+        assert _close(value.nominal, 0.507)
+        assert value.raw_text == "⌵⌀0.507 X 82°"
+        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert _close(angle.nominal, 82)
+        assert angle.raw_text == "⌵⌀0.507 X 82°"
+
+    def test_qty_prefixed_tolerance_dimension_not_mistaken_for_value_angle(self):
+        # No degree sign at all -- must not trigger the value-then-angle fallback.
+        results = parse_characteristics("2X 0.500 ±0.010")
+        assert len(results) == 1
+
     def test_countersink_keyword(self):
         result = parse_characteristic("CSK 0.500 X 82")
         assert result.char_type == CharacteristicType.COUNTERSINK.value
@@ -147,8 +207,10 @@ class TestHoleFeatureModifiers:
         diameter, depth = results
         assert diameter.char_type == CharacteristicType.DIAMETER.value
         assert _close(diameter.nominal, 0.089)
+        assert diameter.raw_text == "2X ⌀0.089 ▼0.500"
         assert depth.char_type == CharacteristicType.DEPTH.value
         assert _close(depth.nominal, 0.5)
+        assert depth.raw_text == "2X ⌀0.089 ▼0.500"
 
     def test_qty_prefix_does_not_contaminate_single_value_nominal(self):
         # "9X n0.250 THRU" -- diameter symbol mangled and no second numeric
@@ -302,3 +364,74 @@ class TestComputeLimits:
         lower, upper = compute_limits(None, 0.1, 0.1)
         assert lower is None
         assert upper is None
+
+
+class TestParseDefaultTolerances:
+    TITLE_BLOCK = (
+        "TOLERANCES UNLESS OTHERWISE NOTED\n"
+        "FRACTIONAL  0\"-6\": ±1/64   6\"-24\": ±1/32\n"
+        "DECIMAL:  X.X: ±0.1000   X.XX: ±0.0100\n"
+        "          X.XXX: ±0.0050  X.XXXX: ±0.0001\n"
+        "ANGLES: ±0.5°  FINISH: 125 MICRO INCHES\n"
+    )
+
+    def test_extracts_all_decimal_places_and_angle(self):
+        result = parse_default_tolerances(self.TITLE_BLOCK)
+        assert _close(result.one_decimal, 0.1000)
+        assert _close(result.two_decimal, 0.0100)
+        assert _close(result.three_decimal, 0.0050)
+        assert _close(result.four_decimal, 0.0001)
+        assert _close(result.angular, 0.5)
+
+    def test_no_title_block_gives_empty_result(self):
+        result = parse_default_tolerances("PIC PULLEY, BALL SCREW\nA1219")
+        assert result.is_empty()
+
+
+class TestApplyDefaultTolerance:
+    DEFAULTS = DefaultTolerances(one_decimal=0.1, two_decimal=0.01, three_decimal=0.005, angular=0.5)
+
+    def test_three_decimal_diameter_gets_matching_default(self):
+        parsed = ParsedCharacteristic(
+            char_type=CharacteristicType.DIAMETER.value, nominal=0.25, nominal_text="0.250",
+        )
+        result = apply_default_tolerance(parsed, self.DEFAULTS)
+        assert _close(result.tol_plus, 0.005)
+        assert _close(result.tol_minus, 0.005)
+        assert _close(result.lower_limit, 0.245)
+        assert _close(result.upper_limit, 0.255)
+
+    def test_two_decimal_vs_three_decimal_pick_different_defaults(self):
+        two = apply_default_tolerance(
+            ParsedCharacteristic(char_type=CharacteristicType.LINEAR_DIMENSION.value, nominal=0.25, nominal_text="0.25"),
+            self.DEFAULTS,
+        )
+        three = apply_default_tolerance(
+            ParsedCharacteristic(char_type=CharacteristicType.LINEAR_DIMENSION.value, nominal=0.25, nominal_text="0.250"),
+            self.DEFAULTS,
+        )
+        assert _close(two.tol_plus, 0.01)
+        assert _close(three.tol_plus, 0.005)
+
+    def test_angle_uses_angular_default(self):
+        parsed = ParsedCharacteristic(char_type=CharacteristicType.ANGLE.value, nominal=82.0, nominal_text="82")
+        result = apply_default_tolerance(parsed, self.DEFAULTS)
+        assert _close(result.tol_plus, 0.5)
+
+    def test_explicit_tolerance_is_never_overwritten(self):
+        parsed = ParsedCharacteristic(
+            char_type=CharacteristicType.DIAMETER.value, nominal=0.25, nominal_text="0.250",
+            tol_plus=0.02, tol_minus=0.02,
+        )
+        result = apply_default_tolerance(parsed, self.DEFAULTS)
+        assert _close(result.tol_plus, 0.02)
+
+    def test_note_and_thread_types_are_never_defaulted(self):
+        parsed = ParsedCharacteristic(char_type=CharacteristicType.THREAD.value, nominal=None, nominal_text=None)
+        result = apply_default_tolerance(parsed, self.DEFAULTS)
+        assert result.tol_plus is None
+
+    def test_empty_defaults_leaves_parsed_unchanged(self):
+        parsed = ParsedCharacteristic(char_type=CharacteristicType.DIAMETER.value, nominal=0.25, nominal_text="0.250")
+        result = apply_default_tolerance(parsed, DefaultTolerances())
+        assert result.tol_plus is None

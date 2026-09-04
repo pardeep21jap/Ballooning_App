@@ -106,6 +106,56 @@ class BalloonItem(QGraphicsObject):
         self.dragFinished.emit(self.balloon_id)
 
 
+class LeaderHandleItem(QGraphicsObject):
+    """A small draggable square marking a leader line's start point (the end
+    that touches the drawing feature, as opposed to the end at the balloon).
+
+    Distinct from :class:`BalloonItem` mainly in shape (a diamond, so it
+    reads as "not the balloon" at a glance) and in not carrying a number.
+    """
+
+    moved = pyqtSignal(str, QPointF)
+    dragFinished = pyqtSignal(str)
+
+    def __init__(self, balloon_id: str, half_size: float):
+        super().__init__()
+        self.balloon_id = balloon_id
+        self.half_size = half_size
+        self._emit_moves = True
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+            | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setZValue(9.0)
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.setToolTip("Drag to move the leader line's start point.")
+
+    def boundingRect(self) -> QRectF:
+        r = self.half_size + 2
+        return QRectF(-r, -r, 2 * r, 2 * r)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: D102
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(20, 20, 20))
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 230)))
+        s = self.half_size
+        painter.drawPolygon([QPointF(0, -s), QPointF(s, 0), QPointF(0, s), QPointF(-s, 0)])
+
+    def set_emit_moves(self, enabled: bool) -> None:
+        self._emit_moves = enabled
+
+    def itemChange(self, change, value):  # noqa: D102
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged and self._emit_moves:
+            self.moved.emit(self.balloon_id, self.pos())
+        return super().itemChange(change, value)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: D102
+        super().mouseReleaseEvent(event)
+        self.dragFinished.emit(self.balloon_id)
+
+
 class _RenderWorker(QObject):
     """Runs PyMuPDF page rendering on a dedicated background thread."""
 
@@ -146,6 +196,9 @@ class PdfGraphicsView(QGraphicsView):
     balloonDoubleClicked = pyqtSignal(str)
     newBalloonRequested = pyqtSignal(float, float)
     leaderPointPicked = pyqtSignal(str, float, float)
+    leaderHandleMoved = pyqtSignal(str, float, float)
+    leaderHandleDragFinished = pyqtSignal(str)
+    emptySpaceClicked = pyqtSignal()
     statusMessage = pyqtSignal(str)
     renderStarted = pyqtSignal()
     renderFinished = pyqtSignal()
@@ -166,6 +219,8 @@ class PdfGraphicsView(QGraphicsView):
         self._effective_dpi = ACTUAL_SIZE_DPI
         self._balloon_items: dict[str, BalloonItem] = {}
         self._leader_items: dict[str, QGraphicsLineItem] = {}
+        self._leader_handle_items: dict[str, LeaderHandleItem] = {}
+        self._selected_balloon_id: Optional[str] = None
         self._current_balloons: list[Balloon] = []
 
         self.add_balloon_mode = False
@@ -173,6 +228,7 @@ class PdfGraphicsView(QGraphicsView):
 
         self._panning = False
         self._pan_start_pos = None
+        self._click_start_pos = None
 
         self._request_counter = 0
         self._latest_request_id = -1
@@ -330,6 +386,8 @@ class PdfGraphicsView(QGraphicsView):
                 self._scene.removeItem(self._balloon_items.pop(stale_id))
                 if stale_id in self._leader_items:
                     self._scene.removeItem(self._leader_items.pop(stale_id))
+                if stale_id in self._leader_handle_items:
+                    self._scene.removeItem(self._leader_handle_items.pop(stale_id))
 
         for balloon in page_balloons:
             px, py = pdf_to_pixel(balloon.x, balloon.y, dpi)
@@ -365,9 +423,25 @@ class PdfGraphicsView(QGraphicsView):
                     self._scene.addItem(line_item)
                     self._leader_items[balloon.id] = line_item
                 line_item.setLine(lx, ly, px, py)
-            elif line_item is not None:
-                self._scene.removeItem(line_item)
-                del self._leader_items[balloon.id]
+
+                handle = self._leader_handle_items.get(balloon.id)
+                if handle is None:
+                    handle = LeaderHandleItem(balloon.id, half_size=radius_px * 0.4)
+                    handle.setVisible(balloon.id == self._selected_balloon_id)
+                    handle.moved.connect(self._on_leader_handle_item_moved)
+                    handle.dragFinished.connect(self.leaderHandleDragFinished.emit)
+                    self._scene.addItem(handle)
+                    self._leader_handle_items[balloon.id] = handle
+                handle.set_emit_moves(False)
+                handle.half_size = radius_px * 0.4
+                handle.setPos(lx, ly)
+                handle.set_emit_moves(True)
+            else:
+                if line_item is not None:
+                    self._scene.removeItem(line_item)
+                    del self._leader_items[balloon.id]
+                if balloon.id in self._leader_handle_items:
+                    self._scene.removeItem(self._leader_handle_items.pop(balloon.id))
 
     def _on_item_moved(self, balloon_id: str, scene_pos: QPointF) -> None:
         # NOTE: deliberately does not trigger a full _sync_balloon_items() resync
@@ -385,9 +459,24 @@ class PdfGraphicsView(QGraphicsView):
             line = line_item.line()
             line_item.setLine(line.x1(), line.y1(), scene_pos.x(), scene_pos.y())
 
+    def _on_leader_handle_item_moved(self, balloon_id: str, scene_pos: QPointF) -> None:
+        # Mirrors _on_item_moved above, but for the leader line's *start*
+        # point: only the line's live endpoint is updated here, not the
+        # model -- the caller persists the new position once dragging ends.
+        dpi = self._last_render_dpi()
+        pdf_x, pdf_y = pixel_to_pdf(scene_pos.x(), scene_pos.y(), dpi)
+        self.leaderHandleMoved.emit(balloon_id, pdf_x, pdf_y)
+        line_item = self._leader_items.get(balloon_id)
+        if line_item is not None:
+            line = line_item.line()
+            line_item.setLine(scene_pos.x(), scene_pos.y(), line.x2(), line.y2())
+
     def select_balloon(self, balloon_id: Optional[str]) -> None:
+        self._selected_balloon_id = balloon_id
         for bid, item in self._balloon_items.items():
             item.setSelected(bid == balloon_id)
+        for bid, handle in self._leader_handle_items.items():
+            handle.setVisible(bid == balloon_id)
 
     # ------------------------------------------------------------------
     # Mouse interaction: manual panning + add-balloon / leader picking
@@ -407,12 +496,13 @@ class PdfGraphicsView(QGraphicsView):
                 self.leaderPointPicked.emit(self.leader_mode_balloon_id, pdf_x, pdf_y)
                 return
 
-            if isinstance(item, BalloonItem):
+            if isinstance(item, (BalloonItem, LeaderHandleItem)):
                 super().mousePressEvent(event)
                 return
 
             self._panning = True
             self._pan_start_pos = event.pos()
+            self._click_start_pos = event.pos()  # fixed, to distinguish a click from a pan-drag
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             return
 
@@ -432,7 +522,13 @@ class PdfGraphicsView(QGraphicsView):
     def mouseReleaseEvent(self, event) -> None:  # noqa: D102
         if event.button() == Qt.MouseButton.LeftButton and self._panning:
             self._panning = False
-            self._pan_start_pos = None
             self.setCursor(Qt.CursorShape.ArrowCursor)
+            # A press-release on empty space with negligible movement is a
+            # click, not a pan-drag -- deselect whatever balloon was selected
+            # (and its leader handle) rather than leaving it selected forever.
+            if self._click_start_pos is not None and (event.pos() - self._click_start_pos).manhattanLength() <= 4:
+                self.emptySpaceClicked.emit()
+            self._pan_start_pos = None
+            self._click_start_pos = None
             return
         super().mouseReleaseEvent(event)

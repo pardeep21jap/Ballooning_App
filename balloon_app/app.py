@@ -51,6 +51,7 @@ from balloon_app.dialogs import (
     AboutDialog,
     BalloonEditDialog,
     ConfidenceThresholdDialog,
+    DefaultTolerancesDialog,
     ExportExcelOptionsDialog,
     ExportPdfOptionsDialog,
     NewProjectDialog,
@@ -60,7 +61,7 @@ from balloon_app.dialogs import (
     TeachTrainingDialog,
 )
 from balloon_app.excel_export import export_excel
-from balloon_app.ocr_parser import parse_characteristics
+from balloon_app.ocr_parser import DefaultTolerances, parse_characteristics, parse_default_tolerances
 from balloon_app.pdf_engine import PdfDocument, PdfLoadError
 from balloon_app.pdf_export import PdfExportResult, export_ballooned_pdf, resolve_source_path
 from balloon_app.pdf_view import PdfGraphicsView
@@ -84,11 +85,15 @@ def _sanitize_filename(name: str) -> str:
 def _auto_balloon_page_task(
     source_path: Path, drawing_id: str, page_number: int, existing: list[Balloon],
     start_number: int, dpi: float, tesseract_path: Optional[str],
+    default_tolerances: Optional[DefaultTolerances] = None,
 ) -> AutoBalloonResult:
     doc = PdfDocument(source_path)
     doc.open()
     try:
-        return auto_balloon_page(doc, drawing_id, page_number, existing, start_number, dpi=dpi, tesseract_path=tesseract_path)
+        return auto_balloon_page(
+            doc, drawing_id, page_number, existing, start_number, dpi=dpi,
+            tesseract_path=tesseract_path, default_tolerances=default_tolerances,
+        )
     finally:
         doc.close()
 
@@ -96,6 +101,7 @@ def _auto_balloon_page_task(
 def _auto_balloon_drawing_task(
     source_path: Path, drawing_id: str, page_count: int, existing: list[Balloon],
     start_number: int, dpi: float, tesseract_path: Optional[str],
+    default_tolerances: Optional[DefaultTolerances] = None,
 ) -> list[AutoBalloonResult]:
     doc = PdfDocument(source_path)
     doc.open()
@@ -104,7 +110,10 @@ def _auto_balloon_drawing_task(
         number = start_number
         running_existing = list(existing)
         for page_number in range(page_count):
-            result = auto_balloon_page(doc, drawing_id, page_number, running_existing, number, dpi=dpi, tesseract_path=tesseract_path)
+            result = auto_balloon_page(
+                doc, drawing_id, page_number, running_existing, number, dpi=dpi,
+                tesseract_path=tesseract_path, default_tolerances=default_tolerances,
+            )
             results.append(result)
             running_existing = running_existing + result.balloons
             number += len(result.balloons)
@@ -267,6 +276,38 @@ class _CallableWorker(QThread):
         self.finished_ok.emit(result)
 
 
+class ReviewTable(QTableWidget):
+    """A :class:`QTableWidget` with drag-and-drop row reordering.
+
+    Qt's built-in ``InternalMove`` drag-drop moves individual *items*, not
+    whole rows, which corrupts a multi-column table like this one. Instead,
+    this only detects "row A was dropped onto row B" and hands it to a
+    callback -- the caller is expected to recompute balloon numbers from
+    the intended order and fully repaint the table from data, rather than
+    letting Qt attempt the move itself.
+    """
+
+    def __init__(self, rows: int, columns: int, on_rows_dropped, parent: Optional[QWidget] = None):
+        super().__init__(rows, columns, parent)
+        self._on_rows_dropped = on_rows_dropped
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(True)
+
+    def dropEvent(self, event) -> None:
+        if event.source() is not self:
+            super().dropEvent(event)
+            return
+        source_row = self.currentRow()
+        target_row = self.indexAt(event.position().toPoint()).row()
+        if target_row == -1:
+            target_row = self.rowCount() - 1
+        event.ignore()  # the table is repainted from data by the callback, not by Qt
+        if source_row == -1 or target_row == -1 or source_row == target_row:
+            return
+        self._on_rows_dropped(source_row, target_row)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -283,6 +324,8 @@ class MainWindow(QMainWindow):
         self._drag_start_snapshots: dict[str, dict] = {}
         self._drag_session_ids: dict[str, int] = {}
         self._drag_session_counter = 0
+        self._leader_drag_start_snapshots: dict[str, dict] = {}
+        self._leader_drag_session_ids: dict[str, int] = {}
 
         self.undo_stack = QUndoStack(self)
         self.undo_stack.indexChanged.connect(lambda _i: self._update_window_title())
@@ -307,6 +350,9 @@ class MainWindow(QMainWindow):
         self.pdf_view.balloonDragFinished.connect(self._on_balloon_drag_finished)
         self.pdf_view.newBalloonRequested.connect(self._on_new_balloon_requested)
         self.pdf_view.leaderPointPicked.connect(self._on_leader_point_picked)
+        self.pdf_view.leaderHandleMoved.connect(self._on_leader_handle_moved)
+        self.pdf_view.leaderHandleDragFinished.connect(self._on_leader_handle_drag_finished)
+        self.pdf_view.emptySpaceClicked.connect(self._on_empty_space_clicked)
         self.pdf_view.renderStarted.connect(lambda: self._set_busy(True, "Rendering page..."))
         self.pdf_view.renderFinished.connect(lambda: self._set_busy(False))
 
@@ -350,7 +396,7 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.search_edit)
         layout.addLayout(search_row)
 
-        self.review_table = QTableWidget(0, 9)
+        self.review_table = ReviewTable(0, 9, self._on_review_rows_dropped)
         self.review_table.setHorizontalHeaderLabels(
             ["Balloon #", "Page", "Type", "Raw Text", "Nominal", "Tolerance", "GD&T", "Confidence", "Status"]
         )
@@ -360,6 +406,10 @@ class MainWindow(QMainWindow):
         self.review_table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.review_table.doubleClicked.connect(lambda _i: self._edit_selected_balloon())
         layout.addWidget(self.review_table, stretch=1)
+
+        reorder_hint = QLabel("Drag a row to renumber balloons to match (Filter must be \"All\").")
+        reorder_hint.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addWidget(reorder_hint)
 
         row1 = QHBoxLayout()
         accept_btn = QPushButton("Accept")
@@ -540,6 +590,10 @@ class MainWindow(QMainWindow):
         auto_drawing_act = QAction("Auto-Balloon Entire Drawing", self)
         auto_drawing_act.triggered.connect(self._auto_balloon_entire_drawing)
         tools_menu.addAction(auto_drawing_act)
+
+        default_tol_act = QAction("Default Tolerances...", self)
+        default_tol_act.triggered.connect(self._edit_default_tolerances)
+        tools_menu.addAction(default_tol_act)
 
         tools_menu.addSeparator()
         review_act = QAction("Review", self)
@@ -1036,8 +1090,48 @@ class MainWindow(QMainWindow):
         self._drag_start_snapshots.pop(balloon_id, None)
         self._drag_session_ids.pop(balloon_id, None)
 
+    def _on_leader_handle_moved(self, balloon_id: str, pdf_x: float, pdf_y: float) -> None:
+        """Dragging a leader line's start point (see LeaderHandleItem). Mirrors
+        _on_balloon_moved's mergeable-undo-per-gesture pattern; dragging a
+        leader line that was only implicitly anchored to the balloon's bbox
+        center makes it an explicit, independently-movable point from here on.
+        """
+        balloon = self._find_balloon(balloon_id)
+        if balloon is None or self.project is None:
+            return
+        if balloon_id not in self._leader_drag_start_snapshots:
+            self._leader_drag_start_snapshots[balloon_id] = {
+                "leader_x": balloon.leader_x, "leader_y": balloon.leader_y,
+            }
+            self._drag_session_counter += 1
+            self._leader_drag_session_ids[balloon_id] = self._drag_session_counter
+        balloon.leader_x = pdf_x
+        balloon.leader_y = pdf_y
+        balloon.touch()
+        self._mark_dirty()
+        before = {balloon_id: self._leader_drag_start_snapshots[balloon_id]}
+        after = {balloon_id: {"leader_x": pdf_x, "leader_y": pdf_y}}
+        cmd = BalloonFieldChangeCommand(
+            self.project, [balloon_id], before, after, lambda: None, text="Move Leader Point",
+            merge_session_id=self._leader_drag_session_ids[balloon_id],
+        )
+        self.undo_stack.push(cmd)
+
+    def _on_leader_handle_drag_finished(self, balloon_id: str) -> None:
+        self._leader_drag_start_snapshots.pop(balloon_id, None)
+        self._leader_drag_session_ids.pop(balloon_id, None)
+
     def _on_canvas_balloon_selected(self, balloon_id: str) -> None:
         self._select_table_row_for_balloon(balloon_id)
+        # _select_table_row_for_balloon blocks the table's own signals (to
+        # avoid re-triggering this same handler in a loop), so the usual
+        # itemSelectionChanged -> select_balloon path never fires here --
+        # do it directly so the leader-handle diamond still shows up.
+        self.pdf_view.select_balloon(balloon_id)
+
+    def _on_empty_space_clicked(self) -> None:
+        self.review_table.clearSelection()
+        self.pdf_view.select_balloon(None)
 
     def _select_table_row_for_balloon(self, balloon_id: str) -> None:
         for row in range(self.review_table.rowCount()):
@@ -1367,12 +1461,111 @@ class MainWindow(QMainWindow):
         self.undo_stack.push(cmd)
         self._refresh_all()
 
+    def _on_review_rows_dropped(self, source_row: int, target_row: int) -> None:
+        """Handle a drag-and-drop row reorder in the review table: renumber
+        every balloon for this drawing to match the row's new position.
+
+        Only safe when the table is showing every balloon for the drawing
+        (Filter = "All") -- a filtered view is a subset, and renumbering it
+        to 1..N would collide with the numbers of the balloons hidden by
+        the filter.
+        """
+        if self.project is None or self.drawing is None:
+            return
+        if self.filter_combo.currentText() != "All":
+            self.statusBar().showMessage('Set Filter to "All" to drag-reorder balloon numbers.', 6000)
+            return
+
+        displayed = self._filtered_sorted_balloons()
+        if source_row >= len(displayed) or target_row >= len(displayed):
+            return
+
+        ordered_ids = [b.id for b in displayed]
+        moved_id = ordered_ids.pop(source_row)
+        ordered_ids.insert(target_row, moved_id)
+
+        by_id = {b.id: b for b in displayed}
+        before = {bid: {"number": by_id[bid].number} for bid in ordered_ids}
+        for i, bid in enumerate(ordered_ids, start=1):
+            by_id[bid].number = i
+            by_id[bid].touch()
+        after = {bid: {"number": by_id[bid].number} for bid in ordered_ids}
+
+        cmd = BalloonFieldChangeCommand(self.project, ordered_ids, before, after, self._refresh_all, text="Reorder Balloons")
+        self.undo_stack.push(cmd)
+        self._refresh_all()
+
     def _focus_review_panel(self) -> None:
         self.search_edit.setFocus()
 
     # ------------------------------------------------------------------
     # Auto-ballooning
     # ------------------------------------------------------------------
+    def _ensure_default_tolerances(self) -> DefaultTolerances:
+        """The first time a drawing is auto-ballooned, offer to set its
+        general/default tolerance table (best-effort auto-detected from the
+        current page's title block, reviewable/editable before use), then
+        remember the choice on the Drawing so this isn't asked again.
+        """
+        if self.drawing is None:
+            return DefaultTolerances()
+        if self.drawing.tolerances_configured:
+            return DefaultTolerances(
+                one_decimal=self.drawing.tol_one_decimal,
+                two_decimal=self.drawing.tol_two_decimal,
+                three_decimal=self.drawing.tol_three_decimal,
+                four_decimal=self.drawing.tol_four_decimal,
+                angular=self.drawing.tol_angular,
+            )
+
+        page_text = ""
+        if self.pdf_doc is not None:
+            try:
+                blocks = self.pdf_doc.extract_text_blocks(self.current_page)
+                page_text = "\n".join(b.text for b in blocks)
+            except Exception:
+                logger.exception("Failed to extract page text for default-tolerance detection")
+        detected = parse_default_tolerances(page_text)
+
+        dialog = DefaultTolerancesDialog(
+            detected.one_decimal, detected.two_decimal, detected.three_decimal,
+            detected.four_decimal, detected.angular,
+            auto_detected=not detected.is_empty(), parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return DefaultTolerances()  # skip for this run only -- ask again next time
+
+        self._apply_tolerance_dialog_values(dialog)
+        return DefaultTolerances(
+            one_decimal=self.drawing.tol_one_decimal,
+            two_decimal=self.drawing.tol_two_decimal,
+            three_decimal=self.drawing.tol_three_decimal,
+            four_decimal=self.drawing.tol_four_decimal,
+            angular=self.drawing.tol_angular,
+        )
+
+    def _apply_tolerance_dialog_values(self, dialog: DefaultTolerancesDialog) -> None:
+        values = dialog.values()
+        self.drawing.tol_one_decimal = values["tol_one_decimal"]
+        self.drawing.tol_two_decimal = values["tol_two_decimal"]
+        self.drawing.tol_three_decimal = values["tol_three_decimal"]
+        self.drawing.tol_four_decimal = values["tol_four_decimal"]
+        self.drawing.tol_angular = values["tol_angular"]
+        self.drawing.tolerances_configured = True
+        self._mark_dirty()
+
+    def _edit_default_tolerances(self) -> None:
+        if self.project is None or self.drawing is None:
+            QMessageBox.information(self, "No Drawing", "Open or add a PDF drawing first.")
+            return
+        dialog = DefaultTolerancesDialog(
+            self.drawing.tol_one_decimal, self.drawing.tol_two_decimal, self.drawing.tol_three_decimal,
+            self.drawing.tol_four_decimal, self.drawing.tol_angular,
+            auto_detected=self.drawing.tolerances_configured, parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._apply_tolerance_dialog_values(dialog)
+
     def _auto_balloon_current_page(self) -> None:
         if self.project is None or self.drawing is None or self.pdf_doc is None:
             QMessageBox.information(self, "No Drawing", "Open or add a PDF drawing first.")
@@ -1381,12 +1574,13 @@ class MainWindow(QMainWindow):
         if source_path is None:
             QMessageBox.warning(self, "Drawing Not Found", "Cannot locate the source PDF. Relink the drawing first.")
             return
+        default_tolerances = self._ensure_default_tolerances()
         existing = self.project.balloons_for(self.drawing.id)
         start_number = self.project.next_balloon_number(self.drawing.id)
         self._run_background(
             _auto_balloon_page_task, self._on_auto_balloon_page_done, "Auto-ballooning current page...",
             source_path, self.drawing.id, self.current_page, existing, start_number,
-            self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(),
+            self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(), default_tolerances,
         )
 
     def _on_auto_balloon_page_done(self, result: AutoBalloonResult) -> None:
@@ -1414,12 +1608,13 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        default_tolerances = self._ensure_default_tolerances()
         existing = self.project.balloons_for(self.drawing.id)
         start_number = self.project.next_balloon_number(self.drawing.id)
         self._run_background(
             _auto_balloon_drawing_task, self._on_auto_balloon_drawing_done, "Auto-ballooning entire drawing...",
             source_path, self.drawing.id, self.drawing.page_count, existing, start_number,
-            self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(),
+            self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(), default_tolerances,
         )
 
     def _on_auto_balloon_drawing_done(self, results: list[AutoBalloonResult]) -> None:

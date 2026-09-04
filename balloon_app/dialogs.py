@@ -179,6 +179,78 @@ def _format_number(value: float) -> str:
     return text if text else "0"
 
 
+class DefaultTolerancesDialog(QDialog):
+    """Collects a drawing's general/default tolerance table -- the
+    "TOLERANCES UNLESS OTHERWISE NOTED" convention, keyed by decimal-place
+    count, plus a separate angular tolerance. Applied automatically, during
+    auto-ballooning, to any detected dimension that has no explicit
+    tolerance of its own.
+    """
+
+    def __init__(
+        self,
+        one_decimal: Optional[float] = None,
+        two_decimal: Optional[float] = None,
+        three_decimal: Optional[float] = None,
+        four_decimal: Optional[float] = None,
+        angular: Optional[float] = None,
+        auto_detected: bool = False,
+        parent: Optional[QWidget] = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Default Tolerances")
+        self.setMinimumWidth(420)
+
+        intro_text = (
+            "Detected from this drawing's title block -- review and adjust if needed."
+            if auto_detected else
+            "Not found on this drawing (or it has no title-block tolerance note). "
+            "Enter values matching the drawing's convention, or leave any of them blank."
+        )
+        intro = QLabel(
+            intro_text + "\n\nApplied automatically to any auto-detected dimension that doesn't "
+            "carry its own explicit tolerance, based on its number of decimal places."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: gray;")
+
+        self.one_edit = _optional_float_line_edit()
+        _set_optional_float(self.one_edit, one_decimal)
+        self.two_edit = _optional_float_line_edit()
+        _set_optional_float(self.two_edit, two_decimal)
+        self.three_edit = _optional_float_line_edit()
+        _set_optional_float(self.three_edit, three_decimal)
+        self.four_edit = _optional_float_line_edit()
+        _set_optional_float(self.four_edit, four_decimal)
+        self.angular_edit = _optional_float_line_edit()
+        _set_optional_float(self.angular_edit, angular)
+
+        form = QFormLayout()
+        form.addRow("X.X   (1 decimal) ±", self.one_edit)
+        form.addRow("X.XX   (2 decimals) ±", self.two_edit)
+        form.addRow("X.XXX   (3 decimals) ±", self.three_edit)
+        form.addRow("X.XXXX   (4 decimals) ±", self.four_edit)
+        form.addRow("Angles ±", self.angular_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            "tol_one_decimal": _parse_optional_float(self.one_edit),
+            "tol_two_decimal": _parse_optional_float(self.two_edit),
+            "tol_three_decimal": _parse_optional_float(self.three_edit),
+            "tol_four_decimal": _parse_optional_float(self.four_edit),
+            "tol_angular": _parse_optional_float(self.angular_edit),
+        }
+
+
 class BalloonEditDialog(QDialog):
     """Full edit form for one balloon's characteristic data.
 

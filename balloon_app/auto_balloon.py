@@ -33,7 +33,12 @@ import numpy as np
 
 from balloon_app.config import AUTO_BALLOON_DPI, BALLOON_RADIUS_PDF_POINTS, CHARACTERISTIC_CLASSES, RULES_OCR_MODEL_VERSION
 from balloon_app.data_model import Balloon, BalloonSource, CharacteristicType, ReviewStatus
-from balloon_app.ocr_parser import parse_characteristic, parse_characteristics
+from balloon_app.ocr_parser import (
+    DefaultTolerances,
+    apply_default_tolerance,
+    parse_characteristic,
+    parse_characteristics,
+)
 from balloon_app.pdf_engine import PdfDocument, TextBlock, rect_pdf_to_pixel, rect_pixel_to_pdf
 
 logger = logging.getLogger("balloon_app.auto_balloon")
@@ -58,6 +63,44 @@ _PIPE_DATUM_HINT_RE = re.compile(r"\d\s*\|\s*[A-Z]")
 # A short, bare integer with nothing else attached: "1", "2", "23", "(4)".
 # These are almost always zone/sheet/revision markers, not dimensions.
 _BARE_SHORT_INTEGER_RE = re.compile(r"^\(?\d{1,2}\)?$")
+
+# Boilerplate phrases that appear only inside a drawing's title block, never
+# as an inspection characteristic in their own right. The title-block note
+# often contains real decimal numbers and symbols (a "TOLERANCES UNLESS
+# OTHERWISE NOTED" table, "±0.5°", fractional tolerances) that would
+# otherwise pass _looks_like_characteristic and get ballooned individually
+# -- see _title_block_cutoff_y below, which uses these to exclude the whole
+# title block region rather than trying to keyword-match every field in it.
+_TITLE_BLOCK_KEYWORDS_RE = re.compile(
+    r"TOLERANCES UNLESS OTHERWISE (NOTED|SPECIFIED)|UNLESS OTHERWISE SPECIFIED|"
+    r"\bDRAWN\b|\bCHECKED\b|\bDESIGNED\b|\bENGINEER(ED)?\b|\bAPPROVED\b|"
+    r"\bTITLE\b|\bSCALE\b|\bSHEET\b|\bQTY\.?\s*:|\bMATERIAL\b|\bFINISH\b|"
+    r"\bPROJECT CODE\b|\bDWG\.?\s*NO\.?\b|\bNEXT ASSY\b|\bDO NOT SCALE\b|"
+    r"\bPROPRIETARY\b|\bCONFIDENTIAL\b|\bINTERPRET (DRAWING|PER)\b|"
+    r"\bBREAK ALL SHARP EDGES\b|\bFRACTIONAL\b",
+    re.IGNORECASE,
+)
+
+
+def _title_block_cutoff_y(blocks: list[TextBlock], page_height: float) -> Optional[float]:
+    """Return a page-y cutoff below which everything is treated as inside
+    the title block, or ``None`` if no title-block boilerplate was found.
+
+    Rather than keyword-matching every individual title-block field (drawing
+    number, revision, company name/logo, dates -- an open-ended list that
+    varies per template), this finds the topmost boilerplate phrase in the
+    bottom half of the page and excludes that whole horizontal strip down
+    to the bottom edge. Matches ANSI/ISO title blocks, which run the full
+    sheet width along the bottom; a title block running the full height
+    along one side instead would need a different heuristic.
+    """
+    matches = [
+        b for b in blocks
+        if b.bbox[1] > page_height * 0.5 and _TITLE_BLOCK_KEYWORDS_RE.search(b.text)
+    ]
+    if not matches:
+        return None
+    return min(b.bbox[1] for b in matches) - 4.0  # small padding above the topmost match
 
 
 def _looks_like_characteristic(text: str) -> bool:
@@ -344,8 +387,14 @@ def auto_balloon_page(
     dpi: float = AUTO_BALLOON_DPI,
     tesseract_path: Optional[str] = None,
     detector: Optional[BaseDetector] = None,
+    default_tolerances: Optional[DefaultTolerances] = None,
 ) -> AutoBalloonResult:
     """Run the full auto-balloon pipeline for a single page.
+
+    ``default_tolerances``, when given, backfills tol_plus/tol_minus (and
+    the resulting limits) on any detected dimension that has a nominal but
+    no explicit tolerance of its own -- e.g. "9X Ø0.250 THRU" relying on the
+    drawing's general "X.XXX: ±0.005" title-block note.
 
     Returns proposed balloons (status=pending, source=auto) plus a status
     message suitable for display in the UI status bar. Never raises for
@@ -371,7 +420,17 @@ def auto_balloon_page(
         logger.exception("Failed to extract native text on page %d", page_number)
         native_blocks = []
 
+    try:
+        _, page_height = pdf_doc.page_size_pdf(page_number)
+    except Exception:
+        page_height = None
+    title_block_cutoff_y = (
+        _title_block_cutoff_y(native_blocks, page_height) if page_height else None
+    )
+
     for block in _merge_nearby_text_blocks(native_blocks):
+        if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
+            continue  # inside the title block -- never a real characteristic
         if not _looks_like_characteristic(block.text):
             continue
         if gray_image is not None:
@@ -402,6 +461,8 @@ def auto_balloon_page(
                 # OCR boxes are inherently ink-backed (Tesseract only reports
                 # boxes where it found glyphs), so no extra ink check needed.
                 bbox_pdf = rect_pixel_to_pdf(det.bbox, dpi)
+                if title_block_cutoff_y is not None and bbox_pdf[1] >= title_block_cutoff_y:
+                    continue  # inside the title block -- never a real characteristic
                 candidates.append(
                     Detection(bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text)
                 )
@@ -421,6 +482,11 @@ def auto_balloon_page(
         # inspected requirement (e.g. a tapped hole's thread class *and* its
         # depth) -- each becomes its own balloon, placed near the same text.
         parsed_list = parse_characteristics(raw_text) if raw_text else [None]
+        if default_tolerances is not None:
+            parsed_list = [
+                apply_default_tolerance(p, default_tolerances) if p is not None else None
+                for p in parsed_list
+            ]
 
         for parsed in parsed_list:
             if parsed is not None:
@@ -444,7 +510,7 @@ def auto_balloon_page(
                 bbox_x1=det.bbox[2],
                 bbox_y1=det.bbox[3],
                 char_type=char_type,
-                raw_text=raw_text,
+                raw_text=parsed.raw_text if parsed is not None else raw_text,
                 nominal=parsed.nominal if parsed else None,
                 tol_plus=parsed.tol_plus if parsed else None,
                 tol_minus=parsed.tol_minus if parsed else None,

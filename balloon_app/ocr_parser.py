@@ -86,7 +86,7 @@ _SQUARE_HINT_RE = re.compile(r"[□]|\bSQ\b|\bSQUARE\b", re.IGNORECASE)
 
 # Paired "symbol/keyword + its own number" extractors, used to pull a shape
 # value back out of a compound callout that also carries a depth (see
-# _try_shape_with_depth below) -- unlike the *_HINT_RE checks above these
+# _try_shape_with_secondary_value below) -- unlike the *_HINT_RE checks above these
 # capture the number that belongs to the shape itself, not just detect that
 # the shape symbol is present somewhere in the text.
 _DIAMETER_VALUE_RE = re.compile(rf"[{_DIAMETER_SYMBOLS}]\s*({NUM})")
@@ -108,8 +108,24 @@ _LEADING_QTY_RE = re.compile(r"^\s*\d+\s*[Xx]\s+")
 # know *which* letters are meant to be symbols, so it is a lower-confidence,
 # purely structural fallback tried only when nothing more specific matched.
 _QTY_TWO_VALUE_RE = re.compile(
-    rf"^\s*\d+\s*[Xx]\s+[A-Za-z]{{0,3}}\s*({NUM})\s+[A-Za-z]{{0,3}}\s*({NUM})\b"
+    rf"^\s*(\d+)\s*[Xx]\s+[A-Za-z]{{0,3}}\s*({NUM})\s+[A-Za-z]{{0,3}}\s*({NUM})\b"
 )
+
+# A number immediately followed by the degree sign, e.g. "82°" in
+# "⌵⌀0.507 X 82°" (a countersink's included angle, following its
+# diameter). Unlike the diameter/depth glyphs, ° (U+00B0) is a plain
+# Latin-1 character that survives CAD PDF font substitution reliably.
+_TRAILING_ANGLE_RE = re.compile(rf"({NUM})\s*°")
+
+# Structural fallback for "<value> X <angle>°" (a countersink/chamfer's
+# diameter times its included angle) when the shape symbol(s) in front of
+# the value are *also* unrecognizable -- e.g. "w n 0.507 X 82°", where both
+# the countersink glyph ("w") and the diameter glyph ("n") were mangled by
+# the drawing's font. Unlike _TRAILING_ANGLE_RE (used once a real shape
+# symbol has already been resolved), this doesn't require recognizing
+# anything at all before the value -- the "X ...°" shape alone is signal
+# enough, since it isn't produced by any other tolerance/dimension format.
+_VALUE_THEN_ANGLE_RE = re.compile(rf"({NUM})\s*[Xx]\s*({NUM})\s*°")
 
 # Numeric tolerance extraction patterns, tried in priority order.
 _ASYM_SLASH_RE = re.compile(rf"({NUM})\s*\+\s*({NUM})\s*/\s*-\s*({NUM})")
@@ -136,6 +152,11 @@ class ParsedCharacteristic:
     char_type: str = CharacteristicType.OTHER.value
     raw_text: str = ""
     nominal: Optional[float] = None
+    # The nominal exactly as printed (e.g. "0.250"), before float conversion
+    # loses the distinction between "0.25" and "0.250" -- needed to pick the
+    # right entry in a decimal-place-keyed default tolerance table. Only
+    # populated where the nominal has no explicit tolerance of its own.
+    nominal_text: Optional[str] = None
     tol_plus: Optional[float] = None
     tol_minus: Optional[float] = None
     lower_limit: Optional[float] = None
@@ -216,6 +237,7 @@ def _extract_numeric_tolerance(text: str) -> Optional[dict]:
     if m:
         return {
             "nominal": _round(float(m.group(1))),
+            "nominal_text": m.group(1),
             "tol_plus": None,
             "tol_minus": None,
             "lower_limit": None,
@@ -253,71 +275,166 @@ def _try_thread(text: str) -> Optional[list[ParsedCharacteristic]]:
                 char_type=CharacteristicType.DEPTH.value,
                 raw_text=text,
                 nominal=_round(float(depth_match.group(1))),
+                nominal_text=depth_match.group(1),
                 confidence=0.8,
             )
         )
     return results
 
 
-def _try_shape_with_depth(text: str) -> Optional[list[ParsedCharacteristic]]:
-    """A shape value paired with a trailing depth callout on the same line,
-
-    e.g. "2X ⌀0.089 ▼0.500" -- a hole's diameter *and* its depth, checked
-    with different gauges -- becomes two characteristics (Diameter, Depth)
-    instead of one, matching how :func:`_try_thread` already splits a
-    thread callout from its trailing depth.
+def _resolve_shape_char_type(text: str) -> Optional[str]:
+    """Priority-ordered shape/hole-modifier type for ``text``, matching the
+    main single-value classification's priority (a counterbore/countersink
+    symbol is more specific than the diameter symbol it precedes). Used to
+    label the "primary" value in a compound shape+depth or shape+angle
+    split -- returns ``None`` when there's no identifiable shape at all.
     """
-    if not _DEPTH_HINT_RE.search(text):
+    if _COUNTERBORE_HINT_RE.search(text):
+        return CharacteristicType.COUNTERBORE.value
+    if _COUNTERSINK_HINT_RE.search(text):
+        return CharacteristicType.COUNTERSINK.value
+    if _SQUARE_HINT_RE.search(text):
+        return CharacteristicType.SQUARE.value
+    if _DIAMETER_RE.search(text):
+        return CharacteristicType.DIAMETER.value
+    if _RADIUS_RE.search(text):
+        return CharacteristicType.RADIUS.value
+    return None
+
+
+def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteristic]]:
+    """A shape value paired with a trailing depth *or* angle callout on the
+    same line -- each is inspected with a different gauge, so it becomes
+    its own characteristic instead of one that silently drops a value:
+
+    * "2X ⌀0.089 ▼0.500" -- a hole's diameter and its depth.
+    * "⌵⌀0.507 X 82°" -- a countersink's diameter and its included angle.
+
+    Matches how :func:`_try_thread` already splits a thread callout from
+    its trailing depth.
+    """
+    has_depth = bool(_DEPTH_HINT_RE.search(text))
+    has_degree = "°" in text
+    if not has_depth and not has_degree:
         return None  # nothing to pair with -- let the single-value path handle it
 
-    for value_re, char_type in (
-        (_DIAMETER_VALUE_RE, CharacteristicType.DIAMETER.value),
-        (_SQUARE_VALUE_RE, CharacteristicType.SQUARE.value),
-        (_RADIUS_VALUE_RE, CharacteristicType.RADIUS.value),
-    ):
-        m = value_re.search(text)
-        if not m:
-            continue
+    shape_char_type = _resolve_shape_char_type(text)
+    if shape_char_type is None:
+        return None
+
+    if shape_char_type == CharacteristicType.SQUARE.value:
+        value_re = _SQUARE_VALUE_RE
+    elif shape_char_type == CharacteristicType.RADIUS.value:
+        value_re = _RADIUS_VALUE_RE
+    else:
+        # DIAMETER, COUNTERBORE, and COUNTERSINK all precede a diameter callout.
+        value_re = _DIAMETER_VALUE_RE
+
+    m = value_re.search(text)
+    if not m:
+        return None
+
+    secondary: Optional[ParsedCharacteristic] = None
+    if has_depth:
         depth_match = _TRAILING_DECIMAL_RE.search(text, m.end())
-        if not depth_match:
-            continue
-        return [
-            ParsedCharacteristic(
-                char_type=char_type,
-                raw_text=text,
-                nominal=_round(float(m.group(1))),
-                confidence=0.85,
-            ),
-            ParsedCharacteristic(
+        if depth_match:
+            secondary = ParsedCharacteristic(
                 char_type=CharacteristicType.DEPTH.value,
                 raw_text=text,
                 nominal=_round(float(depth_match.group(1))),
+                nominal_text=depth_match.group(1),
                 confidence=0.8,
-            ),
-        ]
-    return None
+            )
+    if secondary is None and has_degree:
+        angle_match = _TRAILING_ANGLE_RE.search(text, m.end())
+        if angle_match:
+            secondary = ParsedCharacteristic(
+                char_type=CharacteristicType.ANGLE.value,
+                raw_text=text,
+                nominal=_round(float(angle_match.group(1))),
+                nominal_text=angle_match.group(1),
+                confidence=0.85,
+            )
+    if secondary is None:
+        return None
+
+    primary = ParsedCharacteristic(
+        char_type=shape_char_type,
+        raw_text=text,
+        nominal=_round(float(m.group(1))),
+        nominal_text=m.group(1),
+        confidence=0.85,
+    )
+    return [primary, secondary]
 
 
 def _try_qty_prefixed_two_values(text: str) -> Optional[list[ParsedCharacteristic]]:
     """Structural fallback for a quantity-prefixed hole callout whose two
     dimension symbols are both unrecognized (see _QTY_TWO_VALUE_RE above).
     Assumes the far more common ordering: diameter first, depth second.
+
+    ``raw_text`` is rewritten from the mangled source ("2X n 0.089 x
+    0.500") to its canonical symbol form ("2X ⌀0.089 ▼0.500") -- the
+    original letters carry no information (they're an artifact of the
+    drawing's font, not real content), so showing them verbatim would only
+    confuse review, not aid traceability.
     """
     m = _QTY_TWO_VALUE_RE.match(text)
     if not m:
         return None
+    qty, diameter_value, depth_value = m.group(1), m.group(2), m.group(3)
+    cleaned_text = f"{qty}X ⌀{diameter_value} ▼{depth_value}"
     return [
         ParsedCharacteristic(
             char_type=CharacteristicType.DIAMETER.value,
-            raw_text=text,
-            nominal=_round(float(m.group(1))),
+            raw_text=cleaned_text,
+            nominal=_round(float(diameter_value)),
+            nominal_text=diameter_value,
             confidence=0.55,
         ),
         ParsedCharacteristic(
             char_type=CharacteristicType.DEPTH.value,
-            raw_text=text,
-            nominal=_round(float(m.group(2))),
+            raw_text=cleaned_text,
+            nominal=_round(float(depth_value)),
+            nominal_text=depth_value,
             confidence=0.5,
+        ),
+    ]
+
+
+def _try_bare_value_with_angle(text: str) -> Optional[list[ParsedCharacteristic]]:
+    """Structural fallback for "<value> X <angle>°" when no shape symbol at
+    all is recognizable (see _VALUE_THEN_ANGLE_RE above). "A diameter times
+    an included angle" is specifically the countersink notation -- a plain
+    diameter is never followed by "X <angle>°" -- so unlike the other
+    unrecognized-symbol fallbacks, the shape here can be inferred with
+    reasonable confidence.
+
+    ``raw_text`` is rewritten from the mangled source ("w n 0.507 X 82°")
+    to its canonical symbol form ("⌵⌀0.507 X 82°") -- the original letters
+    carry no information (they're an artifact of the drawing's font, not
+    real content), so showing them verbatim would only confuse review, not
+    aid traceability.
+    """
+    m = _VALUE_THEN_ANGLE_RE.search(text)
+    if not m:
+        return None
+    diameter_value, angle_value = m.group(1), m.group(2)
+    cleaned_text = f"⌵⌀{diameter_value} X {angle_value}°"
+    return [
+        ParsedCharacteristic(
+            char_type=CharacteristicType.COUNTERSINK.value,
+            raw_text=cleaned_text,
+            nominal=_round(float(diameter_value)),
+            nominal_text=diameter_value,
+            confidence=0.6,
+        ),
+        ParsedCharacteristic(
+            char_type=CharacteristicType.ANGLE.value,
+            raw_text=cleaned_text,
+            nominal=_round(float(angle_value)),
+            nominal_text=angle_value,
+            confidence=0.6,
         ),
     ]
 
@@ -411,6 +528,121 @@ def compute_limits(
     return lower, upper
 
 
+# ---------------------------------------------------------------------------
+# Default/general tolerance table (title-block "TOLERANCES UNLESS OTHERWISE
+# NOTED" note), used to backfill tol_plus/tol_minus on dimensions that don't
+# carry their own explicit tolerance callout.
+# ---------------------------------------------------------------------------
+_DECIMAL_TOL_RE: dict[int, re.Pattern] = {
+    1: re.compile(rf"X\.X\b\s*[:=]?\s*±?\s*({NUM})"),
+    2: re.compile(rf"X\.XX\b\s*[:=]?\s*±?\s*({NUM})"),
+    3: re.compile(rf"X\.XXX\b\s*[:=]?\s*±?\s*({NUM})"),
+    4: re.compile(rf"X\.XXXX\b\s*[:=]?\s*±?\s*({NUM})"),
+}
+_ANGULAR_TOL_RE = re.compile(rf"ANGLES?\s*[:=]?\s*±?\s*({NUM})\s*°?", re.IGNORECASE)
+
+_DECIMAL_PLACES_FIELD = {1: "one_decimal", 2: "two_decimal", 3: "three_decimal", 4: "four_decimal"}
+
+_TOLERANCED_DIMENSION_TYPES = {
+    CharacteristicType.LINEAR_DIMENSION.value,
+    CharacteristicType.DIAMETER.value,
+    CharacteristicType.RADIUS.value,
+    CharacteristicType.DEPTH.value,
+    CharacteristicType.COUNTERBORE.value,
+    CharacteristicType.COUNTERSINK.value,
+    CharacteristicType.SQUARE.value,
+}
+
+
+@dataclass
+class DefaultTolerances:
+    """A drawing's general/default tolerance table -- either parsed from its
+    title block or entered manually -- keyed by decimal-place count (the
+    "X.XX: ±0.0100" convention), plus a separate angular tolerance.
+    """
+
+    one_decimal: Optional[float] = None
+    two_decimal: Optional[float] = None
+    three_decimal: Optional[float] = None
+    four_decimal: Optional[float] = None
+    angular: Optional[float] = None
+
+    def is_empty(self) -> bool:
+        return all(
+            v is None
+            for v in (self.one_decimal, self.two_decimal, self.three_decimal, self.four_decimal, self.angular)
+        )
+
+    def for_decimal_places(self, places: int) -> Optional[float]:
+        """The configured tolerance for a value with this many decimal
+        places, falling back to the next-coarsest configured entry if the
+        table has gaps (e.g. only X.XXX is set but a value has 4 places)."""
+        if places <= 0:
+            return None
+        for p in range(min(places, 4), 0, -1):
+            value = getattr(self, _DECIMAL_PLACES_FIELD[p])
+            if value is not None:
+                return value
+        return None
+
+
+def _decimal_places(nominal_text: Optional[str]) -> int:
+    if not nominal_text or "." not in nominal_text:
+        return 0
+    return len(nominal_text.split(".", 1)[1])
+
+
+def parse_default_tolerances(page_text: str) -> DefaultTolerances:
+    """Best-effort extraction of a drawing's general/default tolerance table
+    from its title-block note (commonly headed "TOLERANCES UNLESS OTHERWISE
+    NOTED"), e.g. "X.XX: ±0.0100" / "X.XXX: ±0.0050" / "ANGLES: ±0.5°".
+
+    Returns an empty ``DefaultTolerances`` if no such table is found --
+    callers should let the user review/fill in the result either way, since
+    title-block layouts vary too much for this to be fully reliable.
+    """
+    result = DefaultTolerances()
+    for places, pattern in _DECIMAL_TOL_RE.items():
+        m = pattern.search(page_text)
+        if m:
+            setattr(result, _DECIMAL_PLACES_FIELD[places], _round(float(m.group(1))))
+    m = _ANGULAR_TOL_RE.search(page_text)
+    if m:
+        result.angular = _round(float(m.group(1)))
+    return result
+
+
+def apply_default_tolerance(
+    parsed: ParsedCharacteristic, defaults: DefaultTolerances
+) -> ParsedCharacteristic:
+    """Backfill ``tol_plus``/``tol_minus``/limits on ``parsed`` from
+    ``defaults`` when it has a nominal but no explicit tolerance of its own
+    (e.g. "9X Ø0.250 THRU" relying on the drawing's general "X.XXX: ±0.005"
+    note). Returns ``parsed`` unchanged if it already has an explicit
+    tolerance, has no nominal, its decimal precision is unknown, or no
+    matching default is configured.
+    """
+    if parsed.nominal is None or parsed.tol_plus is not None or parsed.tol_minus is not None:
+        return parsed
+    if defaults.is_empty():
+        return parsed
+
+    if parsed.char_type == CharacteristicType.ANGLE.value:
+        tol = defaults.angular
+    elif parsed.char_type in _TOLERANCED_DIMENSION_TYPES:
+        tol = defaults.for_decimal_places(_decimal_places(parsed.nominal_text))
+    else:
+        tol = None
+
+    if tol is None:
+        return parsed
+
+    parsed.tol_plus = tol
+    parsed.tol_minus = tol
+    parsed.lower_limit, parsed.upper_limit = compute_limits(parsed.nominal, tol, tol)
+    return parsed
+
+
 def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
     """Classify and parse a chunk of drawing text into one or more characteristics.
 
@@ -436,13 +668,17 @@ def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
         if result is not None:
             return [result]
 
-    shape_and_depth = _try_shape_with_depth(text)
-    if shape_and_depth is not None:
-        return shape_and_depth
+    shape_and_secondary = _try_shape_with_secondary_value(text)
+    if shape_and_secondary is not None:
+        return shape_and_secondary
 
     qty_two_values = _try_qty_prefixed_two_values(text)
     if qty_two_values is not None:
         return qty_two_values
+
+    value_and_angle = _try_bare_value_with_angle(text)
+    if value_and_angle is not None:
+        return value_and_angle
 
     is_depth = bool(_DEPTH_HINT_RE.search(text))
     is_counterbore = bool(_COUNTERBORE_HINT_RE.search(text))
@@ -485,6 +721,7 @@ def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
                 char_type=char_type,
                 raw_text=text,
                 nominal=numeric["nominal"],
+                nominal_text=numeric.get("nominal_text"),
                 tol_plus=numeric["tol_plus"],
                 tol_minus=numeric["tol_minus"],
                 lower_limit=numeric["lower_limit"],
