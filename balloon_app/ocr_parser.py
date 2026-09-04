@@ -586,7 +586,12 @@ class DefaultTolerances:
         return None
 
 
-def _decimal_places(nominal_text: Optional[str]) -> int:
+def decimal_places(nominal_text: Optional[str]) -> int:
+    """Digits after the decimal point in ``nominal_text`` as originally
+    printed (e.g. "0.250" -> 3, "0.25" -> 2), or 0 if there's no decimal
+    point at all. Used to pick the matching entry in a decimal-place-keyed
+    default tolerance table.
+    """
     if not nominal_text or "." not in nominal_text:
         return 0
     return len(nominal_text.split(".", 1)[1])
@@ -630,7 +635,7 @@ def apply_default_tolerance(
     if parsed.char_type == CharacteristicType.ANGLE.value:
         tol = defaults.angular
     elif parsed.char_type in _TOLERANCED_DIMENSION_TYPES:
-        tol = defaults.for_decimal_places(_decimal_places(parsed.nominal_text))
+        tol = defaults.for_decimal_places(decimal_places(parsed.nominal_text))
     else:
         tol = None
 

@@ -396,9 +396,9 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.search_edit)
         layout.addLayout(search_row)
 
-        self.review_table = ReviewTable(0, 9, self._on_review_rows_dropped)
+        self.review_table = ReviewTable(0, 7, self._on_review_rows_dropped)
         self.review_table.setHorizontalHeaderLabels(
-            ["Balloon #", "Page", "Type", "Raw Text", "Nominal", "Tolerance", "GD&T", "Confidence", "Status"]
+            ["Balloon #", "Page", "Type", "Raw Text", "Nominal", "Tolerance", "Status"]
         )
         self.review_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1036,7 +1036,7 @@ class MainWindow(QMainWindow):
             source=BalloonSource.MANUAL.value,
             status=ReviewStatus.ACCEPTED.value,
         )
-        dialog = BalloonEditDialog(balloon, is_new=True, parent=self)
+        dialog = BalloonEditDialog(balloon, is_new=True, default_tolerances=self._current_default_tolerances(), parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             dialog.apply_to_balloon(balloon)
             cmd = AddBalloonsCommand(self.project, [balloon], self._refresh_all, text="Add Balloon")
@@ -1213,11 +1213,6 @@ class MainWindow(QMainWindow):
             return f"{b.lower_limit} to {b.upper_limit}"
         return ""
 
-    @staticmethod
-    def _format_gdt(b: Balloon) -> str:
-        parts = [p for p in (b.gdt_symbol, b.gdt_tolerance, b.material_condition, b.datums) if p]
-        return " | ".join(parts)
-
     def _refresh_review_table(self) -> None:
         balloons = self._filtered_sorted_balloons()
         table = self.review_table
@@ -1230,8 +1225,6 @@ class MainWindow(QMainWindow):
                 b.raw_text,
                 "" if b.nominal is None else str(b.nominal),
                 self._format_tolerance(b),
-                self._format_gdt(b),
-                f"{b.confidence:.2f}",
                 b.status.capitalize(),
             ]
             for col, value in enumerate(values):
@@ -1301,7 +1294,7 @@ class MainWindow(QMainWindow):
         if balloon is None or self.project is None:
             return
         before = balloon.to_dict()
-        dialog = BalloonEditDialog(balloon, is_new=False, parent=self)
+        dialog = BalloonEditDialog(balloon, is_new=False, default_tolerances=self._current_default_tolerances(), parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         dialog.apply_to_balloon(balloon)
@@ -1331,7 +1324,7 @@ class MainWindow(QMainWindow):
             source=BalloonSource.MANUAL.value,
             status=ReviewStatus.ACCEPTED.value,
         )
-        dialog = BalloonEditDialog(balloon, is_new=True, parent=self)
+        dialog = BalloonEditDialog(balloon, is_new=True, default_tolerances=self._current_default_tolerances(), parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             dialog.apply_to_balloon(balloon)
             cmd = AddBalloonsCommand(self.project, [balloon], self._refresh_all, text="Add Balloon")
@@ -1501,6 +1494,22 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Auto-ballooning
     # ------------------------------------------------------------------
+    def _current_default_tolerances(self) -> DefaultTolerances:
+        """The drawing's currently-configured default tolerance table (empty
+        if none is set yet or there's no drawing) -- read-only, never
+        prompts. Used to offer "Use Default Tolerance" in the balloon edit
+        dialog regardless of whether auto-ballooning has run yet.
+        """
+        if self.drawing is None:
+            return DefaultTolerances()
+        return DefaultTolerances(
+            one_decimal=self.drawing.tol_one_decimal,
+            two_decimal=self.drawing.tol_two_decimal,
+            three_decimal=self.drawing.tol_three_decimal,
+            four_decimal=self.drawing.tol_four_decimal,
+            angular=self.drawing.tol_angular,
+        )
+
     def _ensure_default_tolerances(self) -> DefaultTolerances:
         """The first time a drawing is auto-ballooned, offer to set its
         general/default tolerance table (best-effort auto-detected from the
@@ -1510,13 +1519,7 @@ class MainWindow(QMainWindow):
         if self.drawing is None:
             return DefaultTolerances()
         if self.drawing.tolerances_configured:
-            return DefaultTolerances(
-                one_decimal=self.drawing.tol_one_decimal,
-                two_decimal=self.drawing.tol_two_decimal,
-                three_decimal=self.drawing.tol_three_decimal,
-                four_decimal=self.drawing.tol_four_decimal,
-                angular=self.drawing.tol_angular,
-            )
+            return self._current_default_tolerances()
 
         page_text = ""
         if self.pdf_doc is not None:
@@ -1528,28 +1531,20 @@ class MainWindow(QMainWindow):
         detected = parse_default_tolerances(page_text)
 
         dialog = DefaultTolerancesDialog(
-            detected.one_decimal, detected.two_decimal, detected.three_decimal,
-            detected.four_decimal, detected.angular,
+            detected.one_decimal, detected.two_decimal, detected.three_decimal, detected.angular,
             auto_detected=not detected.is_empty(), parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return DefaultTolerances()  # skip for this run only -- ask again next time
 
         self._apply_tolerance_dialog_values(dialog)
-        return DefaultTolerances(
-            one_decimal=self.drawing.tol_one_decimal,
-            two_decimal=self.drawing.tol_two_decimal,
-            three_decimal=self.drawing.tol_three_decimal,
-            four_decimal=self.drawing.tol_four_decimal,
-            angular=self.drawing.tol_angular,
-        )
+        return self._current_default_tolerances()
 
     def _apply_tolerance_dialog_values(self, dialog: DefaultTolerancesDialog) -> None:
         values = dialog.values()
         self.drawing.tol_one_decimal = values["tol_one_decimal"]
         self.drawing.tol_two_decimal = values["tol_two_decimal"]
         self.drawing.tol_three_decimal = values["tol_three_decimal"]
-        self.drawing.tol_four_decimal = values["tol_four_decimal"]
         self.drawing.tol_angular = values["tol_angular"]
         self.drawing.tolerances_configured = True
         self._mark_dirty()
@@ -1560,7 +1555,7 @@ class MainWindow(QMainWindow):
             return
         dialog = DefaultTolerancesDialog(
             self.drawing.tol_one_decimal, self.drawing.tol_two_decimal, self.drawing.tol_three_decimal,
-            self.drawing.tol_four_decimal, self.drawing.tol_angular,
+            self.drawing.tol_angular,
             auto_detected=self.drawing.tolerances_configured, parent=self,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:

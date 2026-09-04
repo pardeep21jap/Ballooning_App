@@ -353,6 +353,34 @@ class TestAutoBalloonPreFilter:
         for text in ["19.43", "0.25", "0.063", "0.75", "R5", "Ø25", "M6 x 1.0", "1/4-20 UNC", "45°"]:
             assert _looks_like_characteristic(text) is True, text
 
+    def test_bare_short_integer_without_geometry_stays_rejected(self):
+        # Backward-compatible default: without bbox/page_size info, a bare
+        # short integer can't be told apart from a zone marker, so it's
+        # conservatively rejected exactly as before.
+        from balloon_app.auto_balloon import _looks_like_characteristic
+
+        assert _looks_like_characteristic("75") is False
+
+    def test_bare_short_integer_outside_zone_margin_is_accepted(self):
+        # A whole-number metric dimension ("75", "19", "Ø11"'s bare "11")
+        # sitting well inside the drawing body -- far from every sheet
+        # edge -- is not a zone marker and must be accepted once geometry
+        # is available.
+        from balloon_app.auto_balloon import _looks_like_characteristic
+
+        page_size = (1000.0, 800.0)
+        interior_bbox = (400.0, 300.0, 430.0, 315.0)  # nowhere near any edge
+        assert _looks_like_characteristic("75", bbox=interior_bbox, page_size=page_size) is True
+
+    def test_bare_short_integer_inside_zone_margin_stays_rejected(self):
+        # An actual zone/grid reference number, printed in the thin margin
+        # strip just inside the top edge, must still be rejected.
+        from balloon_app.auto_balloon import _looks_like_characteristic
+
+        page_size = (1000.0, 800.0)
+        top_margin_bbox = (500.0, 2.0, 510.0, 14.0)  # y0 within the top 4% of page height
+        assert _looks_like_characteristic("3", bbox=top_margin_bbox, page_size=page_size) is False
+
 
 class TestComputeLimits:
     def test_symmetric(self):

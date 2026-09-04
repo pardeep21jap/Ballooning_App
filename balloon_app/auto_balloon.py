@@ -34,6 +34,7 @@ import numpy as np
 from balloon_app.config import AUTO_BALLOON_DPI, BALLOON_RADIUS_PDF_POINTS, CHARACTERISTIC_CLASSES, RULES_OCR_MODEL_VERSION
 from balloon_app.data_model import Balloon, BalloonSource, CharacteristicType, ReviewStatus
 from balloon_app.ocr_parser import (
+    NUM,
     DefaultTolerances,
     apply_default_tolerance,
     parse_characteristic,
@@ -82,6 +83,24 @@ _TITLE_BLOCK_KEYWORDS_RE = re.compile(
 )
 
 
+def _in_zone_margin(
+    bbox: tuple[float, float, float, float],
+    page_width: float,
+    page_height: float,
+    margin_fraction: float = 0.04,
+) -> bool:
+    """True if ``bbox`` sits within the thin zone/grid-reference margin
+    strip just inside a sheet edge (top, left, or right -- the bottom is
+    handled separately by the title-block cutoff), where ANSI/ISO Y14.1
+    zone letters/numbers ("1 2 3 4", "A B C D") are printed. A real
+    dimension is never drawn in that margin.
+    """
+    x0, y0, x1, y1 = bbox
+    margin_x = page_width * margin_fraction
+    margin_y = page_height * margin_fraction
+    return y0 <= margin_y or x0 <= margin_x or x1 >= page_width - margin_x
+
+
 def _title_block_cutoff_y(blocks: list[TextBlock], page_height: float) -> Optional[float]:
     """Return a page-y cutoff below which everything is treated as inside
     the title block, or ``None`` if no title-block boilerplate was found.
@@ -103,21 +122,31 @@ def _title_block_cutoff_y(blocks: list[TextBlock], page_height: float) -> Option
     return min(b.bbox[1] for b in matches) - 4.0  # small padding above the topmost match
 
 
-def _looks_like_characteristic(text: str) -> bool:
+def _looks_like_characteristic(
+    text: str,
+    bbox: Optional[tuple[float, float, float, float]] = None,
+    page_size: Optional[tuple[float, float]] = None,
+) -> bool:
     """Cheap pre-filter so we don't propose a balloon for every scrap of text.
 
     A drawing has plenty of text that is never an inspection characteristic:
     title-block boilerplate, drawing/part numbers, dates, QTY counts,
     material codes, and -- notably -- the zone/grid reference numbers
     printed along a drawing border (ANSI/ISO sheet format), which are bare
-    1-2 digit integers and would otherwise look exactly like a "candidate".
-    We require either a decimal number, a recognized dimension/GD&T/thread
-    symbol or keyword, and reject bare short integers outright.
+    1-2 digit integers and are textually indistinguishable from a real
+    whole-number dimension ("75", "19", "Ø11", a bare "3" on a radius) in a
+    metric drawing. Only position tells them apart: zone markers live in
+    the sheet's margin strip (see _in_zone_margin), dimensions don't. When
+    ``bbox``/``page_size`` are supplied, a bare short integer outside that
+    margin is accepted; without geometry, it's conservatively rejected
+    (the old behavior) since it can't be told apart from a zone marker.
     """
     text = text.strip()
     if not text or len(text) > 120:
         return False
     if _BARE_SHORT_INTEGER_RE.match(text):
+        if bbox is not None and page_size is not None and not _in_zone_margin(bbox, *page_size):
+            return True
         return False
     return bool(
         _DECIMAL_NUMBER_RE.search(text)
@@ -206,16 +235,17 @@ class RulesOcrDetector(BaseDetector):
             key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
             lines.setdefault(key, []).append(i)
 
+        image_height, image_width = image.shape[:2]
         detections: list[Detection] = []
         for idxs in lines.values():
             words = [data["text"][i] for i in idxs]
             line_text = " ".join(w for w in words if w).strip()
-            if not _looks_like_characteristic(line_text):
-                continue
             x0 = min(data["left"][i] for i in idxs)
             y0 = min(data["top"][i] for i in idxs)
             x1 = max(data["left"][i] + data["width"][i] for i in idxs)
             y1 = max(data["top"][i] + data["height"][i] for i in idxs)
+            if not _looks_like_characteristic(line_text, bbox=(x0, y0, x1, y1), page_size=(image_width, image_height)):
+                continue
 
             confs = []
             for i in idxs:
@@ -325,6 +355,172 @@ def _merge_nearby_text_blocks(blocks: list[TextBlock], y_tol: float = 3.0, x_gap
     return merged
 
 
+_BARE_SIGNED_NUM_RE = re.compile(rf"^\s*([+-])\s*({NUM})\s*$")
+# A +/- value embedded *within* a larger block's text, e.g. the "-0.010" in
+# an already same-line-merged "Ø6.38 -0.010" -- used to pull out and
+# reorder a sign that's already part of the anchor block, so it isn't
+# duplicated or emitted in the wrong order when merged with an externally
+# found fragment (see _merge_stacked_tolerance_fragments).
+_EMBEDDED_PLUS_RE = re.compile(rf"\+\s*({NUM})")
+_EMBEDDED_MINUS_RE = re.compile(rf"-\s*({NUM})")
+# A trailing bare (unsigned) zero after the nominal, e.g. the "0" in "Ø8 0"
+# -- the unsigned side of a unilateral tolerance ("0 / +0.05"), where the
+# zero side is conventionally written without a +/- sign since +0 and -0
+# are equivalent. Requires a preceding token (the nominal itself) so a
+# bare "0" is never mistaken for the whole value.
+_TRAILING_BARE_ZERO_RE = re.compile(r"(?<=\S)\s+(0(?:\.0+)?)\s*$")
+
+
+def _bboxes_are_near(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float], y_gap: float, x_slack: float
+) -> bool:
+    a_x0, a_y0, a_x1, a_y1 = a
+    b_x0, b_y0, b_x1, b_y1 = b
+    vertical_gap = max(a_y0, b_y0) - min(a_y1, b_y1)  # <= 0 when the boxes already overlap in y
+    if vertical_gap > y_gap:
+        return False
+    horizontal_gap = max(a_x0, b_x0) - min(a_x1, b_x1)
+    return horizontal_gap <= x_slack
+
+
+def _union_bbox(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
+
+
+def _bbox_center_distance(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax, ay = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
+    bx, by = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
+    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+
+def _merge_stacked_tolerance_fragments(
+    blocks: list[TextBlock], y_gap: float = 20.0, x_slack: float = 40.0
+) -> list[TextBlock]:
+    """Merge a nominal value with +/- tolerance fragments stacked above or
+    below it as separate lines -- a common drawing convention:
+
+            +0.005
+        Ø6.38
+            -0.010
+
+    Each line above is its own PDF text span, on a different y-baseline
+    than the nominal, so :func:`_merge_nearby_text_blocks` (same-line only)
+    leaves them separate. Without this, "+0.005" and "-0.010" would either
+    balloon as their own (meaningless) characteristics, or the nominal
+    would balloon with no tolerance at all even though one was clearly
+    given on the drawing.
+
+    A block only participates as a tolerance fragment if its *entire* text
+    is just a signed number -- this is deliberately narrow so it can't
+    accidentally swallow an unrelated nearby dimension. Conversely, an
+    anchor must actually contain a digit -- a bare datum-reference letter
+    ("B") sitting near a fragment is not a dimension and must not steal it.
+    When more than one eligible anchor is in range of the same fragment
+    (e.g. two dimensions stacked close together), the fragment goes to
+    whichever is geometrically *closest*, not just whichever is processed
+    first.
+
+    The anchor block itself may already carry one sign (e.g. same-line
+    merging already combined "Ø6.38" and "-0.010" into one block since
+    they share a line, leaving only "+0.005" -- on a different line --
+    still separate). That embedded sign is pulled back out and re-emitted
+    in canonical "nominal +plus -minus" order along with anything merged in
+    externally, rather than just appended wherever it happened to already
+    be -- appending blindly can produce "6.38 -0.010 +0.005", which the
+    asymmetric-tolerance parser (which requires + before -) then fails to
+    recognize as a tolerance at all.
+    """
+    is_sign_fragment = [bool(_BARE_SIGNED_NUM_RE.match(b.text)) for b in blocks]
+    has_digit = [bool(re.search(r"\d", b.text)) for b in blocks]
+
+    # Each fragment picks its single closest eligible anchor, rather than
+    # anchors greedily claiming whatever fragment they encounter first.
+    fragment_anchor: dict[int, int] = {}
+    for j, frag in enumerate(blocks):
+        if not is_sign_fragment[j]:
+            continue
+        best_i, best_dist = None, None
+        for i, cand in enumerate(blocks):
+            if i == j or is_sign_fragment[i] or not has_digit[i]:
+                continue
+            if not _bboxes_are_near(cand.bbox, frag.bbox, y_gap, x_slack):
+                continue
+            dist = _bbox_center_distance(cand.bbox, frag.bbox)
+            if best_dist is None or dist < best_dist:
+                best_i, best_dist = i, dist
+        if best_i is not None:
+            fragment_anchor[j] = best_i
+
+    used: set[int] = set()
+    merged: list[TextBlock] = []
+
+    for i, nominal in enumerate(blocks):
+        if is_sign_fragment[i] or i in used:
+            continue
+
+        assigned = [j for j, anchor in fragment_anchor.items() if anchor == i]
+        plus_idx = minus_idx = None
+        for j in assigned:
+            sign = _BARE_SIGNED_NUM_RE.match(blocks[j].text).group(1)
+            if sign == "+" and plus_idx is None:
+                plus_idx = j
+            elif sign == "-" and minus_idx is None:
+                minus_idx = j
+
+        if plus_idx is None and minus_idx is None:
+            continue  # no external fragment to merge -- leave this block as-is
+
+        base_text = nominal.text
+        plus_val = minus_val = None
+        embedded_plus = _EMBEDDED_PLUS_RE.search(base_text)
+        if embedded_plus:
+            plus_val = embedded_plus.group(1)
+            base_text = base_text.replace(embedded_plus.group(0), " ", 1)
+        embedded_minus = _EMBEDDED_MINUS_RE.search(base_text)
+        if embedded_minus:
+            minus_val = embedded_minus.group(1)
+            base_text = base_text.replace(embedded_minus.group(0), " ", 1)
+        base_text = " ".join(base_text.split())
+
+        combined_bbox = nominal.bbox
+        if plus_idx is not None:
+            plus_val = _BARE_SIGNED_NUM_RE.match(blocks[plus_idx].text).group(2)
+            combined_bbox = _union_bbox(combined_bbox, blocks[plus_idx].bbox)
+            used.add(plus_idx)
+        if minus_idx is not None:
+            minus_val = _BARE_SIGNED_NUM_RE.match(blocks[minus_idx].text).group(2)
+            combined_bbox = _union_bbox(combined_bbox, blocks[minus_idx].bbox)
+            used.add(minus_idx)
+
+        # A unilateral tolerance ("0 / +0.05") -- only one side has an
+        # explicit sign; the other, always exactly 0, is conventionally
+        # written bare since +0 and -0 are equivalent. That bare "0" sits
+        # right after the nominal (same-line merged already, e.g. "Ø8 0"),
+        # so only one of plus_val/minus_val was found above; the trailing
+        # bare number fills in the other side.
+        if (plus_val is None) != (minus_val is None):
+            trailing_zero = _TRAILING_BARE_ZERO_RE.search(base_text)
+            if trailing_zero:
+                base_text = base_text[: trailing_zero.start()].rstrip()
+                if plus_val is None:
+                    plus_val = trailing_zero.group(1)
+                else:
+                    minus_val = trailing_zero.group(1)
+
+        parts = [base_text]
+        if plus_val is not None:
+            parts.append(f"+{plus_val}")
+        if minus_val is not None:
+            parts.append(f"-{minus_val}")
+        used.add(i)
+        merged.append(TextBlock(text=" ".join(parts), bbox=combined_bbox))
+
+    untouched = [b for i, b in enumerate(blocks) if i not in used]
+    return untouched + merged
+
+
 def _bbox_has_ink(gray_image: np.ndarray, bbox_px: tuple[float, float, float, float], padding: float = 2.0, min_dark_fraction: float = 0.01) -> bool:
     """OpenCV-based plausibility check: does this bbox actually cover ink?
 
@@ -421,17 +617,20 @@ def auto_balloon_page(
         native_blocks = []
 
     try:
-        _, page_height = pdf_doc.page_size_pdf(page_number)
+        page_width, page_height = pdf_doc.page_size_pdf(page_number)
     except Exception:
-        page_height = None
+        page_width = page_height = None
+    page_size = (page_width, page_height) if page_width and page_height else None
     title_block_cutoff_y = (
         _title_block_cutoff_y(native_blocks, page_height) if page_height else None
     )
 
-    for block in _merge_nearby_text_blocks(native_blocks):
+    merged_native_blocks = _merge_stacked_tolerance_fragments(_merge_nearby_text_blocks(native_blocks))
+
+    for block in merged_native_blocks:
         if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
             continue  # inside the title block -- never a real characteristic
-        if not _looks_like_characteristic(block.text):
+        if not _looks_like_characteristic(block.text, bbox=block.bbox, page_size=page_size):
             continue
         if gray_image is not None:
             bbox_px = rect_pdf_to_pixel(block.bbox, dpi)

@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
 from balloon_app import __version__
 from balloon_app.config import AppSettings, DEFAULT_CONFIDENCE_THRESHOLD
 from balloon_app.data_model import Balloon, CharacteristicType, ReviewStatus
-from balloon_app.ocr_parser import compute_limits
+from balloon_app.ocr_parser import DefaultTolerances, compute_limits, decimal_places
 from balloon_app.training_export import TeachStats
 
 COMMON_INSPECTION_METHODS = [
@@ -192,7 +192,6 @@ class DefaultTolerancesDialog(QDialog):
         one_decimal: Optional[float] = None,
         two_decimal: Optional[float] = None,
         three_decimal: Optional[float] = None,
-        four_decimal: Optional[float] = None,
         angular: Optional[float] = None,
         auto_detected: bool = False,
         parent: Optional[QWidget] = None,
@@ -220,8 +219,6 @@ class DefaultTolerancesDialog(QDialog):
         _set_optional_float(self.two_edit, two_decimal)
         self.three_edit = _optional_float_line_edit()
         _set_optional_float(self.three_edit, three_decimal)
-        self.four_edit = _optional_float_line_edit()
-        _set_optional_float(self.four_edit, four_decimal)
         self.angular_edit = _optional_float_line_edit()
         _set_optional_float(self.angular_edit, angular)
 
@@ -229,7 +226,6 @@ class DefaultTolerancesDialog(QDialog):
         form.addRow("X.X   (1 decimal) ±", self.one_edit)
         form.addRow("X.XX   (2 decimals) ±", self.two_edit)
         form.addRow("X.XXX   (3 decimals) ±", self.three_edit)
-        form.addRow("X.XXXX   (4 decimals) ±", self.four_edit)
         form.addRow("Angles ±", self.angular_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -246,7 +242,6 @@ class DefaultTolerancesDialog(QDialog):
             "tol_one_decimal": _parse_optional_float(self.one_edit),
             "tol_two_decimal": _parse_optional_float(self.two_edit),
             "tol_three_decimal": _parse_optional_float(self.three_edit),
-            "tol_four_decimal": _parse_optional_float(self.four_edit),
             "tol_angular": _parse_optional_float(self.angular_edit),
         }
 
@@ -258,12 +253,19 @@ class BalloonEditDialog(QDialog):
     for editing/reviewing an existing (possibly auto-proposed) balloon.
     """
 
-    def __init__(self, balloon: Balloon, is_new: bool, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        balloon: Balloon,
+        is_new: bool,
+        default_tolerances: Optional[DefaultTolerances] = None,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Add Balloon" if is_new else f"Edit Balloon #{balloon.number}")
         self.setMinimumWidth(480)
         self._balloon = balloon
         self._is_new = is_new
+        self._default_tolerances = default_tolerances
 
         self.char_type_combo = QComboBox()
         for ct in CharacteristicType:
@@ -284,6 +286,14 @@ class BalloonEditDialog(QDialog):
 
         calc_button = QPushButton("Calculate Limits from Nominal ± Tolerance")
         calc_button.clicked.connect(self._calculate_limits)
+
+        default_tol_button = QPushButton("Use Default Tolerance")
+        default_tol_button.setToolTip(
+            "Fill Tolerance +/- from this drawing's default tolerance table (Tools -> Default "
+            "Tolerances...), matched by the Nominal's decimal places (or by the angular default "
+            "for an Angle characteristic)."
+        )
+        default_tol_button.clicked.connect(self._apply_default_tolerance)
 
         self.gdt_symbol_edit = QLineEdit(balloon.gdt_symbol or "")
         self.gdt_tolerance_edit = QLineEdit(balloon.gdt_tolerance or "")
@@ -323,6 +333,7 @@ class BalloonEditDialog(QDialog):
         form.addRow("Lower Limit:", self.lower_limit_edit)
         form.addRow("Upper Limit:", self.upper_limit_edit)
         form.addRow("", calc_button)
+        form.addRow("", default_tol_button)
         form.addRow("GD&T Symbol:", self.gdt_symbol_edit)
         form.addRow("GD&T Tolerance:", self.gdt_tolerance_edit)
         form.addRow("Material Condition:", self.material_condition_edit)
@@ -357,6 +368,33 @@ class BalloonEditDialog(QDialog):
             _set_optional_float(self.lower_limit_edit, lower)
         if upper is not None:
             _set_optional_float(self.upper_limit_edit, upper)
+
+    def _apply_default_tolerance(self) -> None:
+        if self._default_tolerances is None or self._default_tolerances.is_empty():
+            QMessageBox.information(
+                self, "No Default Tolerance",
+                "No default tolerance table is set for this drawing.\n\n"
+                "Set one via Tools -> Default Tolerances...",
+            )
+            return
+
+        char_type = self.char_type_combo.currentData()
+        if char_type == CharacteristicType.ANGLE.value:
+            tol = self._default_tolerances.angular
+        else:
+            tol = self._default_tolerances.for_decimal_places(decimal_places(self.nominal_edit.text().strip()))
+
+        if tol is None:
+            QMessageBox.information(
+                self, "No Matching Default",
+                "This drawing's default tolerance table has no entry for this value's "
+                "decimal places (or, for an angle, no angular default).",
+            )
+            return
+
+        _set_optional_float(self.tol_plus_edit, tol)
+        _set_optional_float(self.tol_minus_edit, tol)
+        self._calculate_limits()
 
     def apply_to_balloon(self, balloon: Balloon) -> None:
         """Write the dialog's fields back into ``balloon`` in place."""

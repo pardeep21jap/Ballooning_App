@@ -7,10 +7,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from balloon_app.auto_balloon import _bbox_has_ink, auto_balloon_page
+from balloon_app.auto_balloon import _bbox_has_ink, _merge_stacked_tolerance_fragments, auto_balloon_page
 from balloon_app.data_model import CharacteristicType
 from balloon_app.ocr_parser import DefaultTolerances
-from balloon_app.pdf_engine import PdfDocument
+from balloon_app.pdf_engine import PdfDocument, TextBlock
 
 fitz = pytest.importorskip("pymupdf")
 
@@ -307,3 +307,216 @@ class TestTitleBlockExclusion:
         raw_texts = [b.raw_text for b in result.balloons]
         assert any("0.750" in t for t in raw_texts)
         assert any("0.500" in t for t in raw_texts)
+
+
+class TestStackedToleranceFragments:
+    def test_plus_above_and_minus_below_merge_into_one(self):
+        # A common drawing convention: the nominal on its own line, with
+        # the asymmetric tolerance stacked above/below it as separate lines.
+        #     +0.005
+        # Ø6.38
+        #     -0.010
+        blocks = [
+            TextBlock(text="+0.005", bbox=(100, 180, 130, 190)),
+            TextBlock(text="Ø6.38", bbox=(80, 195, 130, 208)),
+            TextBlock(text="-0.010", bbox=(100, 210, 130, 220)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "Ø6.38 +0.005 -0.010"
+
+    def test_only_one_sign_fragment_still_merges(self):
+        blocks = [
+            TextBlock(text="6.38", bbox=(80, 195, 110, 208)),
+            TextBlock(text="-0.010", bbox=(100, 210, 130, 220)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "6.38 -0.010"
+
+    def test_datum_letter_does_not_steal_a_nearby_fragment(self):
+        # A bare datum-reference letter ("B") happens to sit closer (in
+        # raw distance) to a "+0.005" fragment than the real numeric
+        # dimension does. Since "B" has no digit it must never be treated
+        # as an anchor -- the fragment has to reach past it to the real
+        # dimension regardless of which one is geometrically nearest.
+        blocks = [
+            TextBlock(text="B", bbox=(115, 175, 123, 190)),
+            TextBlock(text="+0.005", bbox=(120, 180, 150, 190)),
+            TextBlock(text="Ø6.38 -0.010", bbox=(80, 195, 160, 208)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        texts = {b.text for b in merged}
+        assert "Ø6.38 +0.005 -0.010" in texts
+        assert "B" in texts
+
+    def test_fragment_goes_to_the_closer_of_two_eligible_anchors(self):
+        # Two numeric dimensions are both technically "in range" of one
+        # fragment; it must go to whichever is actually closer.
+        blocks = [
+            TextBlock(text="+0.005", bbox=(120, 180, 150, 190)),
+            TextBlock(text="Ø6.38", bbox=(80, 195, 130, 208)),  # closer
+            TextBlock(text="12.70", bbox=(80, 100, 130, 113)),  # farther
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        texts = {b.text for b in merged}
+        assert "Ø6.38 +0.005" in texts
+        assert "12.70" in texts
+
+    def test_unilateral_tolerance_bare_zero_fills_the_missing_side(self):
+        # A unilateral tolerance ("0 / +0.05"): the unsigned "0" -- already
+        # same-line merged with the nominal into "Ø8 0" -- means "no
+        # negative deviation", conventionally written without a sign since
+        # +0 and -0 are equivalent. It must become tol_minus=0, not get
+        # left in the nominal text or dropped.
+        blocks = [
+            TextBlock(text="+0.05", bbox=(190, 295, 220, 305)),
+            TextBlock(text="Ø8 0", bbox=(180, 305, 230, 318)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "Ø8 +0.05 -0"
+
+    def test_bare_zero_not_stripped_without_a_signed_fragment_nearby(self):
+        # No external +/- fragment in range -- must not touch the block at
+        # all (a bare "Ø8 0" with nothing else is left for the normal
+        # single-value path to handle, whatever it decides).
+        blocks = [TextBlock(text="Ø8 0", bbox=(180, 305, 230, 318))]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert merged == blocks
+
+    def test_minus_already_same_line_merged_with_nominal_reorders_correctly(self):
+        # Real-world layout: "Ø6.38 -0.010" sit on the same line and were
+        # already combined by the same-line merge; "+0.005" is a separate
+        # line above. Appending "+0.005" naively would produce "Ø6.38
+        # -0.010 +0.005", which the asymmetric-tolerance parser (which
+        # requires + before -) fails to recognize as a tolerance at all --
+        # the embedded "-0.010" must be pulled out and re-emitted after
+        # the plus, in canonical order.
+        blocks = [
+            TextBlock(text="+0.005", bbox=(120, 180, 150, 190)),
+            TextBlock(text="Ø6.38 -0.010", bbox=(80, 195, 160, 208)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "Ø6.38 +0.005 -0.010"
+
+    def test_unrelated_bare_number_far_away_does_not_merge(self):
+        blocks = [
+            TextBlock(text="6.38", bbox=(80, 195, 110, 208)),
+            TextBlock(text="+0.010", bbox=(80, 500, 110, 512)),  # far below -- unrelated
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 2
+
+    def test_no_sign_fragments_leaves_blocks_untouched(self):
+        blocks = [TextBlock(text="6.38", bbox=(80, 195, 110, 208))]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert merged == blocks
+
+    def test_end_to_end_nominal_and_minus_same_line_plus_above(self, tmp_path):
+        """Exact real-world layout: "Ø6.38 -0.010" on one line, "+0.005" on
+        a separate line above it. Must still produce one balloon with the
+        correct +0.005/-0.010 tolerance, not a bare nominal with none.
+        """
+        pdf_path = tmp_path / "same_line_minus.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((120, 180), "+0.005", fontsize=10)
+        page.insert_text((80, 195), "Ø6.38 -0.010", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.nominal == pytest.approx(6.38)
+        assert balloon.tol_plus == pytest.approx(0.005)
+        assert balloon.tol_minus == pytest.approx(0.010)
+
+    def test_end_to_end_stacked_tolerance_produces_one_toleranced_balloon(self, tmp_path):
+        """Full pipeline: a diameter with its +/- tolerance stacked as
+        separate lines must produce ONE balloon with the correct tolerance,
+        not two (or three) meaningless fragment balloons.
+        """
+        pdf_path = tmp_path / "stacked_tolerance.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 180), "+0.005", fontsize=10)
+        page.insert_text((80, 195), "Ø6.38", fontsize=12)
+        page.insert_text((100, 210), "-0.010", fontsize=10)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.char_type == CharacteristicType.DIAMETER.value
+        assert balloon.nominal == pytest.approx(6.38)
+        assert balloon.tol_plus == pytest.approx(0.005)
+        assert balloon.tol_minus == pytest.approx(0.010)
+
+    def test_end_to_end_unilateral_tolerance(self, tmp_path):
+        """Full pipeline for a unilateral tolerance drawn as "Ø8 0" on one
+        line and "+0.05" stacked above it -- must produce one balloon with
+        tol_plus=0.05, tol_minus=0 (limits [8.0, 8.05]), not a bare nominal
+        with no tolerance at all.
+        """
+        pdf_path = tmp_path / "unilateral_tolerance.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((190, 180), "+0.05", fontsize=10)
+        page.insert_text((180, 195), "Ø8   0", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.nominal == pytest.approx(8.0)
+        assert balloon.tol_plus == pytest.approx(0.05)
+        assert balloon.tol_minus == pytest.approx(0.0)
+        assert balloon.lower_limit == pytest.approx(8.0)
+        assert balloon.upper_limit == pytest.approx(8.05)
+
+
+class TestZoneMarginWholeNumberDimensions:
+    def test_whole_number_dimension_ballooned_but_zone_markers_are_not(self, tmp_path):
+        """Whole-number metric dimensions ("75", "19") inside the drawing
+        body must be ballooned like any other dimension, while the sheet's
+        zone/grid reference numbers ("1"-"4" along the top margin) -- which
+        look identical as bare text -- must still be excluded.
+        """
+        pdf_path = tmp_path / "whole_number_dims.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=1000, height=800)
+        # Zone markers: thin strip just inside the top edge.
+        for i, x in enumerate([100, 350, 600, 850], start=1):
+            page.insert_text((x, 10), str(i), fontsize=8)
+        # Real whole-number dimensions, well inside the drawing body.
+        page.insert_text((400, 300), "75", fontsize=12)
+        page.insert_text((400, 400), "19", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = {b.raw_text for b in result.balloons}
+        assert "75" in raw_texts
+        assert "19" in raw_texts
+        assert not ({"1", "2", "3", "4"} & raw_texts)
