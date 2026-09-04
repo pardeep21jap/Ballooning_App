@@ -70,6 +70,15 @@ def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]])
             logger.warning("Skipping %d balloon(s) for out-of-range page %d", len(page_balloons), page_number)
             continue
         page = doc[page_number]
+        # Balloon x/y are stored in the app's display convention (page.rect,
+        # i.e. already rotated -- see pdf_engine.py). PyMuPDF's drawing/text
+        # APIs instead expect raw/mediabox-space coordinates, so every point
+        # and rect has to be mapped back with derotation_matrix before being
+        # handed to draw_circle/draw_line/insert_textbox on a rotated page.
+        # insert_textbox additionally needs `rotate=page.rotation` so the
+        # glyphs themselves are rotated to read upright once PyMuPDF applies
+        # the page's own rotation for display.
+        derotation_matrix = page.derotation_matrix
         for balloon in page_balloons:
             color = _rgba_unit(status_color(balloon.source, balloon.status))
             center = fitz.Point(balloon.x, balloon.y)
@@ -82,11 +91,18 @@ def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]])
                 leader_start = fitz.Point((bx0 + bx1) / 2.0, (by0 + by1) / 2.0)
 
             if leader_start is not None and leader_start.distance_to(center) > radius:
-                page.draw_line(leader_start, center, color=color, width=0.75)
+                page.draw_line(leader_start * derotation_matrix, center * derotation_matrix, color=color, width=0.75)
 
-            page.draw_circle(center, radius, color=color, fill=color, width=1.0, fill_opacity=0.85)
+            page.draw_circle(center * derotation_matrix, radius, color=color, fill=color, width=1.0, fill_opacity=0.85)
 
-            text_rect = fitz.Rect(center.x - radius, center.y - radius * 0.75, center.x + radius, center.y + radius * 0.75)
+            # Square, circle-diameter box: insert_textbox's internal fit
+            # check needs noticeably more headroom than the font's nominal
+            # size, so a shorter box (previously radius * 0.75 tall) caused
+            # it to silently draw nothing -- on every export, regardless of
+            # page rotation -- because the number never "fit".
+            text_rect = fitz.Rect(center.x - radius, center.y - radius, center.x + radius, center.y + radius)
+            text_rect = text_rect * derotation_matrix
+            text_rect.normalize()
             page.insert_textbox(
                 text_rect,
                 str(balloon.number),
@@ -94,6 +110,7 @@ def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]])
                 fontname="helv",
                 color=(1, 1, 1),
                 align=1,
+                rotate=page.rotation,
             )
 
 

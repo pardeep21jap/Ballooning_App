@@ -60,6 +60,7 @@ from balloon_app.dialogs import (
     TeachTrainingDialog,
 )
 from balloon_app.excel_export import export_excel
+from balloon_app.ocr_parser import parse_characteristics
 from balloon_app.pdf_engine import PdfDocument, PdfLoadError
 from balloon_app.pdf_export import PdfExportResult, export_ballooned_pdf, resolve_source_path
 from balloon_app.pdf_view import PdfGraphicsView
@@ -152,6 +153,32 @@ class DeleteBalloonsCommand(QUndoCommand):
         for b in self.balloons:
             if b.id not in existing_ids:
                 self.project.balloons.append(b)
+        self.refresh_cb()
+
+
+class SplitBalloonCommand(QUndoCommand):
+    """Replace one balloon with several (from "Split Balloon"), as one undo step."""
+
+    def __init__(self, project: Project, original: Balloon, new_balloons: list[Balloon], refresh_cb, text: str = "Split Balloon"):
+        super().__init__(text)
+        self.project = project
+        self.original = original
+        self.new_balloons = list(new_balloons)
+        self.refresh_cb = refresh_cb
+
+    def redo(self) -> None:
+        self.project.balloons = [b for b in self.project.balloons if b.id != self.original.id]
+        existing_ids = {b.id for b in self.project.balloons}
+        for b in self.new_balloons:
+            if b.id not in existing_ids:
+                self.project.balloons.append(b)
+        self.refresh_cb()
+
+    def undo(self) -> None:
+        new_ids = {b.id for b in self.new_balloons}
+        self.project.balloons = [b for b in self.project.balloons if b.id not in new_ids]
+        if self.original.id not in {b.id for b in self.project.balloons}:
+            self.project.balloons.append(self.original)
         self.refresh_cb()
 
 
@@ -361,11 +388,19 @@ class MainWindow(QMainWindow):
         row3 = QHBoxLayout()
         duplicate_btn = QPushButton("Duplicate")
         duplicate_btn.clicked.connect(self._duplicate_selected_balloon)
+        split_btn = QPushButton("Split Balloon")
+        split_btn.setToolTip(
+            "Re-run automatic detection on this balloon's raw drawing text and, if it now "
+            "recognizes more than one characteristic (e.g. a hole's diameter and its depth), "
+            "replace this balloon with one properly-typed balloon per characteristic."
+        )
+        split_btn.clicked.connect(self._split_selected_balloon)
         delete_btn = QPushButton("Delete")
         delete_btn.clicked.connect(self._delete_selected_balloons)
         renumber_btn = QPushButton("Renumber...")
         renumber_btn.clicked.connect(self._show_renumber_dialog)
         row3.addWidget(duplicate_btn)
+        row3.addWidget(split_btn)
         row3.addWidget(delete_btn)
         row3.addWidget(renumber_btn)
         layout.addLayout(row3)
@@ -450,6 +485,10 @@ class MainWindow(QMainWindow):
         duplicate_act.setShortcut(QKeySequence("Ctrl+D"))
         duplicate_act.triggered.connect(self._duplicate_selected_balloon)
         edit_menu.addAction(duplicate_act)
+
+        split_act = QAction("Split Balloon", self)
+        split_act.triggered.connect(self._split_selected_balloon)
+        edit_menu.addAction(split_act)
 
         delete_act = QAction("Delete Balloon", self)
         delete_act.setShortcut(QKeySequence("Delete"))
@@ -736,15 +775,23 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Project", "Create or open a project first.")
             return
         dialog = ProjectPropertiesDialog(
-            self.project.name, self.project.part_number, self.project.revision,
-            self.project.customer, self.project.notes, self,
+            self.project.name, self.project.part_number, self.project.part_name,
+            self.project.revision, self.project.customer, self.project.unit,
+            self.project.serial_lot_number, self.project.fai_report,
+            self.project.po_number, self.project.mfg_wo, self.project.notes, self,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             values = dialog.values()
             self.project.name = values["name"]
             self.project.part_number = values["part_number"]
+            self.project.part_name = values["part_name"]
             self.project.revision = values["revision"]
             self.project.customer = values["customer"]
+            self.project.unit = values["unit"]
+            self.project.serial_lot_number = values["serial_lot_number"]
+            self.project.fai_report = values["fai_report"]
+            self.project.po_number = values["po_number"]
+            self.project.mfg_wo = values["mfg_wo"]
             self.project.notes = values["notes"]
             self.project.touch()
             self._mark_dirty()
@@ -1213,6 +1260,62 @@ class MainWindow(QMainWindow):
         new_balloon.status = ReviewStatus.ACCEPTED.value
         new_balloon.original_prediction = None
         cmd = AddBalloonsCommand(self.project, [new_balloon], self._refresh_all, text="Duplicate Balloon")
+        self.undo_stack.push(cmd)
+        self._refresh_all()
+
+    def _split_selected_balloon(self) -> None:
+        """Re-run auto-detection on the selected balloon's raw text and, if it
+        now recognizes more than one characteristic, replace the balloon with
+        one properly-typed balloon per characteristic (e.g. a hole's diameter
+        and its depth, packed into one line of drawing text).
+
+        Detection can only split what it can recognize; when the drawing's
+        symbols/text don't resolve into more than one characteristic, this
+        reports that plainly instead of guessing -- use Duplicate, then Edit
+        each copy, for a fully manual split.
+        """
+        ids = self._selected_balloon_ids()
+        if not ids or self.project is None or self.drawing is None:
+            return
+        original = self._find_balloon(ids[0])
+        if original is None:
+            return
+
+        parsed_list = parse_characteristics(original.raw_text) if original.raw_text else []
+        if len(parsed_list) < 2:
+            QMessageBox.information(
+                self, "Nothing To Split",
+                "Automatic detection only recognizes one characteristic in this balloon's "
+                "raw drawing text, so there's nothing to split automatically.\n\n"
+                "Use Duplicate, then Edit each copy, to split it manually.",
+            )
+            return
+
+        new_balloons: list[Balloon] = []
+        for i, parsed in enumerate(parsed_list):
+            b = Balloon.from_dict(original.to_dict())
+            b.id = new_id()
+            b.number = original.number if i == 0 else self.project.next_balloon_number(self.drawing.id)
+            b.x = original.x + (i * 20.0)
+            b.y = original.y + (i * 20.0)
+            b.char_type = parsed.char_type
+            b.nominal = parsed.nominal
+            b.tol_plus = parsed.tol_plus
+            b.tol_minus = parsed.tol_minus
+            b.lower_limit = parsed.lower_limit
+            b.upper_limit = parsed.upper_limit
+            b.gdt_symbol = parsed.gdt_symbol
+            b.gdt_tolerance = parsed.gdt_tolerance
+            b.material_condition = parsed.material_condition
+            b.datums = parsed.datums
+            b.surface_finish = parsed.surface_finish
+            b.thread_callout = parsed.thread_callout
+            b.note = parsed.note or original.note
+            b.original_prediction = None
+            b.touch()
+            new_balloons.append(b)
+
+        cmd = SplitBalloonCommand(self.project, original, new_balloons, self._refresh_all)
         self.undo_stack.push(cmd)
         self._refresh_all()
 

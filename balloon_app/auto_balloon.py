@@ -33,7 +33,7 @@ import numpy as np
 
 from balloon_app.config import AUTO_BALLOON_DPI, BALLOON_RADIUS_PDF_POINTS, CHARACTERISTIC_CLASSES, RULES_OCR_MODEL_VERSION
 from balloon_app.data_model import Balloon, BalloonSource, CharacteristicType, ReviewStatus
-from balloon_app.ocr_parser import parse_characteristic
+from balloon_app.ocr_parser import parse_characteristic, parse_characteristics
 from balloon_app.pdf_engine import PdfDocument, TextBlock, rect_pdf_to_pixel, rect_pixel_to_pdf
 
 logger = logging.getLogger("balloon_app.auto_balloon")
@@ -45,7 +45,8 @@ logger = logging.getLogger("balloon_app.auto_balloon")
 _DECIMAL_NUMBER_RE = re.compile(r"\d+\.\d+|\.\d+")
 _SYMBOL_HINT_RE = re.compile(
     r"[⌀ØΦ∅]|±|°|\bRa\b|\bDIA\b|"
-    r"⏤|⏥|○|⌭|⌒|⌓|⟂|∠|∥|⌯|⌖|◎|↗|⌰|⌇",
+    r"⏤|⏥|○|⌭|⌒|⌓|⟂|∠|∥|⌯|⌖|◎|↗|⌰|⌇|"
+    r"[▼↓⌴⌵□]",
     re.IGNORECASE,
 )
 _RADIUS_HINT_RE = re.compile(r"(?<![A-Za-z])R(?![a-zA-Z])\s*\d")
@@ -416,49 +417,54 @@ def auto_balloon_page(
 
     for det in candidates:
         raw_text = det.raw_text or ""
-        parsed = parse_characteristic(raw_text) if raw_text else None
-        if parsed is not None:
-            char_type = parsed.char_type
-            confidence = det.confidence if det.confidence > 0 else parsed.confidence
-        else:
-            char_type = det.label or CharacteristicType.OTHER.value
-            confidence = det.confidence
+        # A single detected text chunk can pack more than one independently
+        # inspected requirement (e.g. a tapped hole's thread class *and* its
+        # depth) -- each becomes its own balloon, placed near the same text.
+        parsed_list = parse_characteristics(raw_text) if raw_text else [None]
 
-        cx, cy = _placement_point(det.bbox, occupied)
-        occupied.append((cx, cy))
+        for parsed in parsed_list:
+            if parsed is not None:
+                char_type = parsed.char_type
+                confidence = det.confidence if det.confidence > 0 else parsed.confidence
+            else:
+                char_type = det.label or CharacteristicType.OTHER.value
+                confidence = det.confidence
 
-        balloon = Balloon(
-            number=number,
-            drawing_id=drawing_id,
-            page_number=page_number,
-            x=cx,
-            y=cy,
-            bbox_x0=det.bbox[0],
-            bbox_y0=det.bbox[1],
-            bbox_x1=det.bbox[2],
-            bbox_y1=det.bbox[3],
-            char_type=char_type,
-            raw_text=raw_text,
-            nominal=parsed.nominal if parsed else None,
-            tol_plus=parsed.tol_plus if parsed else None,
-            tol_minus=parsed.tol_minus if parsed else None,
-            lower_limit=parsed.lower_limit if parsed else None,
-            upper_limit=parsed.upper_limit if parsed else None,
-            gdt_symbol=parsed.gdt_symbol if parsed else None,
-            gdt_tolerance=parsed.gdt_tolerance if parsed else None,
-            material_condition=parsed.material_condition if parsed else None,
-            datums=parsed.datums if parsed else None,
-            surface_finish=parsed.surface_finish if parsed else None,
-            thread_callout=parsed.thread_callout if parsed else None,
-            note=(parsed.note if parsed else "") or ("Detected by ML model; please fill in details." if not raw_text else ""),
-            source=BalloonSource.AUTO.value,
-            model_version=RULES_OCR_MODEL_VERSION,
-            confidence=round(max(0.0, min(1.0, confidence)), 3),
-            status=ReviewStatus.PENDING.value,
-        )
-        balloon.snapshot_prediction()
-        balloons.append(balloon)
-        number += 1
+            cx, cy = _placement_point(det.bbox, occupied)
+            occupied.append((cx, cy))
+
+            balloon = Balloon(
+                number=number,
+                drawing_id=drawing_id,
+                page_number=page_number,
+                x=cx,
+                y=cy,
+                bbox_x0=det.bbox[0],
+                bbox_y0=det.bbox[1],
+                bbox_x1=det.bbox[2],
+                bbox_y1=det.bbox[3],
+                char_type=char_type,
+                raw_text=raw_text,
+                nominal=parsed.nominal if parsed else None,
+                tol_plus=parsed.tol_plus if parsed else None,
+                tol_minus=parsed.tol_minus if parsed else None,
+                lower_limit=parsed.lower_limit if parsed else None,
+                upper_limit=parsed.upper_limit if parsed else None,
+                gdt_symbol=parsed.gdt_symbol if parsed else None,
+                gdt_tolerance=parsed.gdt_tolerance if parsed else None,
+                material_condition=parsed.material_condition if parsed else None,
+                datums=parsed.datums if parsed else None,
+                surface_finish=parsed.surface_finish if parsed else None,
+                thread_callout=parsed.thread_callout if parsed else None,
+                note=(parsed.note if parsed else "") or ("Detected by ML model; please fill in details." if not raw_text else ""),
+                source=BalloonSource.AUTO.value,
+                model_version=RULES_OCR_MODEL_VERSION,
+                confidence=round(max(0.0, min(1.0, confidence)), 3),
+                status=ReviewStatus.PENDING.value,
+            )
+            balloon.snapshot_prediction()
+            balloons.append(balloon)
+            number += 1
 
     if not balloons and not message:
         message = "No inspection characteristics were automatically detected on this page. Add balloons manually if needed."

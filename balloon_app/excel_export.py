@@ -1,12 +1,11 @@
-"""Generic Excel inspection-sheet export using openpyxl.
+"""AS9102 Form 3 (First Article Inspection Report) Excel export using openpyxl.
 
-Produces a workbook with:
-
-* ``Inspection Data`` -- one row per exported characteristic, with a live
-  PASS/FAIL formula driven by an "Actual" column the inspector fills in by
-  hand.
-* ``Project Info`` -- project/drawing metadata, including a link back to the
-  original source PDF.
+Produces a single-sheet workbook laid out like the standard AS9102 "Form 3:
+Characteristic Accountability, Verification and Compatibility Evaluation":
+a title block, a part/order info grid, then one row per ballooned
+characteristic under the Char No. / Characteristic Designator / Requirement /
+UoM / Upper Limit / Lower Limit / Results / Gauge / NonConformance Number /
+Notes column set.
 """
 
 from __future__ import annotations
@@ -18,51 +17,45 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.worksheet import Worksheet
 
 from balloon_app.data_model import Balloon, CharacteristicType, Drawing, Project, ReviewStatus
-from balloon_app.ocr_parser import compute_limits
 
 logger = logging.getLogger("balloon_app.excel_export")
 
 INSPECTION_SHEET_NAME = "Inspection Data"
-PROJECT_INFO_SHEET_NAME = "Project Info"
 
-# Column order matches the spec exactly; letters below are relied upon by the
-# generated Result formula, so do not reorder without updating it.
+FORM_NUMBER = "QF1439"
+FORM_REV = "-"
+
+# Column order matches AS9102 Form 3 field numbering.
 COLUMNS: list[tuple[str, str]] = [
-    ("A", "Char #"),
-    ("B", "Page"),
-    ("C", "Balloon Type"),
-    ("D", "Raw Drawing Callout"),
-    ("E", "Description"),
-    ("F", "Nominal"),
-    ("G", "Tol +"),
-    ("H", "Tol -"),
-    ("I", "Lower Limit"),
-    ("J", "Upper Limit"),
-    ("K", "GD&T Symbol"),
-    ("L", "GD&T Tolerance"),
-    ("M", "Material Condition"),
-    ("N", "Datums"),
-    ("O", "Surface Finish"),
-    ("P", "Thread Callout"),
-    ("Q", "Critical (Y/N)"),
-    ("R", "Inspection Method"),
-    ("S", "Actual"),
-    ("T", "Result"),
-    ("U", "Status"),
+    ("A", "7.\nChar No."),
+    ("B", "7a.\nCharacteristic Designator"),
+    ("C", "8.\nRequirement"),
+    ("D", "8a.\nUoM"),
+    ("E", "±"),
+    ("F", "8b.\nUpper Limit"),
+    ("G", "8c.\nLower Limit"),
+    ("H", "9.\nResults"),
+    ("I", "10.\nGauge"),
+    ("J", "11.\nNonConformance Number"),
+    ("K", "12.\nNotes"),
 ]
 
 _COLUMN_WIDTHS: dict[str, float] = {
-    "A": 8, "B": 6, "C": 18, "D": 30, "E": 32, "F": 10, "G": 8, "H": 8,
-    "I": 12, "J": 12, "K": 14, "L": 14, "M": 14, "N": 10, "O": 13, "P": 15,
-    "Q": 10, "R": 18, "S": 10, "T": 9, "U": 11,
+    "A": 8, "B": 24, "C": 14, "D": 8, "E": 5, "F": 12, "G": 12,
+    "H": 10, "I": 16, "J": 18, "K": 20,
 }
+
+_LAST_COL = COLUMNS[-1][0]
 
 HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
+GROUP_FILL = PatternFill(start_color="D9E2F3", end_color="D9E2F3", fill_type="solid")
+LABEL_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+THIN_BORDER = Border(*(Side(style="thin", color="808080"),) * 4)
 
 
 def is_exportable(balloon: Balloon, include_pending: bool) -> bool:
@@ -82,66 +75,166 @@ def is_exportable(balloon: Balloon, include_pending: bool) -> bool:
     return False
 
 
-def _write_headers(ws: Worksheet) -> None:
+def _fmt_number(value: Optional[float], strip_leading_zero: bool = False) -> Optional[str]:
+    if value is None:
+        return None
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    if text in ("", "-", "-0"):
+        text = "0"
+    if strip_leading_zero:
+        negative = text.startswith("-")
+        body = text[1:] if negative else text
+        if body.startswith("0.") and len(body) > 2:
+            body = body[1:]
+        text = ("-" if negative else "") + body
+    return text
+
+
+def _designator(balloon: Balloon) -> str:
+    if balloon.note.strip():
+        return balloon.note.strip()
+    return CharacteristicType.display_name(balloon.char_type)
+
+
+def _requirement(balloon: Balloon, strip_leading_zero: bool) -> str:
+    if balloon.char_type == CharacteristicType.NOTE.value:
+        return balloon.raw_text.strip() or balloon.note.strip()
+    if balloon.nominal is not None:
+        return _fmt_number(balloon.nominal, strip_leading_zero=strip_leading_zero) or ""
+    return balloon.raw_text.strip()
+
+
+def _uom(balloon: Balloon, project_unit: str) -> str:
+    if balloon.char_type == CharacteristicType.ANGLE.value:
+        return "deg"
+    if balloon.nominal is not None:
+        return project_unit
+    return ""
+
+
+def _tol_deltas(balloon: Balloon) -> tuple[Optional[float], Optional[float]]:
+    """Return (upper_delta, lower_delta) -- signed offsets from nominal, not absolute limits."""
+    upper_delta = balloon.tol_plus
+    if upper_delta is None and balloon.nominal is not None and balloon.upper_limit is not None:
+        upper_delta = balloon.upper_limit - balloon.nominal
+    lower_delta = -balloon.tol_minus if balloon.tol_minus is not None else None
+    if lower_delta is None and balloon.nominal is not None and balloon.lower_limit is not None:
+        lower_delta = balloon.lower_limit - balloon.nominal
+    return upper_delta, lower_delta
+
+
+def _write_row(ws: Worksheet, row: int, balloon: Balloon, project_unit: str) -> None:
+    strip_zero = project_unit == "in"
+    upper_delta, lower_delta = _tol_deltas(balloon)
+
+    values = {
+        "A": balloon.number,
+        "B": _designator(balloon),
+        "C": _requirement(balloon, strip_leading_zero=strip_zero),
+        "D": _uom(balloon, project_unit),
+        "E": "+" if (upper_delta is not None or lower_delta is not None) else "",
+        "F": _fmt_number(upper_delta),
+        "G": _fmt_number(lower_delta),
+        "H": None,  # Results -- filled in by the inspector
+        "I": balloon.inspection_method,
+        "J": None,  # NonConformance Number -- filled in by the inspector
+        "K": None,  # Notes -- filled in by the inspector
+    }
+    for col_letter, _title in COLUMNS:
+        cell = ws[f"{col_letter}{row}"]
+        cell.value = values.get(col_letter)
+        cell.border = THIN_BORDER
+        cell.alignment = Alignment(
+            horizontal="center" if col_letter in ("A", "D", "E", "F", "G", "H") else "left",
+            vertical="center",
+            wrap_text=col_letter in ("B", "C", "I", "K"),
+        )
+
+
+def _write_title_block(ws: Worksheet) -> int:
+    """Write the title rows and return the next free row number."""
+    ws.merge_cells(f"A1:{_LAST_COL}1")
+    ws["A1"] = "Sheet 1 of 1"
+    ws["A1"].alignment = Alignment(horizontal="right")
+    ws["A1"].font = Font(size=9, color="808080")
+
+    ws.merge_cells(f"A2:{_LAST_COL}2")
+    ws["A2"] = "First Article Inspection Report"
+    ws["A2"].font = Font(size=14, bold=True)
+    ws["A2"].alignment = Alignment(horizontal="center")
+    ws.row_dimensions[2].height = 22
+
+    ws.merge_cells(f"A3:{_LAST_COL}3")
+    ws["A3"] = "Form 3: Characteristic Accountability, Verification and Compatibility Evaluation"
+    ws["A3"].font = Font(size=11, bold=True)
+    ws["A3"].alignment = Alignment(horizontal="center")
+    return 4
+
+
+def _label_value(ws: Worksheet, row: int, col_letter: str, label: str, value: object) -> None:
+    label_cell = ws[f"{col_letter}{row}"]
+    label_cell.value = label
+    label_cell.font = Font(bold=True, size=9)
+    label_cell.fill = LABEL_FILL
+    label_cell.border = THIN_BORDER
+    label_cell.alignment = Alignment(vertical="center")
+
+    value_col = chr(ord(col_letter) + 1)
+    value_cell = ws[f"{value_col}{row}"]
+    value_cell.value = value
+    value_cell.border = THIN_BORDER
+    value_cell.alignment = Alignment(vertical="center")
+
+
+def _write_info_grid(ws: Worksheet, start_row: int, project: Project) -> int:
+    row1, row2 = start_row, start_row + 1
+
+    _label_value(ws, row1, "A", "1. Part Number", project.part_number)
+    _label_value(ws, row1, "C", "2. Part Name", project.part_name or project.name)
+    _label_value(ws, row1, "E", "3. Serial/Lot Number", project.serial_lot_number)
+    _label_value(ws, row1, "G", "4. FAI Report", project.fai_report)
+
+    _label_value(ws, row2, "A", "5. Part Rev", project.revision)
+    _label_value(ws, row2, "C", "6. PO Number:", project.po_number)
+    ws.merge_cells(f"D{row2}:E{row2}")
+    _label_value(ws, row2, "G", "6a. Mfg WO#:", project.mfg_wo)
+    ws.merge_cells(f"H{row2}:{_LAST_COL}{row2}")
+
+    ws.row_dimensions[row1].height = 18
+    ws.row_dimensions[row2].height = 18
+    return row2 + 2  # one blank spacer row
+
+
+def _write_group_headers(ws: Worksheet, row: int) -> None:
+    groups = [
+        ("A", "G", "Characteristic Accountability"),
+        ("H", "I", "Inspection / Test Results"),
+        ("J", "K", "Other Fields"),
+    ]
+    for start, end, title in groups:
+        ws.merge_cells(f"{start}{row}:{end}{row}")
+        cell = ws[f"{start}{row}"]
+        cell.value = title
+        cell.fill = GROUP_FILL
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = THIN_BORDER
+
+
+def _write_column_headers(ws: Worksheet, row: int) -> None:
     for col_letter, title in COLUMNS:
-        cell = ws[f"{col_letter}1"]
+        cell = ws[f"{col_letter}{row}"]
         cell.value = title
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    ws.freeze_panes = "A2"
-    ws.row_dimensions[1].height = 28
+        cell.border = THIN_BORDER
+    ws.row_dimensions[row].height = 30
 
 
 def _apply_column_widths(ws: Worksheet) -> None:
     for col_letter, width in _COLUMN_WIDTHS.items():
         ws.column_dimensions[col_letter].width = width
-
-
-def _result_formula(row: int) -> str:
-    return (
-        f'=IF(S{row}="","",'
-        f'IF(OR(I{row}="",J{row}=""),"",'
-        f'IF(AND(S{row}>=I{row},S{row}<=J{row}),"PASS","FAIL")))'
-    )
-
-
-def _write_row(ws: Worksheet, row: int, balloon: Balloon) -> None:
-    lower_limit = balloon.lower_limit
-    upper_limit = balloon.upper_limit
-    if lower_limit is None or upper_limit is None:
-        computed_lower, computed_upper = compute_limits(balloon.nominal, balloon.tol_plus, balloon.tol_minus)
-        lower_limit = lower_limit if lower_limit is not None else computed_lower
-        upper_limit = upper_limit if upper_limit is not None else computed_upper
-
-    values = {
-        "A": balloon.number,
-        "B": balloon.page_number + 1,  # display as 1-based
-        "C": CharacteristicType.display_name(balloon.char_type),
-        "D": balloon.raw_text,
-        "E": balloon.note,
-        "F": balloon.nominal,
-        "G": balloon.tol_plus,
-        "H": balloon.tol_minus,
-        "I": lower_limit,
-        "J": upper_limit,
-        "K": balloon.gdt_symbol,
-        "L": balloon.gdt_tolerance,
-        "M": balloon.material_condition,
-        "N": balloon.datums,
-        "O": balloon.surface_finish,
-        "P": balloon.thread_callout,
-        "Q": "Y" if balloon.critical else "N",
-        "R": balloon.inspection_method,
-        "S": None,  # Actual -- filled in by the inspector
-        "T": None,  # Result -- formula, set below
-        "U": balloon.status.capitalize(),
-    }
-    for col_letter, _title in COLUMNS:
-        if col_letter == "T":
-            continue
-        ws[f"{col_letter}{row}"] = values.get(col_letter)
-    ws[f"T{row}"] = _result_formula(row)
 
 
 def build_inspection_workbook(
@@ -150,68 +243,40 @@ def build_inspection_workbook(
     balloons: Iterable[Balloon],
     include_pending: bool = False,
 ) -> Workbook:
-    """Build (but do not save) the inspection workbook for one drawing."""
+    """Build (but do not save) the AS9102 Form 3 inspection workbook for one drawing."""
     exportable = [b for b in balloons if is_exportable(b, include_pending)]
     exportable.sort(key=lambda b: (b.page_number, b.number))
 
     wb = Workbook()
     ws = wb.active
     ws.title = INSPECTION_SHEET_NAME
-    _write_headers(ws)
-
-    row = 2
-    for balloon in exportable:
-        _write_row(ws, row, balloon)
-        row += 1
-
-    last_row = max(row - 1, 1)
-    ws.auto_filter.ref = f"A1:{COLUMNS[-1][0]}{last_row}"
     _apply_column_widths(ws)
 
-    info_ws = wb.create_sheet(PROJECT_INFO_SHEET_NAME)
-    _write_project_info(info_ws, project, drawing, exported_count=len(exportable), include_pending=include_pending)
+    next_row = _write_title_block(ws)
+    next_row = _write_info_grid(ws, next_row, project)
+
+    group_row = next_row
+    header_row = next_row + 1
+    _write_group_headers(ws, group_row)
+    _write_column_headers(ws, header_row)
+    ws.freeze_panes = f"A{header_row + 1}"
+
+    row = header_row + 1
+    for balloon in exportable:
+        _write_row(ws, row, balloon, project.unit or "in")
+        row += 1
+
+    last_data_row = max(row - 1, header_row)
+    ws.auto_filter.ref = f"A{header_row}:{_LAST_COL}{last_data_row}"
+
+    footer_row = row + 1
+    ws.merge_cells(f"I{footer_row}:{_LAST_COL}{footer_row}")
+    footer_cell = ws[f"I{footer_row}"]
+    footer_cell.value = f"Form {FORM_NUMBER} Rev {FORM_REV}"
+    footer_cell.font = Font(size=9, italic=True, color="808080")
+    footer_cell.alignment = Alignment(horizontal="right")
 
     return wb
-
-
-def _write_project_info(
-    ws: Worksheet, project: Project, drawing: Optional[Drawing], exported_count: int, include_pending: bool
-) -> None:
-    ws.column_dimensions["A"].width = 24
-    ws.column_dimensions["B"].width = 60
-
-    rows: list[tuple[str, object]] = [
-        ("Project Name", project.name),
-        ("Part Number", project.part_number),
-        ("Revision", project.revision),
-        ("Customer", project.customer),
-        ("Notes", project.notes),
-        ("Date Created", project.date_created),
-        ("Date Modified", project.date_modified),
-        ("", ""),
-        ("Drawing File Name", drawing.file_name if drawing else ""),
-        ("Original PDF Path", drawing.original_path if drawing else ""),
-        ("Page Count", drawing.page_count if drawing else ""),
-        ("", ""),
-        ("Characteristics Exported", exported_count),
-        ("Pending Proposals Included", "Yes" if include_pending else "No"),
-        ("Generated By", "BalloonApp"),
-    ]
-
-    for i, (label, value) in enumerate(rows, start=1):
-        label_cell = ws.cell(row=i, column=1, value=label)
-        label_cell.font = Font(bold=bool(label))
-        ws.cell(row=i, column=2, value=value)
-
-    if drawing and drawing.original_path:
-        link_row = 10  # "Original PDF Path" row above
-        cell = ws.cell(row=link_row, column=2)
-        try:
-            uri = Path(drawing.original_path).resolve().as_uri()
-            cell.hyperlink = uri
-            cell.font = Font(color="0563C1", underline="single")
-        except (ValueError, OSError):
-            pass  # leave as plain text if the path can't form a valid URI
 
 
 def export_excel(

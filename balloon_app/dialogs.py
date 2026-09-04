@@ -38,8 +38,9 @@ from balloon_app.ocr_parser import compute_limits
 from balloon_app.training_export import TeachStats
 
 COMMON_INSPECTION_METHODS = [
-    "", "Caliper", "Micrometer", "CMM", "Height Gage", "Optical Comparator",
-    "Thread Gage", "Surface Comparator", "Visual", "Ring/Plug Gage", "Other",
+    "", "Caliper", "Micrometer", "CMM", "Height Gauge", "Optical Comparator",
+    "Thread Gage", "Surface Comparator", "Visual", "Ring/Plug Gage", "Pin Gauge",
+    "Protractor", "GO/NO-GO", "Other",
 ]
 
 
@@ -53,16 +54,38 @@ class NewProjectDialog(QDialog):
 
         self.name_edit = QLineEdit("Untitled Project")
         self.part_number_edit = QLineEdit()
+        self.part_name_edit = QLineEdit()
         self.revision_edit = QLineEdit()
         self.customer_edit = QLineEdit()
+        self.unit_combo = QComboBox()
+        self.unit_combo.addItem("Inches (in)", "in")
+        self.unit_combo.addItem("Millimeters (mm)", "mm")
+        self.serial_lot_edit = QLineEdit()
+        self.fai_report_edit = QLineEdit()
+        self.po_number_edit = QLineEdit()
+        self.mfg_wo_edit = QLineEdit()
         self.notes_edit = QPlainTextEdit()
         self.notes_edit.setFixedHeight(70)
+
+        unit_hint = QLabel(
+            "Sets the unit of measure for every dimension on this drawing "
+            "(shown as \"UoM\" on the exported FAIR). Choose it now, before ballooning."
+        )
+        unit_hint.setWordWrap(True)
+        unit_hint.setStyleSheet("color: gray; font-size: 10px;")
 
         form = QFormLayout()
         form.addRow("Project Name:", self.name_edit)
         form.addRow("Part Number:", self.part_number_edit)
+        form.addRow("Part Name:", self.part_name_edit)
         form.addRow("Revision:", self.revision_edit)
         form.addRow("Customer:", self.customer_edit)
+        form.addRow("Unit of Measure:", self.unit_combo)
+        form.addRow("", unit_hint)
+        form.addRow("Serial/Lot Number:", self.serial_lot_edit)
+        form.addRow("FAI Report #:", self.fai_report_edit)
+        form.addRow("PO Number:", self.po_number_edit)
+        form.addRow("Mfg WO#:", self.mfg_wo_edit)
         form.addRow("Notes:", self.notes_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -83,8 +106,14 @@ class NewProjectDialog(QDialog):
         return {
             "name": self.name_edit.text().strip(),
             "part_number": self.part_number_edit.text().strip(),
+            "part_name": self.part_name_edit.text().strip(),
             "revision": self.revision_edit.text().strip(),
             "customer": self.customer_edit.text().strip(),
+            "unit": self.unit_combo.currentData(),
+            "serial_lot_number": self.serial_lot_edit.text().strip(),
+            "fai_report": self.fai_report_edit.text().strip(),
+            "po_number": self.po_number_edit.text().strip(),
+            "mfg_wo": self.mfg_wo_edit.text().strip(),
             "notes": self.notes_edit.toPlainText().strip(),
         }
 
@@ -92,13 +121,34 @@ class NewProjectDialog(QDialog):
 class ProjectPropertiesDialog(NewProjectDialog):
     """Same fields as :class:`NewProjectDialog`, pre-populated for editing."""
 
-    def __init__(self, name: str, part_number: str, revision: str, customer: str, notes: str, parent: Optional[QWidget] = None):
+    def __init__(
+        self,
+        name: str,
+        part_number: str,
+        part_name: str,
+        revision: str,
+        customer: str,
+        unit: str,
+        serial_lot_number: str,
+        fai_report: str,
+        po_number: str,
+        mfg_wo: str,
+        notes: str,
+        parent: Optional[QWidget] = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Project Properties")
         self.name_edit.setText(name)
         self.part_number_edit.setText(part_number)
+        self.part_name_edit.setText(part_name)
         self.revision_edit.setText(revision)
         self.customer_edit.setText(customer)
+        idx = self.unit_combo.findData(unit)
+        self.unit_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.serial_lot_edit.setText(serial_lot_number)
+        self.fai_report_edit.setText(fai_report)
+        self.po_number_edit.setText(po_number)
+        self.mfg_wo_edit.setText(mfg_wo)
         self.notes_edit.setPlainText(notes)
 
 

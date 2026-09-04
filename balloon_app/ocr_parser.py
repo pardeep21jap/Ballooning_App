@@ -50,6 +50,18 @@ _THREAD_UNIFIED_RE = re.compile(
 )
 _THREAD_METRIC_RE = re.compile(rf"\bM\s?(\d+\.?\d*)\s*[xX×]\s*({NUM})\b")
 
+# A depth callout trailing a thread spec, e.g. "8-32 UNC-2B ▼0.500" (tapped
+# hole depth). CAD PDF exports draw the "depth" glyph from a custom
+# GD&T/dingbat font, so the character actually extracted from the PDF for
+# that glyph varies by CAD tool/font -- it can be ▼, ⌵, ↓, or (when the font
+# has no proper ToUnicode mapping for it) an unrelated ASCII letter like
+# "x". Matching specific symbol characters is therefore unreliable; instead
+# any decimal number trailing the thread match is treated as the depth,
+# since nothing else legitimately follows a thread callout on a drawing.
+# Thread *class* codes ("2B", "6H", "3A") are bare integers glued to a
+# letter, never decimals, so they don't false-match here.
+_TRAILING_DECIMAL_RE = re.compile(r"(\d+\.\d+|\.\d+)")
+
 _SURFACE_FINISH_RE_PREFIX = re.compile(rf"\bRa\s*({NUM})\s*(µm|um|μm)?\b", re.IGNORECASE)
 _SURFACE_FINISH_RE_SUFFIX = re.compile(rf"({NUM})\s*(µm|um|μm)?\s*Ra\b", re.IGNORECASE)
 
@@ -61,6 +73,43 @@ _GENERAL_TOL_KEYWORDS_RE = re.compile(
 _DIAMETER_RE = re.compile(rf"[{_DIAMETER_SYMBOLS}]|\bDIA\b", re.IGNORECASE)
 _RADIUS_RE = re.compile(r"(?<![A-Za-z])R(?![a-zA-Z])\s*" + NUM)
 _ANGLE_HINT_RE = re.compile(r"°")
+
+# ASME Y14.5 dimensioning-modifier symbols for hole features. Matching
+# specific Unicode characters alone is unreliable (see _TRAILING_DECIMAL_RE
+# above -- CAD PDF exports often draw these from a custom dingbat font with
+# no ToUnicode mapping, so the extracted text can be an unrelated ASCII
+# character), so each also matches its common textual/abbreviation form.
+_DEPTH_HINT_RE = re.compile(r"[▼↓]|\bDEPTH\b|\bDEEP\b|\bDP\b", re.IGNORECASE)
+_COUNTERBORE_HINT_RE = re.compile(r"[⌴]|C['’]?BORE|\bCOUNTERBORE\b", re.IGNORECASE)
+_COUNTERSINK_HINT_RE = re.compile(r"[⌵]|C['’]?SINK|\bCSK\b|\bCOUNTERSINK\b", re.IGNORECASE)
+_SQUARE_HINT_RE = re.compile(r"[□]|\bSQ\b|\bSQUARE\b", re.IGNORECASE)
+
+# Paired "symbol/keyword + its own number" extractors, used to pull a shape
+# value back out of a compound callout that also carries a depth (see
+# _try_shape_with_depth below) -- unlike the *_HINT_RE checks above these
+# capture the number that belongs to the shape itself, not just detect that
+# the shape symbol is present somewhere in the text.
+_DIAMETER_VALUE_RE = re.compile(rf"[{_DIAMETER_SYMBOLS}]\s*({NUM})")
+_RADIUS_VALUE_RE = re.compile(rf"(?<![A-Za-z])R(?![a-zA-Z])\s*({NUM})")
+_SQUARE_VALUE_RE = re.compile(rf"(?:[□]|\bSQ\b|\bSQUARE\b)\s*({NUM})", re.IGNORECASE)
+
+# A leading "instance count" prefix, e.g. "2X " / "9X " ("2 places", "9
+# holes"). Not a measurable value itself -- stripped before generic numeric
+# extraction so it isn't mistaken for the dimension's nominal (e.g. "9X
+# 0.250" must not parse as nominal=9).
+_LEADING_QTY_RE = re.compile(r"^\s*\d+\s*[Xx]\s+")
+
+# A quantity-prefixed hole callout with two bare numbers and no explicit
+# tolerance markup between them, e.g. "2X n 0.089 x 0.500" -- almost always
+# a hole's diameter and its depth, with the actual symbols mangled into
+# unrelated letters ("n", "x") by a CAD PDF export's custom dingbat font
+# with no ToUnicode mapping (the same root cause _TRAILING_DECIMAL_RE above
+# works around for threads). Unlike the symbol-based extractors, this can't
+# know *which* letters are meant to be symbols, so it is a lower-confidence,
+# purely structural fallback tried only when nothing more specific matched.
+_QTY_TWO_VALUE_RE = re.compile(
+    rf"^\s*\d+\s*[Xx]\s+[A-Za-z]{{0,3}}\s*({NUM})\s+[A-Za-z]{{0,3}}\s*({NUM})\b"
+)
 
 # Numeric tolerance extraction patterns, tried in priority order.
 _ASYM_SLASH_RE = re.compile(rf"({NUM})\s*\+\s*({NUM})\s*/\s*-\s*({NUM})")
@@ -111,7 +160,7 @@ def _extract_numeric_tolerance(text: str) -> Optional[dict]:
 
     Returns ``None`` if no numeric pattern at all is found.
     """
-    search_text = text.replace("°", " ")
+    search_text = _LEADING_QTY_RE.sub("", text.replace("°", " "), count=1)
 
     m = _ASYM_SLASH_RE.search(search_text)
     if m:
@@ -177,26 +226,100 @@ def _extract_numeric_tolerance(text: str) -> Optional[dict]:
     return None
 
 
-def _try_thread(text: str) -> Optional[ParsedCharacteristic]:
+def _try_thread(text: str) -> Optional[list[ParsedCharacteristic]]:
     m = _THREAD_METRIC_RE.search(text)
     if m:
         callout = f"M{m.group(1)} x {m.group(2)}"
-        return ParsedCharacteristic(
+    else:
+        m = _THREAD_UNIFIED_RE.search(text)
+        if m:
+            callout = f"{m.group(1)}-{m.group(2)} {m.group(3).upper()}"
+        else:
+            return None
+
+    results = [
+        ParsedCharacteristic(
             char_type=CharacteristicType.THREAD.value,
             raw_text=text,
             thread_callout=callout,
             confidence=0.85,
         )
-    m = _THREAD_UNIFIED_RE.search(text)
-    if m:
-        callout = f"{m.group(1)}-{m.group(2)} {m.group(3).upper()}"
-        return ParsedCharacteristic(
-            char_type=CharacteristicType.THREAD.value,
-            raw_text=text,
-            thread_callout=callout,
-            confidence=0.85,
+    ]
+
+    depth_match = _TRAILING_DECIMAL_RE.search(text, m.end())
+    if depth_match:
+        results.append(
+            ParsedCharacteristic(
+                char_type=CharacteristicType.DEPTH.value,
+                raw_text=text,
+                nominal=_round(float(depth_match.group(1))),
+                confidence=0.8,
+            )
         )
+    return results
+
+
+def _try_shape_with_depth(text: str) -> Optional[list[ParsedCharacteristic]]:
+    """A shape value paired with a trailing depth callout on the same line,
+
+    e.g. "2X ⌀0.089 ▼0.500" -- a hole's diameter *and* its depth, checked
+    with different gauges -- becomes two characteristics (Diameter, Depth)
+    instead of one, matching how :func:`_try_thread` already splits a
+    thread callout from its trailing depth.
+    """
+    if not _DEPTH_HINT_RE.search(text):
+        return None  # nothing to pair with -- let the single-value path handle it
+
+    for value_re, char_type in (
+        (_DIAMETER_VALUE_RE, CharacteristicType.DIAMETER.value),
+        (_SQUARE_VALUE_RE, CharacteristicType.SQUARE.value),
+        (_RADIUS_VALUE_RE, CharacteristicType.RADIUS.value),
+    ):
+        m = value_re.search(text)
+        if not m:
+            continue
+        depth_match = _TRAILING_DECIMAL_RE.search(text, m.end())
+        if not depth_match:
+            continue
+        return [
+            ParsedCharacteristic(
+                char_type=char_type,
+                raw_text=text,
+                nominal=_round(float(m.group(1))),
+                confidence=0.85,
+            ),
+            ParsedCharacteristic(
+                char_type=CharacteristicType.DEPTH.value,
+                raw_text=text,
+                nominal=_round(float(depth_match.group(1))),
+                confidence=0.8,
+            ),
+        ]
     return None
+
+
+def _try_qty_prefixed_two_values(text: str) -> Optional[list[ParsedCharacteristic]]:
+    """Structural fallback for a quantity-prefixed hole callout whose two
+    dimension symbols are both unrecognized (see _QTY_TWO_VALUE_RE above).
+    Assumes the far more common ordering: diameter first, depth second.
+    """
+    m = _QTY_TWO_VALUE_RE.match(text)
+    if not m:
+        return None
+    return [
+        ParsedCharacteristic(
+            char_type=CharacteristicType.DIAMETER.value,
+            raw_text=text,
+            nominal=_round(float(m.group(1))),
+            confidence=0.55,
+        ),
+        ParsedCharacteristic(
+            char_type=CharacteristicType.DEPTH.value,
+            raw_text=text,
+            nominal=_round(float(m.group(2))),
+            confidence=0.5,
+        ),
+    ]
 
 
 def _try_surface_finish(text: str) -> Optional[ParsedCharacteristic]:
@@ -288,35 +411,66 @@ def compute_limits(
     return lower, upper
 
 
-def parse_characteristic(text: str) -> ParsedCharacteristic:
-    """Classify and parse a chunk of drawing text into a characteristic.
+def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
+    """Classify and parse a chunk of drawing text into one or more characteristics.
+
+    Usually returns a single item, but a compound callout that packs two
+    independently-inspected requirements into one piece of drawing text
+    (e.g. a tapped hole's thread class *and* its depth, checked with
+    different gauges) is split into separate characteristics here so each
+    becomes its own balloon/line item.
 
     The original text is always preserved in ``raw_text`` regardless of
     whether parsing fully succeeds, so nothing is ever silently lost.
     """
     text = (text or "").strip()
     if not text:
-        return ParsedCharacteristic(char_type=CharacteristicType.OTHER.value, raw_text=text, confidence=0.0)
+        return [ParsedCharacteristic(char_type=CharacteristicType.OTHER.value, raw_text=text, confidence=0.0)]
 
-    for attempt in (_try_thread, _try_surface_finish, _try_gdt, _try_general_tolerance):
+    thread_results = _try_thread(text)
+    if thread_results is not None:
+        return thread_results
+
+    for attempt in (_try_surface_finish, _try_gdt, _try_general_tolerance):
         result = attempt(text)
         if result is not None:
-            return result
+            return [result]
 
+    shape_and_depth = _try_shape_with_depth(text)
+    if shape_and_depth is not None:
+        return shape_and_depth
+
+    qty_two_values = _try_qty_prefixed_two_values(text)
+    if qty_two_values is not None:
+        return qty_two_values
+
+    is_depth = bool(_DEPTH_HINT_RE.search(text))
+    is_counterbore = bool(_COUNTERBORE_HINT_RE.search(text))
+    is_countersink = bool(_COUNTERSINK_HINT_RE.search(text))
+    is_square = bool(_SQUARE_HINT_RE.search(text))
     is_diameter = bool(_DIAMETER_RE.search(text))
     is_radius = bool(_RADIUS_RE.search(text))
     is_angle = bool(_ANGLE_HINT_RE.search(text))
 
     numeric = _extract_numeric_tolerance(text)
 
-    if is_diameter:
+    # A hole-feature modifier symbol (depth/counterbore/countersink/square)
+    # is more specific than a bare diameter/radius, so it wins when both are
+    # present in the same callout (e.g. a counterbore diameter "⌴⌀.500").
+    if is_depth:
+        char_type = CharacteristicType.DEPTH.value
+    elif is_counterbore:
+        char_type = CharacteristicType.COUNTERBORE.value
+    elif is_countersink:
+        char_type = CharacteristicType.COUNTERSINK.value
+    elif is_square:
+        char_type = CharacteristicType.SQUARE.value
+    elif is_diameter:
         char_type = CharacteristicType.DIAMETER.value
     elif is_radius:
         char_type = CharacteristicType.RADIUS.value
     elif is_angle:
         char_type = CharacteristicType.ANGLE.value
-    elif numeric is not None and numeric["confidence"] >= 0.8:
-        char_type = CharacteristicType.LINEAR_DIMENSION.value
     elif numeric is not None:
         char_type = CharacteristicType.LINEAR_DIMENSION.value
     else:
@@ -324,23 +478,37 @@ def parse_characteristic(text: str) -> ParsedCharacteristic:
 
     if numeric is not None:
         confidence = numeric["confidence"]
-        if is_diameter or is_radius or is_angle:
+        if is_diameter or is_radius or is_angle or is_depth or is_counterbore or is_countersink or is_square:
             confidence = max(confidence, 0.75) if numeric["confidence"] >= 0.8 else 0.6
-        return ParsedCharacteristic(
-            char_type=char_type,
-            raw_text=text,
-            nominal=numeric["nominal"],
-            tol_plus=numeric["tol_plus"],
-            tol_minus=numeric["tol_minus"],
-            lower_limit=numeric["lower_limit"],
-            upper_limit=numeric["upper_limit"],
-            confidence=confidence,
-        )
+        return [
+            ParsedCharacteristic(
+                char_type=char_type,
+                raw_text=text,
+                nominal=numeric["nominal"],
+                tol_plus=numeric["tol_plus"],
+                tol_minus=numeric["tol_minus"],
+                lower_limit=numeric["lower_limit"],
+                upper_limit=numeric["upper_limit"],
+                confidence=confidence,
+            )
+        ]
 
     # Nothing numeric recognized at all -- preserve as a note for manual review.
-    return ParsedCharacteristic(
-        char_type=CharacteristicType.NOTE.value,
-        raw_text=text,
-        note=text,
-        confidence=0.2,
-    )
+    return [
+        ParsedCharacteristic(
+            char_type=CharacteristicType.NOTE.value,
+            raw_text=text,
+            note=text,
+            confidence=0.2,
+        )
+    ]
+
+
+def parse_characteristic(text: str) -> ParsedCharacteristic:
+    """Classify and parse a chunk of drawing text into a single characteristic.
+
+    Convenience wrapper around :func:`parse_characteristics` for callers
+    that only need one representative result (e.g. estimating a confidence
+    label for a detection) rather than every characteristic packed into it.
+    """
+    return parse_characteristics(text)[0]

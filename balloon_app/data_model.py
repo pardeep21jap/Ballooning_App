@@ -32,6 +32,10 @@ class CharacteristicType(str, Enum):
     SURFACE_FINISH = "surface_finish"
     NOTE = "note"
     GENERAL_TOLERANCE = "general_tolerance"
+    DEPTH = "depth"
+    COUNTERBORE = "counterbore"
+    COUNTERSINK = "countersink"
+    SQUARE = "square"
     OTHER = "other"
 
     @classmethod
@@ -46,6 +50,10 @@ class CharacteristicType(str, Enum):
             cls.SURFACE_FINISH: "Surface Finish",
             cls.NOTE: "Note",
             cls.GENERAL_TOLERANCE: "General Tolerance",
+            cls.DEPTH: "Depth",
+            cls.COUNTERBORE: "Counterbore",
+            cls.COUNTERSINK: "Countersink",
+            cls.SQUARE: "Square",
             cls.OTHER: "Other",
         }
         try:
@@ -194,9 +202,15 @@ class Project:
     id: str = field(default_factory=new_id)
     name: str = "Untitled Project"
     part_number: str = ""
+    part_name: str = ""
     revision: str = ""
     customer: str = ""
     notes: str = ""
+    unit: str = "in"  # "in" or "mm" -- chosen once, at project/ballooning start
+    serial_lot_number: str = ""
+    fai_report: str = ""
+    po_number: str = ""
+    mfg_wo: str = ""
     date_created: str = field(default_factory=_now_iso)
     date_modified: str = field(default_factory=_now_iso)
     file_path: str = ""  # path to the .bpdb SQLite file, set after save
@@ -230,9 +244,15 @@ class Project:
             "id": self.id,
             "name": self.name,
             "part_number": self.part_number,
+            "part_name": self.part_name,
             "revision": self.revision,
             "customer": self.customer,
             "notes": self.notes,
+            "unit": self.unit,
+            "serial_lot_number": self.serial_lot_number,
+            "fai_report": self.fai_report,
+            "po_number": self.po_number,
+            "mfg_wo": self.mfg_wo,
             "date_created": self.date_created,
             "date_modified": self.date_modified,
             "file_path": self.file_path,
@@ -248,9 +268,15 @@ class Project:
             id=data.get("id", new_id()),
             name=data.get("name", "Untitled Project"),
             part_number=data.get("part_number", ""),
+            part_name=data.get("part_name", ""),
             revision=data.get("revision", ""),
             customer=data.get("customer", ""),
             notes=data.get("notes", ""),
+            unit=data.get("unit", "in"),
+            serial_lot_number=data.get("serial_lot_number", ""),
+            fai_report=data.get("fai_report", ""),
+            po_number=data.get("po_number", ""),
+            mfg_wo=data.get("mfg_wo", ""),
             date_created=data.get("date_created", _now_iso()),
             date_modified=data.get("date_modified", _now_iso()),
             file_path=data.get("file_path", ""),

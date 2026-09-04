@@ -145,14 +145,21 @@ class PdfDocument:
             logger.exception("Failed extracting text on page %d of %s", page_number, self.path)
             return result
 
+        # ``get_text`` reports spans in the page's raw/mediabox space, which
+        # differs from ``page.rect`` (and therefore from ``render_page_rgb``'s
+        # pixel output) whenever the page has a /Rotate entry. Apply the same
+        # rotation PyMuPDF bakes into rendering so text bboxes land on the
+        # visible ink instead of the pre-rotation blank area.
+        rotation_matrix = page.rotation_matrix
         for block in raw.get("blocks", []):
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
                     text = span.get("text", "").strip()
                     if len(text) < min_chars:
                         continue
-                    bbox = tuple(span.get("bbox", (0, 0, 0, 0)))
-                    result.append(TextBlock(text=text, bbox=bbox))  # type: ignore[arg-type]
+                    rect = fitz.Rect(span.get("bbox", (0, 0, 0, 0))) * rotation_matrix
+                    rect.normalize()
+                    result.append(TextBlock(text=text, bbox=tuple(rect)))  # type: ignore[arg-type]
         return result
 
     def has_native_text(self, page_number: int) -> bool:

@@ -106,6 +106,12 @@ CHARACTERISTIC_CLASSES: list[str] = [
     "note",
     "general_tolerance",
     "other",
+    # Appended after the fact -- keep new entries at the end so class ids
+    # baked into any already-exported dataset/label files stay stable.
+    "depth",
+    "counterbore",
+    "countersink",
+    "square",
 ]
 
 

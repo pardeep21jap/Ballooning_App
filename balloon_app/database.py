@@ -31,9 +31,15 @@ CREATE TABLE IF NOT EXISTS project (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     part_number TEXT,
+    part_name TEXT,
     revision TEXT,
     customer TEXT,
     notes TEXT,
+    unit TEXT,
+    serial_lot_number TEXT,
+    fai_report TEXT,
+    po_number TEXT,
+    mfg_wo TEXT,
     date_created TEXT,
     date_modified TEXT
 );
@@ -106,7 +112,24 @@ class ProjectDatabase:
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(SCHEMA)
+        self._migrate_project_columns()
         self._conn.commit()
+
+    def _migrate_project_columns(self) -> None:
+        """Add project columns introduced after a project file's schema was created."""
+        assert self._conn is not None
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(project)")}
+        new_columns = {
+            "part_name": "TEXT",
+            "unit": "TEXT",
+            "serial_lot_number": "TEXT",
+            "fai_report": "TEXT",
+            "po_number": "TEXT",
+            "mfg_wo": "TEXT",
+        }
+        for column, sql_type in new_columns.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE project ADD COLUMN {column} {sql_type}")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -135,16 +158,23 @@ class ProjectDatabase:
 
                 conn.execute(
                     """INSERT INTO project
-                       (id, name, part_number, revision, customer, notes,
+                       (id, name, part_number, part_name, revision, customer, notes,
+                        unit, serial_lot_number, fai_report, po_number, mfg_wo,
                         date_created, date_modified)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         project.id,
                         project.name,
                         project.part_number,
+                        project.part_name,
                         project.revision,
                         project.customer,
                         project.notes,
+                        project.unit,
+                        project.serial_lot_number,
+                        project.fai_report,
+                        project.po_number,
+                        project.mfg_wo,
                         project.date_created,
                         project.date_modified,
                     ),
@@ -202,13 +232,20 @@ class ProjectDatabase:
         if row is None:
             raise ValueError(f"No project found in database: {self.path}")
 
+        row_keys = row.keys()
         project = Project(
             id=row["id"],
             name=row["name"],
             part_number=row["part_number"] or "",
+            part_name=(row["part_name"] or "") if "part_name" in row_keys else "",
             revision=row["revision"] or "",
             customer=row["customer"] or "",
             notes=row["notes"] or "",
+            unit=(row["unit"] or "in") if "unit" in row_keys else "in",
+            serial_lot_number=(row["serial_lot_number"] or "") if "serial_lot_number" in row_keys else "",
+            fai_report=(row["fai_report"] or "") if "fai_report" in row_keys else "",
+            po_number=(row["po_number"] or "") if "po_number" in row_keys else "",
+            mfg_wo=(row["mfg_wo"] or "") if "mfg_wo" in row_keys else "",
             date_created=row["date_created"] or "",
             date_modified=row["date_modified"] or "",
             file_path=str(self.path),
