@@ -36,10 +36,6 @@ CREATE TABLE IF NOT EXISTS project (
     customer TEXT,
     notes TEXT,
     unit TEXT,
-    serial_lot_number TEXT,
-    fai_report TEXT,
-    po_number TEXT,
-    mfg_wo TEXT,
     date_created TEXT,
     date_modified TEXT
 );
@@ -52,10 +48,7 @@ CREATE TABLE IF NOT EXISTS drawing (
     page_count INTEGER,
     date_added TEXT,
     last_known_good_path TEXT,
-    tol_one_decimal REAL,
-    tol_two_decimal REAL,
-    tol_three_decimal REAL,
-    tol_four_decimal REAL,
+    tol_by_decimal_places TEXT,
     tol_angular REAL,
     tolerances_configured INTEGER,
     FOREIGN KEY (project_id) REFERENCES project(id) ON DELETE CASCADE
@@ -101,6 +94,28 @@ CREATE INDEX IF NOT EXISTS idx_balloon_drawing ON balloon(drawing_id);
 
 SCHEMA_VERSION = 1
 
+_LEGACY_TOL_COLUMNS = {
+    "tol_one_decimal": 1, "tol_two_decimal": 2, "tol_three_decimal": 3, "tol_four_decimal": 4,
+}
+
+
+def _tolerance_dict_from_row(row: sqlite3.Row) -> dict[int, float]:
+    """A drawing row's tolerance table: the new JSON column if present,
+    otherwise the old fixed tol_{one,two,three,four}_decimal columns from a
+    project saved before the table became an open-ended map."""
+    raw = row["tol_by_decimal_places"] if "tol_by_decimal_places" in row.keys() else None
+    if raw:
+        try:
+            return {int(k): v for k, v in json.loads(raw).items()}
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            pass
+    row_keys = row.keys()
+    return {
+        places: row[column]
+        for column, places in _LEGACY_TOL_COLUMNS.items()
+        if column in row_keys and row[column] is not None
+    }
+
 
 class ProjectDatabase:
     """Owns a single SQLite connection for one project file."""
@@ -129,10 +144,6 @@ class ProjectDatabase:
         new_columns = {
             "part_name": "TEXT",
             "unit": "TEXT",
-            "serial_lot_number": "TEXT",
-            "fai_report": "TEXT",
-            "po_number": "TEXT",
-            "mfg_wo": "TEXT",
         }
         for column, sql_type in new_columns.items():
             if column not in existing:
@@ -143,10 +154,14 @@ class ProjectDatabase:
         assert self._conn is not None
         existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(drawing)")}
         new_columns = {
+            # Legacy fixed-tier columns (superseded by tol_by_decimal_places
+            # below) -- kept so a project file saved by an older build of the
+            # app still has them for the one-time read-back in load_project.
             "tol_one_decimal": "REAL",
             "tol_two_decimal": "REAL",
             "tol_three_decimal": "REAL",
             "tol_four_decimal": "REAL",
+            "tol_by_decimal_places": "TEXT",
             "tol_angular": "REAL",
             "tolerances_configured": "INTEGER",
         }
@@ -182,9 +197,8 @@ class ProjectDatabase:
                 conn.execute(
                     """INSERT INTO project
                        (id, name, part_number, part_name, revision, customer, notes,
-                        unit, serial_lot_number, fai_report, po_number, mfg_wo,
-                        date_created, date_modified)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        unit, date_created, date_modified)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         project.id,
                         project.name,
@@ -194,10 +208,6 @@ class ProjectDatabase:
                         project.customer,
                         project.notes,
                         project.unit,
-                        project.serial_lot_number,
-                        project.fai_report,
-                        project.po_number,
-                        project.mfg_wo,
                         project.date_created,
                         project.date_modified,
                     ),
@@ -208,9 +218,8 @@ class ProjectDatabase:
                         """INSERT INTO drawing
                            (id, project_id, file_name, original_path, page_count,
                             date_added, last_known_good_path,
-                            tol_one_decimal, tol_two_decimal, tol_three_decimal,
-                            tol_four_decimal, tol_angular, tolerances_configured)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            tol_by_decimal_places, tol_angular, tolerances_configured)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             d.id,
                             project.id,
@@ -219,10 +228,8 @@ class ProjectDatabase:
                             d.page_count,
                             d.date_added,
                             d.last_known_good_path,
-                            d.tol_one_decimal,
-                            d.tol_two_decimal,
-                            d.tol_three_decimal,
-                            d.tol_four_decimal,
+                            json.dumps({str(k): v for k, v in d.tol_by_decimal_places.items()})
+                            if d.tol_by_decimal_places else None,
                             d.tol_angular,
                             int(d.tolerances_configured),
                         ),
@@ -273,10 +280,6 @@ class ProjectDatabase:
             customer=row["customer"] or "",
             notes=row["notes"] or "",
             unit=(row["unit"] or "in") if "unit" in row_keys else "in",
-            serial_lot_number=(row["serial_lot_number"] or "") if "serial_lot_number" in row_keys else "",
-            fai_report=(row["fai_report"] or "") if "fai_report" in row_keys else "",
-            po_number=(row["po_number"] or "") if "po_number" in row_keys else "",
-            mfg_wo=(row["mfg_wo"] or "") if "mfg_wo" in row_keys else "",
             date_created=row["date_created"] or "",
             date_modified=row["date_modified"] or "",
             file_path=str(self.path),
@@ -292,10 +295,7 @@ class ProjectDatabase:
                     page_count=drow["page_count"] or 0,
                     date_added=drow["date_added"] or "",
                     last_known_good_path=drow["last_known_good_path"] or "",
-                    tol_one_decimal=drow["tol_one_decimal"],
-                    tol_two_decimal=drow["tol_two_decimal"],
-                    tol_three_decimal=drow["tol_three_decimal"],
-                    tol_four_decimal=drow["tol_four_decimal"],
+                    tol_by_decimal_places=_tolerance_dict_from_row(drow),
                     tol_angular=drow["tol_angular"],
                     tolerances_configured=bool(drow["tolerances_configured"]),
                 )

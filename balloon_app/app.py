@@ -472,6 +472,10 @@ class MainWindow(QMainWindow):
 
         self.recent_menu = file_menu.addMenu("Recent Projects")
 
+        close_project_act = QAction("Close Project", self)
+        close_project_act.triggered.connect(self._close_project)
+        file_menu.addAction(close_project_act)
+
         file_menu.addSeparator()
         save_project_act = QAction("Save Project", self)
         save_project_act.setShortcut(QKeySequence("Ctrl+S"))
@@ -764,6 +768,31 @@ class MainWindow(QMainWindow):
             return
         self._load_project_object(project, path)
 
+    def _close_project(self) -> None:
+        if self.project is None:
+            QMessageBox.information(self, "No Project", "No project is currently open.")
+            return
+        if not self._confirm_discard_changes():
+            return
+        if self.pdf_doc is not None:
+            try:
+                self.pdf_doc.close()
+            except Exception:
+                pass
+        self.project = None
+        self.drawing = None
+        self.pdf_doc = None
+        self.current_page = 0
+        self.pdf_view.load_document(None)
+        self.undo_stack.clear()
+        self._dirty = False
+
+        self._refresh_drawing_selector()
+        self._refresh_review_table()
+        self._update_window_title()
+        self._update_page_controls()
+        self.statusBar().showMessage("Project closed.", 4000)
+
     def _load_project_object(self, project: Project, path: Path) -> None:
         if self.pdf_doc is not None:
             try:
@@ -831,8 +860,7 @@ class MainWindow(QMainWindow):
         dialog = ProjectPropertiesDialog(
             self.project.name, self.project.part_number, self.project.part_name,
             self.project.revision, self.project.customer, self.project.unit,
-            self.project.serial_lot_number, self.project.fai_report,
-            self.project.po_number, self.project.mfg_wo, self.project.notes, self,
+            self.project.notes, self,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             values = dialog.values()
@@ -842,10 +870,6 @@ class MainWindow(QMainWindow):
             self.project.revision = values["revision"]
             self.project.customer = values["customer"]
             self.project.unit = values["unit"]
-            self.project.serial_lot_number = values["serial_lot_number"]
-            self.project.fai_report = values["fai_report"]
-            self.project.po_number = values["po_number"]
-            self.project.mfg_wo = values["mfg_wo"]
             self.project.notes = values["notes"]
             self.project.touch()
             self._mark_dirty()
@@ -1503,10 +1527,7 @@ class MainWindow(QMainWindow):
         if self.drawing is None:
             return DefaultTolerances()
         return DefaultTolerances(
-            one_decimal=self.drawing.tol_one_decimal,
-            two_decimal=self.drawing.tol_two_decimal,
-            three_decimal=self.drawing.tol_three_decimal,
-            four_decimal=self.drawing.tol_four_decimal,
+            by_decimal_places=dict(self.drawing.tol_by_decimal_places),
             angular=self.drawing.tol_angular,
         )
 
@@ -1531,7 +1552,7 @@ class MainWindow(QMainWindow):
         detected = parse_default_tolerances(page_text)
 
         dialog = DefaultTolerancesDialog(
-            detected.one_decimal, detected.two_decimal, detected.three_decimal, detected.angular,
+            detected.by_decimal_places, detected.angular,
             auto_detected=not detected.is_empty(), parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1542,9 +1563,7 @@ class MainWindow(QMainWindow):
 
     def _apply_tolerance_dialog_values(self, dialog: DefaultTolerancesDialog) -> None:
         values = dialog.values()
-        self.drawing.tol_one_decimal = values["tol_one_decimal"]
-        self.drawing.tol_two_decimal = values["tol_two_decimal"]
-        self.drawing.tol_three_decimal = values["tol_three_decimal"]
+        self.drawing.tol_by_decimal_places = values["tol_by_decimal_places"]
         self.drawing.tol_angular = values["tol_angular"]
         self.drawing.tolerances_configured = True
         self._mark_dirty()
@@ -1554,8 +1573,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Drawing", "Open or add a PDF drawing first.")
             return
         dialog = DefaultTolerancesDialog(
-            self.drawing.tol_one_decimal, self.drawing.tol_two_decimal, self.drawing.tol_three_decimal,
-            self.drawing.tol_angular,
+            self.drawing.tol_by_decimal_places, self.drawing.tol_angular,
             auto_detected=self.drawing.tolerances_configured, parent=self,
         )
         if dialog.exec() == QDialog.DialogCode.Accepted:

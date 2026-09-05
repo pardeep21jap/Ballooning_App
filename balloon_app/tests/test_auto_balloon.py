@@ -175,7 +175,7 @@ class TestDefaultTolerances:
 
         pdf_doc = PdfDocument(pdf_path)
         pdf_doc.open()
-        defaults = DefaultTolerances(three_decimal=0.005)
+        defaults = DefaultTolerances(by_decimal_places={3: 0.005})
         result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200, default_tolerances=defaults)
         pdf_doc.close()
 
@@ -247,7 +247,7 @@ class TestCountersinkDiameterAngleCallout:
 
         pdf_doc = PdfDocument(pdf_path)
         pdf_doc.open()
-        defaults = DefaultTolerances(three_decimal=0.005, angular=0.5)
+        defaults = DefaultTolerances(by_decimal_places={3: 0.005}, angular=0.5)
         result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200, default_tolerances=defaults)
         pdf_doc.close()
 
@@ -520,3 +520,97 @@ class TestZoneMarginWholeNumberDimensions:
         assert "75" in raw_texts
         assert "19" in raw_texts
         assert not ({"1", "2", "3", "4"} & raw_texts)
+
+
+def _draw_small_circle(page, near_bbox, radius=3.0, gap=1.5):
+    """Draw a small vector circle just left of ``near_bbox``, mimicking a
+    CAD PDF export that draws the Ø glyph as line art instead of text."""
+    x0, y0, _x1, y1 = near_bbox
+    cy = (y0 + y1) / 2.0
+    cx = x0 - gap - radius
+    shape = page.new_shape()
+    shape.draw_circle((cx, cy), radius)
+    shape.finish()
+    shape.commit()
+
+
+def _draw_small_triangle(page, near_bbox, offset=4.0):
+    """Draw a small 3-segment triangle just left of ``near_bbox``, mimicking
+    a dimension-line arrowhead that must not be mistaken for a Ø glyph."""
+    x0, y0, _x1, y1 = near_bbox
+    cy = (y0 + y1) / 2.0
+    cx = x0 - offset
+    shape = page.new_shape()
+    shape.draw_line((cx - 2, cy - 3), (cx + 2, cy))
+    shape.draw_line((cx + 2, cy), (cx - 2, cy + 3))
+    shape.draw_line((cx - 2, cy + 3), (cx - 2, cy - 3))
+    shape.finish()
+    shape.commit()
+
+
+class TestVectorDrawnDiameterSymbol:
+    """Some CAD PDF exporters draw the Ø glyph as vector line art (a traced
+    circle) instead of a font character, so it never appears in the page's
+    extracted text at all -- unlike the countersink/depth glyph mangling
+    handled elsewhere in this file, there is no substitute character to
+    recover here. The app must still recognize these as diameters by
+    noticing the small circular vector shape next to the bare number.
+    """
+
+    def test_bare_number_with_adjacent_vector_circle_becomes_diameter(self, tmp_path):
+        pdf_path = tmp_path / "vector_diameter.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((60, 200), "8", fontsize=12)
+        text_bbox = page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"]
+        _draw_small_circle(page, text_bbox)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.char_type == CharacteristicType.DIAMETER.value
+        assert balloon.nominal == pytest.approx(8.0)
+        assert balloon.raw_text == "⌀8"
+
+    def test_bare_number_without_nearby_shape_stays_linear_dimension(self, tmp_path):
+        pdf_path = tmp_path / "no_symbol.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((60, 200), "8", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        assert result.balloons[0].char_type == CharacteristicType.LINEAR_DIMENSION.value
+        assert result.balloons[0].raw_text == "8"
+
+    def test_nearby_arrowhead_triangle_is_not_mistaken_for_diameter_symbol(self, tmp_path):
+        """A dimension-line arrowhead is a compact few-segment shape too, but
+        must not false-positive as a diameter glyph."""
+        pdf_path = tmp_path / "arrowhead.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((60, 200), "13", fontsize=12)
+        text_bbox = page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"]
+        _draw_small_triangle(page, text_bbox)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        assert result.balloons[0].char_type == CharacteristicType.LINEAR_DIMENSION.value

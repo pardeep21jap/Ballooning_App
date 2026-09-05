@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtGui import QDoubleValidator
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -60,10 +61,6 @@ class NewProjectDialog(QDialog):
         self.unit_combo = QComboBox()
         self.unit_combo.addItem("Inches (in)", "in")
         self.unit_combo.addItem("Millimeters (mm)", "mm")
-        self.serial_lot_edit = QLineEdit()
-        self.fai_report_edit = QLineEdit()
-        self.po_number_edit = QLineEdit()
-        self.mfg_wo_edit = QLineEdit()
         self.notes_edit = QPlainTextEdit()
         self.notes_edit.setFixedHeight(70)
 
@@ -82,10 +79,6 @@ class NewProjectDialog(QDialog):
         form.addRow("Customer:", self.customer_edit)
         form.addRow("Unit of Measure:", self.unit_combo)
         form.addRow("", unit_hint)
-        form.addRow("Serial/Lot Number:", self.serial_lot_edit)
-        form.addRow("FAI Report #:", self.fai_report_edit)
-        form.addRow("PO Number:", self.po_number_edit)
-        form.addRow("Mfg WO#:", self.mfg_wo_edit)
         form.addRow("Notes:", self.notes_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -110,10 +103,6 @@ class NewProjectDialog(QDialog):
             "revision": self.revision_edit.text().strip(),
             "customer": self.customer_edit.text().strip(),
             "unit": self.unit_combo.currentData(),
-            "serial_lot_number": self.serial_lot_edit.text().strip(),
-            "fai_report": self.fai_report_edit.text().strip(),
-            "po_number": self.po_number_edit.text().strip(),
-            "mfg_wo": self.mfg_wo_edit.text().strip(),
             "notes": self.notes_edit.toPlainText().strip(),
         }
 
@@ -129,10 +118,6 @@ class ProjectPropertiesDialog(NewProjectDialog):
         revision: str,
         customer: str,
         unit: str,
-        serial_lot_number: str,
-        fai_report: str,
-        po_number: str,
-        mfg_wo: str,
         notes: str,
         parent: Optional[QWidget] = None,
     ):
@@ -145,10 +130,6 @@ class ProjectPropertiesDialog(NewProjectDialog):
         self.customer_edit.setText(customer)
         idx = self.unit_combo.findData(unit)
         self.unit_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.serial_lot_edit.setText(serial_lot_number)
-        self.fai_report_edit.setText(fai_report)
-        self.po_number_edit.setText(po_number)
-        self.mfg_wo_edit.setText(mfg_wo)
         self.notes_edit.setPlainText(notes)
 
 
@@ -179,26 +160,72 @@ def _format_number(value: float) -> str:
     return text if text else "0"
 
 
+class _ToleranceRow(QWidget):
+    """One "X.<n decimals> ±<tolerance>" row in :class:`DefaultTolerancesDialog`,
+    with its own remove button."""
+
+    removed = pyqtSignal(object)
+
+    def __init__(self, decimal_places: int, tolerance: Optional[float], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._prefix = QLabel()
+        layout.addWidget(self._prefix)
+        self.places_spin = QSpinBox()
+        self.places_spin.setRange(0, 6)
+        self.places_spin.setValue(decimal_places)
+        self.places_spin.setToolTip(
+            "Number of decimal places this tolerance applies to (0 = whole number, e.g. \"30\")"
+        )
+        self.places_spin.valueChanged.connect(self._update_prefix)
+        self._update_prefix(decimal_places)
+        layout.addWidget(self.places_spin)
+        layout.addWidget(QLabel("decimal(s) ±"))
+
+        self.tol_edit = _optional_float_line_edit()
+        _set_optional_float(self.tol_edit, tolerance)
+        layout.addWidget(self.tol_edit, 1)
+
+        remove_btn = QPushButton("✕")
+        remove_btn.setFixedWidth(28)
+        remove_btn.setToolTip("Remove this row")
+        remove_btn.clicked.connect(lambda: self.removed.emit(self))
+        layout.addWidget(remove_btn)
+
+    def _update_prefix(self, places: int) -> None:
+        self._prefix.setText("X" if places == 0 else "X.")
+
+    def decimal_places(self) -> int:
+        return self.places_spin.value()
+
+    def tolerance(self) -> Optional[float]:
+        return _parse_optional_float(self.tol_edit)
+
+
 class DefaultTolerancesDialog(QDialog):
     """Collects a drawing's general/default tolerance table -- the
     "TOLERANCES UNLESS OTHERWISE NOTED" convention, keyed by decimal-place
     count, plus a separate angular tolerance. Applied automatically, during
     auto-ballooning, to any detected dimension that has no explicit
     tolerance of its own.
+
+    The decimal-place tiers are an open-ended, user-editable list (rather
+    than a fixed X.X/X.XX/X.XXX set) since drawings vary in how many tiers
+    they define.
     """
 
     def __init__(
         self,
-        one_decimal: Optional[float] = None,
-        two_decimal: Optional[float] = None,
-        three_decimal: Optional[float] = None,
+        by_decimal_places: Optional[dict[int, float]] = None,
         angular: Optional[float] = None,
         auto_detected: bool = False,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Default Tolerances")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(440)
 
         intro_text = (
             "Detected from this drawing's title block -- review and adjust if needed."
@@ -213,20 +240,17 @@ class DefaultTolerancesDialog(QDialog):
         intro.setWordWrap(True)
         intro.setStyleSheet("color: gray;")
 
-        self.one_edit = _optional_float_line_edit()
-        _set_optional_float(self.one_edit, one_decimal)
-        self.two_edit = _optional_float_line_edit()
-        _set_optional_float(self.two_edit, two_decimal)
-        self.three_edit = _optional_float_line_edit()
-        _set_optional_float(self.three_edit, three_decimal)
+        self._rows: list[_ToleranceRow] = []
+        self.rows_layout = QVBoxLayout()
+        self.rows_layout.setSpacing(4)
+
+        add_btn = QPushButton("+ Add Decimal Place")
+        add_btn.clicked.connect(lambda: self._add_row())
+
         self.angular_edit = _optional_float_line_edit()
         _set_optional_float(self.angular_edit, angular)
-
-        form = QFormLayout()
-        form.addRow("X.X   (1 decimal) ±", self.one_edit)
-        form.addRow("X.XX   (2 decimals) ±", self.two_edit)
-        form.addRow("X.XXX   (3 decimals) ±", self.three_edit)
-        form.addRow("Angles ±", self.angular_edit)
+        angular_form = QFormLayout()
+        angular_form.addRow("Angles ±", self.angular_edit)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
@@ -234,14 +258,41 @@ class DefaultTolerancesDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
-        layout.addLayout(form)
+        layout.addLayout(self.rows_layout)
+        layout.addWidget(add_btn)
+        layout.addLayout(angular_form)
         layout.addWidget(buttons)
 
+        by_decimal_places = by_decimal_places or {}
+        for places in sorted(by_decimal_places):
+            self._add_row(places, by_decimal_places[places])
+        if not by_decimal_places:
+            for places in (0, 1, 2, 3):
+                self._add_row(places, None)
+
+    def _add_row(self, decimal_places: Optional[int] = None, tolerance: Optional[float] = None) -> None:
+        used = {r.decimal_places() for r in self._rows}
+        if decimal_places is None or decimal_places in used:
+            decimal_places = next((p for p in range(7) if p not in used), decimal_places or 0)
+        row = _ToleranceRow(decimal_places, tolerance)
+        row.removed.connect(self._remove_row)
+        self._rows.append(row)
+        self.rows_layout.addWidget(row)
+
+    def _remove_row(self, row: "_ToleranceRow") -> None:
+        self._rows.remove(row)
+        self.rows_layout.removeWidget(row)
+        row.setParent(None)
+        row.deleteLater()
+
     def values(self) -> dict:
+        by_places: dict[int, float] = {}
+        for row in self._rows:
+            tol = row.tolerance()
+            if tol is not None:
+                by_places[row.decimal_places()] = tol
         return {
-            "tol_one_decimal": _parse_optional_float(self.one_edit),
-            "tol_two_decimal": _parse_optional_float(self.two_edit),
-            "tol_three_decimal": _parse_optional_float(self.three_edit),
+            "tol_by_decimal_places": by_places,
             "tol_angular": _parse_optional_float(self.angular_edit),
         }
 

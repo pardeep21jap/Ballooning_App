@@ -15,8 +15,7 @@ from balloon_app.excel_export import COLUMNS, FORM_NUMBER, INSPECTION_SHEET_NAME
 def sample_project_and_balloons():
     project = Project(
         name="Test Project", part_number="PN-123", part_name="Camera Housing",
-        revision="A", customer="Acme", unit="in", serial_lot_number="N/A",
-        fai_report="N/A", po_number="PO-1", mfg_wo="WO-1",
+        revision="A", customer="Acme", unit="in",
     )
     drawing = Drawing(project_id=project.id, file_name="part.pdf", original_path="C:/drawings/part.pdf", page_count=1)
     project.drawings.append(drawing)
@@ -59,7 +58,7 @@ def test_headers_match_spec(tmp_path: Path, sample_project_and_balloons):
     assert INSPECTION_SHEET_NAME in wb.sheetnames
 
     ws = wb[INSPECTION_SHEET_NAME]
-    header_row = [ws.cell(row=8, column=i + 1).value for i in range(len(COLUMNS))]
+    header_row = [ws.cell(row=7, column=i + 1).value for i in range(len(COLUMNS))]
     expected = [title for _letter, title in COLUMNS]
     assert header_row == expected
 
@@ -75,7 +74,7 @@ def test_title_block_and_info_grid(tmp_path: Path, sample_project_and_balloons):
     assert "Form 3" in ws["A3"].value
     assert ws["B4"].value == "PN-123"
     assert ws["D4"].value == "Camera Housing"
-    assert ws["B5"].value == "A"
+    assert ws["F4"].value == "A"
 
 
 def test_default_export_excludes_pending_and_rejected(tmp_path: Path, sample_project_and_balloons):
@@ -86,7 +85,7 @@ def test_default_export_excludes_pending_and_rejected(tmp_path: Path, sample_pro
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
     # 2 rows expected: balloon #1 (accepted) and #4 (manual); #2 pending and #3 rejected excluded.
-    char_numbers = [ws.cell(row=r, column=1).value for r in range(9, ws.max_row + 1) if ws.cell(row=r, column=1).value]
+    char_numbers = [ws.cell(row=r, column=1).value for r in range(8, ws.max_row + 1) if ws.cell(row=r, column=1).value]
     assert char_numbers == [1, 4]
 
 
@@ -97,7 +96,7 @@ def test_include_pending_option(tmp_path: Path, sample_project_and_balloons):
 
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
-    char_numbers = [ws.cell(row=r, column=1).value for r in range(9, ws.max_row + 1) if ws.cell(row=r, column=1).value]
+    char_numbers = [ws.cell(row=r, column=1).value for r in range(8, ws.max_row + 1) if ws.cell(row=r, column=1).value]
     # Rejected (#3) must never be included, even with include_pending=True.
     assert 3 not in char_numbers
     assert 2 in char_numbers
@@ -110,14 +109,14 @@ def test_requirement_and_limits_formatting(tmp_path: Path, sample_project_and_ba
 
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
-    # Balloon #1 -> row 9: Requirement = nominal, Upper/Lower = signed tolerance deltas.
-    assert ws["A9"].value == 1
-    assert ws["B9"].value == "Length"
-    assert ws["C9"].value == "50"
-    assert ws["D9"].value == "in"
-    assert ws["F9"].value == "0.05"
-    assert ws["G9"].value == "-0.05"
-    assert ws["I9"].value == "Caliper"
+    # Balloon #1 -> row 8: Requirement = nominal, Upper/Lower = signed tolerance deltas.
+    assert ws["A8"].value == 1
+    assert ws["B8"].value == "Length"
+    assert ws["C8"].value == "50"
+    assert ws["D8"].value == "in"
+    assert ws["F8"].value == "0.05"
+    assert ws["G8"].value == "-0.05"
+    assert ws["I8"].value == "Caliper"
 
 
 def test_form_footer_present(tmp_path: Path, sample_project_and_balloons):
@@ -138,5 +137,5 @@ def test_header_frozen_and_autofilter(tmp_path: Path, sample_project_and_balloon
 
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
-    assert ws.freeze_panes == "A9"
+    assert ws.freeze_panes == "A8"
     assert ws.auto_filter.ref is not None

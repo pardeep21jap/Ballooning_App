@@ -171,6 +171,7 @@ class Detection:
     label: str
     confidence: float
     raw_text: Optional[str] = None
+    diameter_hint: bool = False
 
 
 class BaseDetector(ABC):
@@ -393,6 +394,17 @@ def _bbox_center_distance(a: tuple[float, float, float, float], b: tuple[float, 
     ax, ay = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
     bx, by = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
     return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+
+
+def _bbox_center_within(
+    inner: tuple[float, float, float, float], outer: tuple[float, float, float, float], pad: float = 1.0
+) -> bool:
+    """True if ``inner``'s center falls inside ``outer`` (expanded by
+    ``pad``). Used to tell whether a raw (pre-merge) text block -- and
+    anything found near it, like a vector-drawn diameter symbol -- ended up
+    part of a given merged candidate block."""
+    cx, cy = (inner[0] + inner[2]) / 2.0, (inner[1] + inner[3]) / 2.0
+    return (outer[0] - pad) <= cx <= (outer[2] + pad) and (outer[1] - pad) <= cy <= (outer[3] + pad)
 
 
 def _merge_stacked_tolerance_fragments(
@@ -625,6 +637,19 @@ def auto_balloon_page(
         _title_block_cutoff_y(native_blocks, page_height) if page_height else None
     )
 
+    # Some CAD PDF exports draw the diameter (Ø) glyph as vector line art
+    # instead of a font character, so it never shows up in native_blocks'
+    # text at all (see PdfDocument.find_vector_diameter_symbol). Check each
+    # raw (pre-merge) block here, while bboxes are still tight to a single
+    # span -- merging can stack a value with its +/- tolerance into a much
+    # taller box that throws off the "immediately to the left" geometry check.
+    diameter_hint_bboxes: list[tuple[float, float, float, float]] = []
+    for block in native_blocks:
+        if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
+            continue
+        if pdf_doc.find_vector_diameter_symbol(page_number, block.bbox):
+            diameter_hint_bboxes.append(block.bbox)
+
     merged_native_blocks = _merge_stacked_tolerance_fragments(_merge_nearby_text_blocks(native_blocks))
 
     for block in merged_native_blocks:
@@ -637,7 +662,10 @@ def auto_balloon_page(
             if not _bbox_has_ink(gray_image, bbox_px):
                 logger.debug("Discarding candidate with no ink under its bbox: %r", block.text)
                 continue
-        candidates.append(Detection(bbox=block.bbox, label="", confidence=0.0, raw_text=block.text))
+        diameter_hint = any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in diameter_hint_bboxes)
+        candidates.append(
+            Detection(bbox=block.bbox, label="", confidence=0.0, raw_text=block.text, diameter_hint=diameter_hint)
+        )
 
     used_ocr = False
     ocr_available = True
@@ -680,7 +708,7 @@ def auto_balloon_page(
         # A single detected text chunk can pack more than one independently
         # inspected requirement (e.g. a tapped hole's thread class *and* its
         # depth) -- each becomes its own balloon, placed near the same text.
-        parsed_list = parse_characteristics(raw_text) if raw_text else [None]
+        parsed_list = parse_characteristics(raw_text, diameter_hint=det.diameter_hint) if raw_text else [None]
         if default_tolerances is not None:
             parsed_list = [
                 apply_default_tolerance(p, default_tolerances) if p is not None else None

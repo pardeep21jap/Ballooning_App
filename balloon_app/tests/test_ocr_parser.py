@@ -405,10 +405,10 @@ class TestParseDefaultTolerances:
 
     def test_extracts_all_decimal_places_and_angle(self):
         result = parse_default_tolerances(self.TITLE_BLOCK)
-        assert _close(result.one_decimal, 0.1000)
-        assert _close(result.two_decimal, 0.0100)
-        assert _close(result.three_decimal, 0.0050)
-        assert _close(result.four_decimal, 0.0001)
+        assert _close(result.by_decimal_places[1], 0.1000)
+        assert _close(result.by_decimal_places[2], 0.0100)
+        assert _close(result.by_decimal_places[3], 0.0050)
+        assert _close(result.by_decimal_places[4], 0.0001)
         assert _close(result.angular, 0.5)
 
     def test_no_title_block_gives_empty_result(self):
@@ -417,7 +417,7 @@ class TestParseDefaultTolerances:
 
 
 class TestApplyDefaultTolerance:
-    DEFAULTS = DefaultTolerances(one_decimal=0.1, two_decimal=0.01, three_decimal=0.005, angular=0.5)
+    DEFAULTS = DefaultTolerances(by_decimal_places={1: 0.1, 2: 0.01, 3: 0.005}, angular=0.5)
 
     def test_three_decimal_diameter_gets_matching_default(self):
         parsed = ParsedCharacteristic(
@@ -446,6 +446,21 @@ class TestApplyDefaultTolerance:
         result = apply_default_tolerance(parsed, self.DEFAULTS)
         assert _close(result.tol_plus, 0.5)
 
+    def test_whole_number_gets_zero_decimal_default_when_configured(self):
+        defaults = DefaultTolerances(by_decimal_places={0: 1.0, 1: 0.1}, angular=0.5)
+        parsed = ParsedCharacteristic(
+            char_type=CharacteristicType.LINEAR_DIMENSION.value, nominal=30.0, nominal_text="30",
+        )
+        result = apply_default_tolerance(parsed, defaults)
+        assert _close(result.tol_plus, 1.0)
+
+    def test_whole_number_without_zero_tier_configured_stays_untoleranced(self):
+        parsed = ParsedCharacteristic(
+            char_type=CharacteristicType.LINEAR_DIMENSION.value, nominal=30.0, nominal_text="30",
+        )
+        result = apply_default_tolerance(parsed, self.DEFAULTS)  # no 0-place entry configured
+        assert result.tol_plus is None
+
     def test_explicit_tolerance_is_never_overwritten(self):
         parsed = ParsedCharacteristic(
             char_type=CharacteristicType.DIAMETER.value, nominal=0.25, nominal_text="0.250",
@@ -463,3 +478,33 @@ class TestApplyDefaultTolerance:
         parsed = ParsedCharacteristic(char_type=CharacteristicType.DIAMETER.value, nominal=0.25, nominal_text="0.250")
         result = apply_default_tolerance(parsed, DefaultTolerances())
         assert result.tol_plus is None
+
+
+class TestDiameterHint:
+    """diameter_hint lets a caller (auto_balloon.py, backed by a vector-shape
+    geometry check for CAD exports that draw Ø as line art rather than a
+    font character) classify a bare number as a diameter even though no
+    Ø symbol/word appears in the text itself.
+    """
+
+    def test_bare_number_with_hint_is_classified_as_diameter(self):
+        result = parse_characteristic("8", diameter_hint=True)
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert result.nominal == 8.0
+        assert result.raw_text == "⌀8"  # rewritten since the symbol wasn't in the text
+
+    def test_bare_number_without_hint_stays_linear_dimension(self):
+        result = parse_characteristic("8", diameter_hint=False)
+        assert result.char_type == CharacteristicType.LINEAR_DIMENSION.value
+        assert result.raw_text == "8"
+
+    def test_hint_does_not_override_explicit_depth_symbol(self):
+        """A more specific hole-feature symbol (here, depth) still wins over
+        a diameter hint, exactly as it wins over a real Ø in the text."""
+        result = parse_characteristic("▼0.500", diameter_hint=True)
+        assert result.char_type == CharacteristicType.DEPTH.value
+
+    def test_hint_is_redundant_but_harmless_when_symbol_already_present(self):
+        result = parse_characteristic("⌀8", diameter_hint=True)
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert result.raw_text == "⌀8"  # not double-prefixed

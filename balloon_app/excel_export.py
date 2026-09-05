@@ -187,22 +187,14 @@ def _label_value(ws: Worksheet, row: int, col_letter: str, label: str, value: ob
 
 
 def _write_info_grid(ws: Worksheet, start_row: int, project: Project) -> int:
-    row1, row2 = start_row, start_row + 1
+    row = start_row
 
-    _label_value(ws, row1, "A", "1. Part Number", project.part_number)
-    _label_value(ws, row1, "C", "2. Part Name", project.part_name or project.name)
-    _label_value(ws, row1, "E", "3. Serial/Lot Number", project.serial_lot_number)
-    _label_value(ws, row1, "G", "4. FAI Report", project.fai_report)
+    _label_value(ws, row, "A", "1. Part Number", project.part_number)
+    _label_value(ws, row, "C", "2. Part Name", project.part_name or project.name)
+    _label_value(ws, row, "E", "3. Part Rev", project.revision)
 
-    _label_value(ws, row2, "A", "5. Part Rev", project.revision)
-    _label_value(ws, row2, "C", "6. PO Number:", project.po_number)
-    ws.merge_cells(f"D{row2}:E{row2}")
-    _label_value(ws, row2, "G", "6a. Mfg WO#:", project.mfg_wo)
-    ws.merge_cells(f"H{row2}:{_LAST_COL}{row2}")
-
-    ws.row_dimensions[row1].height = 18
-    ws.row_dimensions[row2].height = 18
-    return row2 + 2  # one blank spacer row
+    ws.row_dimensions[row].height = 18
+    return row + 2  # one blank spacer row
 
 
 def _write_group_headers(ws: Worksheet, row: int) -> None:

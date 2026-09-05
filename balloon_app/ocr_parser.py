@@ -533,15 +533,11 @@ def compute_limits(
 # NOTED" note), used to backfill tol_plus/tol_minus on dimensions that don't
 # carry their own explicit tolerance callout.
 # ---------------------------------------------------------------------------
-_DECIMAL_TOL_RE: dict[int, re.Pattern] = {
-    1: re.compile(rf"X\.X\b\s*[:=]?\s*±?\s*({NUM})"),
-    2: re.compile(rf"X\.XX\b\s*[:=]?\s*±?\s*({NUM})"),
-    3: re.compile(rf"X\.XXX\b\s*[:=]?\s*±?\s*({NUM})"),
-    4: re.compile(rf"X\.XXXX\b\s*[:=]?\s*±?\s*({NUM})"),
-}
+# "X." followed by 1-6 more X's matches any decimal-place tier a title block
+# might use (X.X, X.XX, ... up to X.XXXXXX); the run length of X's is the
+# decimal-place count, so this one pattern replaces a fixed per-count table.
+_DECIMAL_TOL_RE = re.compile(rf"X\.(X{{1,6}})\b\s*[:=]?\s*±?\s*({NUM})")
 _ANGULAR_TOL_RE = re.compile(rf"ANGLES?\s*[:=]?\s*±?\s*({NUM})\s*°?", re.IGNORECASE)
-
-_DECIMAL_PLACES_FIELD = {1: "one_decimal", 2: "two_decimal", 3: "three_decimal", 4: "four_decimal"}
 
 _TOLERANCED_DIMENSION_TYPES = {
     CharacteristicType.LINEAR_DIMENSION.value,
@@ -558,32 +554,28 @@ _TOLERANCED_DIMENSION_TYPES = {
 class DefaultTolerances:
     """A drawing's general/default tolerance table -- either parsed from its
     title block or entered manually -- keyed by decimal-place count (the
-    "X.XX: ±0.0100" convention), plus a separate angular tolerance.
+    "X.XX: ±0.0100" convention), plus a separate angular tolerance. The
+    table is an open-ended ``{decimal_places: tolerance}`` map rather than a
+    fixed set of fields, since drawings vary in how many tiers they define.
     """
 
-    one_decimal: Optional[float] = None
-    two_decimal: Optional[float] = None
-    three_decimal: Optional[float] = None
-    four_decimal: Optional[float] = None
+    by_decimal_places: dict[int, float] = field(default_factory=dict)
     angular: Optional[float] = None
 
     def is_empty(self) -> bool:
-        return all(
-            v is None
-            for v in (self.one_decimal, self.two_decimal, self.three_decimal, self.four_decimal, self.angular)
-        )
+        return not self.by_decimal_places and self.angular is None
 
     def for_decimal_places(self, places: int) -> Optional[float]:
         """The configured tolerance for a value with this many decimal
-        places, falling back to the next-coarsest configured entry if the
-        table has gaps (e.g. only X.XXX is set but a value has 4 places)."""
-        if places <= 0:
+        places (0 for a whole number, e.g. "30"), falling back to the
+        next-coarsest configured entry if the table has gaps (e.g. only
+        X.XXX is set but a value has 4 places)."""
+        if not self.by_decimal_places:
             return None
-        for p in range(min(places, 4), 0, -1):
-            value = getattr(self, _DECIMAL_PLACES_FIELD[p])
-            if value is not None:
-                return value
-        return None
+        candidates = [p for p in self.by_decimal_places if p <= places]
+        if not candidates:
+            return None
+        return self.by_decimal_places[max(candidates)]
 
 
 def decimal_places(nominal_text: Optional[str]) -> int:
@@ -607,10 +599,9 @@ def parse_default_tolerances(page_text: str) -> DefaultTolerances:
     title-block layouts vary too much for this to be fully reliable.
     """
     result = DefaultTolerances()
-    for places, pattern in _DECIMAL_TOL_RE.items():
-        m = pattern.search(page_text)
-        if m:
-            setattr(result, _DECIMAL_PLACES_FIELD[places], _round(float(m.group(1))))
+    for m in _DECIMAL_TOL_RE.finditer(page_text):
+        places = len(m.group(1))
+        result.by_decimal_places[places] = _round(float(m.group(2)))
     m = _ANGULAR_TOL_RE.search(page_text)
     if m:
         result.angular = _round(float(m.group(1)))
@@ -648,7 +639,7 @@ def apply_default_tolerance(
     return parsed
 
 
-def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
+def parse_characteristics(text: str, diameter_hint: bool = False) -> list[ParsedCharacteristic]:
     """Classify and parse a chunk of drawing text into one or more characteristics.
 
     Usually returns a single item, but a compound callout that packs two
@@ -659,6 +650,14 @@ def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
 
     The original text is always preserved in ``raw_text`` regardless of
     whether parsing fully succeeds, so nothing is ever silently lost.
+
+    ``diameter_hint``: the caller found evidence (outside of ``text`` --
+    e.g. a Ø glyph drawn as vector line art rather than a font character,
+    see :meth:`balloon_app.pdf_engine.PdfDocument.find_vector_diameter_symbol`)
+    that this callout is a diameter even though no diameter symbol/word
+    appears in the text itself. Only affects the bare-value fallback below;
+    a callout that already matches a more specific pattern (thread, GD&T,
+    depth, etc.) is unaffected.
     """
     text = (text or "").strip()
     if not text:
@@ -689,7 +688,8 @@ def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
     is_counterbore = bool(_COUNTERBORE_HINT_RE.search(text))
     is_countersink = bool(_COUNTERSINK_HINT_RE.search(text))
     is_square = bool(_SQUARE_HINT_RE.search(text))
-    is_diameter = bool(_DIAMETER_RE.search(text))
+    has_diameter_text = bool(_DIAMETER_RE.search(text))
+    is_diameter = has_diameter_text or diameter_hint
     is_radius = bool(_RADIUS_RE.search(text))
     is_angle = bool(_ANGLE_HINT_RE.search(text))
 
@@ -721,10 +721,14 @@ def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
         confidence = numeric["confidence"]
         if is_diameter or is_radius or is_angle or is_depth or is_counterbore or is_countersink or is_square:
             confidence = max(confidence, 0.75) if numeric["confidence"] >= 0.8 else 0.6
+        # diameter_hint fired but the text itself never carried a Ø symbol
+        # (it was drawn as vector line art, not a character) -- rewrite
+        # raw_text so the review table shows what the drawing actually says.
+        raw_text_out = f"⌀{text}" if char_type == CharacteristicType.DIAMETER.value and not has_diameter_text else text
         return [
             ParsedCharacteristic(
                 char_type=char_type,
-                raw_text=text,
+                raw_text=raw_text_out,
                 nominal=numeric["nominal"],
                 nominal_text=numeric.get("nominal_text"),
                 tol_plus=numeric["tol_plus"],
@@ -746,11 +750,11 @@ def parse_characteristics(text: str) -> list[ParsedCharacteristic]:
     ]
 
 
-def parse_characteristic(text: str) -> ParsedCharacteristic:
+def parse_characteristic(text: str, diameter_hint: bool = False) -> ParsedCharacteristic:
     """Classify and parse a chunk of drawing text into a single characteristic.
 
     Convenience wrapper around :func:`parse_characteristics` for callers
     that only need one representative result (e.g. estimating a confidence
     label for a detection) rather than every characteristic packed into it.
     """
-    return parse_characteristics(text)[0]
+    return parse_characteristics(text, diameter_hint=diameter_hint)[0]

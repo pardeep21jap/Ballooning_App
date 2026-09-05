@@ -25,6 +25,18 @@ logger = logging.getLogger("balloon_app.pdf_engine")
 
 POINTS_PER_INCH = 72.0
 
+# Heuristic thresholds for find_vector_diameter_symbol (see its docstring):
+# a traced-circle diameter glyph is made of many short segments, is roughly
+# as wide as it is tall, and (being sized like a text character) spans a
+# few PDF points -- not the much larger geometry of an actual drawn hole,
+# a leader line, or an arrowhead (2-3 segments).
+_DIAMETER_SYMBOL_MIN_SEGMENTS = 4
+_DIAMETER_SYMBOL_MIN_ASPECT = 0.4
+_DIAMETER_SYMBOL_MAX_ASPECT = 2.2
+_DIAMETER_SYMBOL_MIN_SIZE_PT = 2.0
+_DIAMETER_SYMBOL_MAX_SIZE_PT = 14.0
+_DIAMETER_SYMBOL_TOUCH_EPS = 0.8
+
 
 def dpi_to_zoom(dpi: float) -> float:
     """Convert a target DPI to the zoom factor PyMuPDF's Matrix expects."""
@@ -61,6 +73,60 @@ def rect_pixel_to_pdf(
     return x0, y0, x1, y1
 
 
+def _drawing_item_local_bbox(item: tuple) -> Optional[tuple[float, float, float, float]]:
+    """The local bounding box of one ``page.get_drawings()`` path item
+    (a line, curve, rect, or quad), or ``None`` if it carries no points."""
+    points: list[tuple[float, float]] = []
+    for arg in item[1:]:
+        if hasattr(arg, "x") and hasattr(arg, "y"):
+            points.append((arg.x, arg.y))
+        elif hasattr(arg, "x0"):  # fitz.Rect or fitz.Quad-like corner pair
+            points.append((arg.x0, arg.y0))
+            points.append((arg.x1, arg.y1))
+    if not points:
+        return None
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _rects_touch(
+    a: tuple[float, float, float, float], b: tuple[float, float, float, float], eps: float
+) -> bool:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return not (ax1 + eps < bx0 or bx1 + eps < ax0 or ay1 + eps < by0 or by1 + eps < ay0)
+
+
+def _cluster_touching_rects(
+    rects: list[tuple[float, float, float, float]], eps: float
+) -> list[list[tuple[float, float, float, float]]]:
+    """Group rects into connected components (two rects in the same group if
+    they touch/overlap, directly or transitively, within ``eps``). Used to
+    separate one drawn shape (many touching segments) from unrelated nearby
+    ink that happens to fall in the same search area."""
+    n = len(rects)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _rects_touch(rects[i], rects[j], eps):
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+
+    groups: dict[int, list[tuple[float, float, float, float]]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(rects[i])
+    return list(groups.values())
+
+
 @dataclass
 class TextBlock:
     """A text block/span extracted from a PDF page's native text layer."""
@@ -79,6 +145,7 @@ class PdfDocument:
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self._doc: Optional[fitz.Document] = None
+        self._drawing_items_cache: dict[int, list[tuple[float, float, float, float]]] = {}
 
     def open(self) -> None:
         if not self.path.exists():
@@ -164,6 +231,83 @@ class PdfDocument:
 
     def has_native_text(self, page_number: int) -> bool:
         return len(self.extract_text_blocks(page_number)) > 0
+
+    def _drawing_item_bboxes(self, page_number: int) -> list[tuple[float, float, float, float]]:
+        """All vector-path item bounding boxes on a page (PDF/text coordinate
+        space, rotation-corrected to match :meth:`extract_text_blocks`),
+        cached per page since a page can have thousands of tiny path items
+        and callers probe this once per candidate dimension."""
+        cached = self._drawing_items_cache.get(page_number)
+        if cached is not None:
+            return cached
+
+        page = self.doc[page_number]
+        rotation_matrix = page.rotation_matrix
+        bboxes: list[tuple[float, float, float, float]] = []
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            logger.exception("Failed extracting vector drawings on page %d of %s", page_number, self.path)
+            drawings = []
+        for path in drawings:
+            for item in path.get("items", []):
+                local = _drawing_item_local_bbox(item)
+                if local is None:
+                    continue
+                rect = fitz.Rect(local) * rotation_matrix
+                rect.normalize()
+                bboxes.append(tuple(rect))  # type: ignore[arg-type]
+
+        self._drawing_items_cache[page_number] = bboxes
+        return bboxes
+
+    def find_vector_diameter_symbol(
+        self, page_number: int, bbox: tuple[float, float, float, float]
+    ) -> bool:
+        """Best-effort detection of a diameter (Ø) glyph drawn as vector
+        line art immediately to the left of ``bbox``.
+
+        Some CAD PDF exporters draw GD&T symbols like Ø as traced vector
+        line segments rather than a font character, so the glyph never
+        appears in :meth:`extract_text_blocks`' output at all -- not even as
+        a mangled substitute character. A real diameter glyph traced this
+        way is many short segments approximating a circle, sized like a
+        text character; this looks for such a cluster (spatially isolated
+        from unrelated ink -- leader lines, arrowheads, the part's own hole
+        geometry -- via connected-component clustering) just left of
+        ``bbox``. Returns ``False`` (never raises) if the page has no usable
+        vector-drawing data.
+        """
+        x0, y0, x1, y1 = bbox
+        height = y1 - y0
+        if height <= 0:
+            return False
+        search = fitz.Rect(
+            x0 - height * 1.8, y0 - height * 0.8, x0 + height * 0.15, y1 + height * 0.8
+        )
+
+        try:
+            nearby = [r for r in self._drawing_item_bboxes(page_number) if search.intersects(fitz.Rect(r))]
+        except Exception:
+            logger.exception("Failed diameter-symbol geometry check on page %d of %s", page_number, self.path)
+            return False
+
+        for cluster in _cluster_touching_rects(nearby, _DIAMETER_SYMBOL_TOUCH_EPS):
+            if len(cluster) < _DIAMETER_SYMBOL_MIN_SEGMENTS:
+                continue
+            cx0 = min(r[0] for r in cluster)
+            cx1 = max(r[2] for r in cluster)
+            cy0 = min(r[1] for r in cluster)
+            cy1 = max(r[3] for r in cluster)
+            width, cheight = cx1 - cx0, cy1 - cy0
+            if cheight <= 0 or not (_DIAMETER_SYMBOL_MIN_ASPECT <= width / cheight <= _DIAMETER_SYMBOL_MAX_ASPECT):
+                continue
+            if (
+                _DIAMETER_SYMBOL_MIN_SIZE_PT <= width <= _DIAMETER_SYMBOL_MAX_SIZE_PT
+                and _DIAMETER_SYMBOL_MIN_SIZE_PT <= cheight <= _DIAMETER_SYMBOL_MAX_SIZE_PT
+            ):
+                return True
+        return False
 
     def page_has_images_only(self, page_number: int) -> bool:
         """Heuristic: page has no usable text layer but does have image content."""

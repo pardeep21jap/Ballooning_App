@@ -190,10 +190,7 @@ class Drawing:
     # separate angular tolerance -- applied to any auto-detected dimension
     # that has no explicit tolerance of its own. `tolerances_configured`
     # distinguishes "reviewed and left blank on purpose" from "never asked".
-    tol_one_decimal: Optional[float] = None
-    tol_two_decimal: Optional[float] = None
-    tol_three_decimal: Optional[float] = None
-    tol_four_decimal: Optional[float] = None
+    tol_by_decimal_places: dict[int, float] = field(default_factory=dict)
     tol_angular: Optional[float] = None
     tolerances_configured: bool = False
 
@@ -204,7 +201,27 @@ class Drawing:
     def from_dict(cls, data: dict[str, Any]) -> "Drawing":
         known_fields = {f for f in cls.__dataclass_fields__}
         filtered = {k: v for k, v in data.items() if k in known_fields}
+        by_places = filtered.get("tol_by_decimal_places")
+        filtered["tol_by_decimal_places"] = (
+            {int(k): v for k, v in by_places.items()} if by_places else _legacy_tolerance_dict(data)
+        )
         return cls(**filtered)
+
+
+_LEGACY_TOLERANCE_FIELDS = {
+    "tol_one_decimal": 1, "tol_two_decimal": 2, "tol_three_decimal": 3, "tol_four_decimal": 4,
+}
+
+
+def _legacy_tolerance_dict(data: dict[str, Any]) -> dict[int, float]:
+    """Read the old fixed tol_{one,two,three,four}_decimal fields from a
+    project saved before the tolerance table became an open-ended map, so
+    projects created before this change keep their configured tolerances."""
+    return {
+        places: data[field_name]
+        for field_name, places in _LEGACY_TOLERANCE_FIELDS.items()
+        if data.get(field_name) is not None
+    }
 
 
 @dataclass
@@ -219,10 +236,6 @@ class Project:
     customer: str = ""
     notes: str = ""
     unit: str = "in"  # "in" or "mm" -- chosen once, at project/ballooning start
-    serial_lot_number: str = ""
-    fai_report: str = ""
-    po_number: str = ""
-    mfg_wo: str = ""
     date_created: str = field(default_factory=_now_iso)
     date_modified: str = field(default_factory=_now_iso)
     file_path: str = ""  # path to the .bpdb SQLite file, set after save
@@ -261,10 +274,6 @@ class Project:
             "customer": self.customer,
             "notes": self.notes,
             "unit": self.unit,
-            "serial_lot_number": self.serial_lot_number,
-            "fai_report": self.fai_report,
-            "po_number": self.po_number,
-            "mfg_wo": self.mfg_wo,
             "date_created": self.date_created,
             "date_modified": self.date_modified,
             "file_path": self.file_path,
@@ -285,10 +294,6 @@ class Project:
             customer=data.get("customer", ""),
             notes=data.get("notes", ""),
             unit=data.get("unit", "in"),
-            serial_lot_number=data.get("serial_lot_number", ""),
-            fai_report=data.get("fai_report", ""),
-            po_number=data.get("po_number", ""),
-            mfg_wo=data.get("mfg_wo", ""),
             date_created=data.get("date_created", _now_iso()),
             date_modified=data.get("date_modified", _now_iso()),
             file_path=data.get("file_path", ""),
