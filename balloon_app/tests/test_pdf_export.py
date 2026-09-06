@@ -11,6 +11,24 @@ from balloon_app.pdf_export import export_ballooned_pdf
 fitz = pytest.importorskip("pymupdf")
 
 
+@pytest.mark.parametrize("percent, diameter", [(50, 9), (100, 18), (200, 36)])
+def test_export_uses_selected_balloon_size(tmp_path, percent, diameter):
+    source = tmp_path / "source.pdf"
+    doc = fitz.open()
+    doc.new_page(width=200, height=200)
+    doc.save(source)
+    doc.close()
+    drawing = Drawing(file_name="source.pdf", original_path=str(source), page_count=1)
+    balloon = Balloon(number=1, drawing_id=drawing.id, x=100, y=100)
+    output = tmp_path / "output.pdf"
+    export_ballooned_pdf(drawing, [balloon], output, balloon_size_percent=percent)
+    with fitz.open(output) as exported:
+        circle = exported[0].get_drawings()[0]["rect"]
+        assert circle.width == pytest.approx(diameter)
+        assert circle.height == pytest.approx(diameter)
+        assert "1" in exported[0].get_text()
+
+
 def test_balloon_lands_on_target_on_rotated_page(tmp_path):
     """Regression test: on a page with /Rotate 90, a balloon placed at a
     page.rect-space point (the app's stored convention -- see

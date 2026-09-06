@@ -39,7 +39,9 @@ class CharacteristicType(str, Enum):
     OTHER = "other"
 
     @classmethod
-    def display_name(cls, value: str) -> str:
+    def display_name(cls, value: str, gdt_symbol: Optional[str] = None) -> str:
+        if value == cls.GDT_FRAME.value and gdt_symbol and gdt_symbol.strip():
+            return gdt_symbol.strip()
         names = {
             cls.LINEAR_DIMENSION: "Linear Dimension",
             cls.DIAMETER: "Diameter",

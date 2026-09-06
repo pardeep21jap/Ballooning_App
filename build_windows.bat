@@ -78,6 +78,7 @@ echo [5/5] Building with PyInstaller (this can take a few minutes)...
 "%PYTHON_EXE%" -m PyInstaller ^
     --name "BalloonApp" ^
     --windowed ^
+    --icon "balloon_app\resources\balloonapp.ico" ^
     --noconfirm ^
     --add-data "balloon_app\resources;balloon_app\resources" ^
     --collect-submodules balloon_app ^

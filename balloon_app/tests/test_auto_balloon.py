@@ -678,6 +678,44 @@ class TestVectorDrawnGdtFrame:
     frame (symbol left blank for review) instead of a plain dimension.
     """
 
+    @pytest.mark.parametrize("symbol", ["flatness", "rectangle", "open"])
+    @pytest.mark.parametrize("leader", [False, True])
+    def test_vector_flatness(self, tmp_path, symbol, leader):
+        pdf_path = tmp_path / "flatness.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "0.01", fontsize=12)
+        bbox = page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"]
+        _draw_gdt_frame(page, bbox)
+        x0, y0, _, y1 = bbox
+        h = y1 - y0
+        left = x0 - h * 1.15
+        top, bottom = y0 + h * 0.25, y0 + h * 0.75
+        shift = h * 0.25 if symbol != "rectangle" else 0
+        points = [(left + shift, top), (left + shift + h * 0.5, top),
+                  (left + h * 0.5, bottom), (left, bottom)]
+        shape = page.new_shape()
+        shape.draw_polyline(points if symbol == "open" else points + points[:1])
+        shape.finish(closePath=False)
+        shape.commit()
+        if leader:
+            # The leader joins a long extension line, as in the reported image.
+            edge = x0 - h * 1.35
+            middle = (y0 + y1) / 2
+            page.draw_line((edge, middle), (edge - h, middle))
+            page.draw_line((edge - h, middle - h * 0.2), (edge - h, middle + h * 4))
+        doc.save(str(pdf_path))
+        doc.close()
+        pdf_doc = PdfDocument(pdf_path)
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.char_type == CharacteristicType.GDT_FRAME.value
+        assert balloon.gdt_symbol == ("Flatness" if symbol == "flatness" else None)
+        assert balloon.gdt_tolerance == "0.01"
+        assert balloon.nominal is None
+
     def test_bare_value_with_adjacent_frame_becomes_gdt_frame(self, tmp_path):
         pdf_path = tmp_path / "vector_gdt_frame.pdf"
         doc = fitz.open()

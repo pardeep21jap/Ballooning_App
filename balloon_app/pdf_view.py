@@ -14,9 +14,10 @@ underlying page.
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QMutex, QObject, QPointF, QRectF, QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QMutex, QObject, QPointF, QRectF, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QGraphicsItem, QGraphicsLineItem, QGraphicsObject, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
@@ -75,7 +76,7 @@ class BalloonItem(QGraphicsObject):
         painter.setPen(QPen(QColor(255, 255, 255)))
         font = QFont()
         font.setBold(True)
-        font.setPointSizeF(max(6.0, self.radius * 0.85))
+        font.setPointSizeF(max(1.0, self.radius * 0.85))
         painter.setFont(font)
         painter.drawText(self.boundingRect(), int(Qt.AlignmentFlag.AlignCenter), str(self.number))
 
@@ -210,12 +211,14 @@ class PdfGraphicsView(QGraphicsView):
         self.setScene(self._scene)
         self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
-        self.setBackgroundBrush(QBrush(QColor(60, 60, 60)))
+        self._update_canvas_background()
 
         self._pixmap_item: Optional[QGraphicsPixmapItem] = None
         self._pdf_doc: Optional[PdfDocument] = None
         self._page_number = 0
+        self._welcome_logo = QPixmap(str(Path(__file__).parent / "resources" / "balloonapp-logo.png"))
         self._zoom_level = 1.0
+        self.balloon_size_percent = 100
         self._effective_dpi = ACTUAL_SIZE_DPI
         self._balloon_items: dict[str, BalloonItem] = {}
         self._leader_items: dict[str, QGraphicsLineItem] = {}
@@ -245,12 +248,62 @@ class PdfGraphicsView(QGraphicsView):
         self._thread.quit()
         self._thread.wait(2000)
 
+    def _update_canvas_background(self) -> None:
+        light_theme = self.palette().window().color().lightness() > 128
+        self.setBackgroundBrush(QBrush(QColor("#e9edf2" if light_theme else "#3c3c3c")))
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            self._update_canvas_background()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._pdf_doc is not None or self._pixmap_item is not None or self._welcome_logo.isNull():
+            return
+        # Paint in viewport coordinates, outside the drawing scene, so the
+        # welcome logo stays centered and never affects zoom or export.
+        area = self.viewport().rect()
+        side = min(420, int(min(area.width(), area.height()) * 0.6))
+        if side <= 0:
+            return
+        size = self._welcome_logo.size().scaled(side, side, Qt.AspectRatioMode.KeepAspectRatio)
+        target = QRectF((area.width()-size.width()) / 2, (area.height()-size.height()) / 2,
+                        size.width(), size.height())
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setOpacity(0.4)
+        painter.drawPixmap(target, self._welcome_logo, QRectF(self._welcome_logo.rect()))
+        painter.end()
+
     # ------------------------------------------------------------------
     # Document / page loading
     # ------------------------------------------------------------------
     def load_document(self, pdf_doc: Optional[PdfDocument]) -> None:
+        # Invalidate queued results before clearing the scene. A render from
+        # the previous document must not put its page back after closing.
+        self._request_counter += 1
         self._pdf_doc = pdf_doc
         self._worker.set_document(pdf_doc)
+        self._scene.clear()
+        self._pixmap_item = None
+        self._balloon_items.clear()
+        self._leader_items.clear()
+        self._leader_handle_items.clear()
+        self._current_balloons = []
+        self._selected_balloon_id = None
+        self._page_number = 0
+        self._pending_center_pdf = None
+        self._latest_request_id = -1
+        self.add_balloon_mode = False
+        self.leader_mode_balloon_id = None
+        self._panning = False
+        self._pan_start_pos = None
+        self._click_start_pos = None
+        self.unsetCursor()
+        self._scene.setSceneRect(0, 0, 0, 0)
+        self.viewport().update()
+        self.renderFinished.emit()
 
     def set_page(self, page_number: int, balloons: list[Balloon], preserve_view: bool = False) -> None:
         self._page_number = page_number
@@ -259,6 +312,10 @@ class PdfGraphicsView(QGraphicsView):
 
     def refresh_balloons(self, balloons: list[Balloon]) -> None:
         self._current_balloons = balloons
+        self._sync_balloon_items()
+
+    def set_balloon_size(self, percent: int) -> None:
+        self.balloon_size_percent = max(50, min(200, percent))
         self._sync_balloon_items()
 
     # ------------------------------------------------------------------
@@ -376,7 +433,7 @@ class PdfGraphicsView(QGraphicsView):
         from balloon_app.config import BALLOON_RADIUS_PDF_POINTS
 
         dpi = self._last_render_dpi()
-        radius_px = BALLOON_RADIUS_PDF_POINTS * dpi / 72.0
+        radius_px = BALLOON_RADIUS_PDF_POINTS * self.balloon_size_percent / 100 * dpi / 72.0
 
         page_balloons = [b for b in self._current_balloons if b.page_number == self._page_number]
         current_ids = {b.id for b in page_balloons}
@@ -401,6 +458,7 @@ class PdfGraphicsView(QGraphicsView):
                 self._scene.addItem(item)
                 self._balloon_items[balloon.id] = item
             item.set_emit_moves(False)
+            item.prepareGeometryChange()
             item.radius = radius_px
             item.update_appearance(balloon.number, balloon.source, balloon.status)
             item.setPos(px, py)
@@ -433,6 +491,7 @@ class PdfGraphicsView(QGraphicsView):
                     self._scene.addItem(handle)
                     self._leader_handle_items[balloon.id] = handle
                 handle.set_emit_moves(False)
+                handle.prepareGeometryChange()
                 handle.half_size = radius_px * 0.4
                 handle.setPos(lx, ly)
                 handle.set_emit_moves(True)

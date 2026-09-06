@@ -64,7 +64,7 @@ MAX_ZOOM = 8.0
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
 BALLOON_RADIUS_PDF_POINTS = 9.0
 
-RULES_OCR_MODEL_VERSION = "rules_ocr_v1"
+RULES_OCR_MODEL_VERSION = "rules_ocr_v2_gdt"
 
 # ---------------------------------------------------------------------------
 # Balloon status colors (RGBA) - used consistently across the graphics view,
@@ -127,6 +127,8 @@ class AppSettings:
     use_yolo_if_available: bool = False
     recent_projects: list[str] = field(default_factory=list)
     max_recent_projects: int = 10
+    balloon_size_percent: int = 100
+    theme: str = "dark"
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -145,6 +147,8 @@ class AppSettings:
                 qs.value("use_yolo_if_available", False, type=bool)
             ),
             recent_projects=recent,
+            balloon_size_percent=max(50, min(200, int(qs.value("balloon_size_percent", 100, type=int)))),
+            theme="light" if qs.value("theme", "dark", type=str) == "light" else "dark",
         )
 
     def save(self) -> None:
@@ -156,6 +160,8 @@ class AppSettings:
         qs.setValue("yolo_model_path", self.yolo_model_path)
         qs.setValue("use_yolo_if_available", self.use_yolo_if_available)
         qs.setValue("recent_projects", self.recent_projects)
+        qs.setValue("balloon_size_percent", self.balloon_size_percent)
+        qs.setValue("theme", self.theme)
         qs.sync()
 
     def add_recent_project(self, path: str) -> None:

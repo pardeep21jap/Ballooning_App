@@ -26,6 +26,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='BalloonApp',
+    icon='balloon_app/resources/balloonapp.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

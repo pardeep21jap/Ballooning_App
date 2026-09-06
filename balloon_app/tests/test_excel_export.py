@@ -11,6 +11,30 @@ from balloon_app.data_model import Balloon, BalloonSource, Drawing, Project, Rev
 from balloon_app.excel_export import COLUMNS, FORM_NUMBER, INSPECTION_SHEET_NAME, export_excel
 
 
+@pytest.mark.parametrize("raw, callout", [
+    ('G1/2" - 6H 18.0', 'G1/2"-6H'),
+    ("M4 - 6H 8.0", "M4-6H"),
+    ("8-32 UNC-2B DEPTH 18.0", "8-32 UNC-2B"),
+])
+def test_thread_requirement_excludes_separate_depth(tmp_path, raw, callout):
+    project = Project(name="Thread export", unit="mm")
+    drawing = Drawing(project_id=project.id, file_name="thread.pdf")
+    balloons = [
+        Balloon(number=36, drawing_id=drawing.id, char_type="thread",
+                raw_text=raw, thread_callout=callout),
+        Balloon(number=37, drawing_id=drawing.id, char_type="depth",
+                raw_text=raw, nominal=18.0),
+    ]
+    output = tmp_path / "threads.xlsx"
+    export_excel(project, drawing, balloons, output)
+    workbook = openpyxl.load_workbook(output)
+    sheet = workbook[INSPECTION_SHEET_NAME]
+    assert sheet["C8"].value == callout
+    assert str(sheet["C9"].value) == "18"
+    assert balloons[0].raw_text == raw
+    workbook.close()
+
+
 @pytest.fixture
 def sample_project_and_balloons():
     project = Project(

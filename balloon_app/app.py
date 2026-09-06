@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QKeySequence, QUndoCommand, QUndoStack
+from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QUndoCommand, QUndoStack
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -48,6 +48,7 @@ from balloon_app.data_model import (
 )
 from balloon_app.database import ProjectDatabase
 from balloon_app.dialogs import (
+    COMMON_INSPECTION_METHODS,
     AboutDialog,
     BalloonEditDialog,
     ConfidenceThresholdDialog,
@@ -312,6 +313,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BalloonApp")
+        self.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "balloonapp.ico")))
         self.resize(1440, 900)
 
         self.settings = AppSettings.load()
@@ -361,8 +363,13 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.addWidget(self.pdf_view)
         splitter.addWidget(review_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
+        # Stretch factors alone multiply each widget's size hint. The
+        # empty canvas has a tiny hint while the review controls have a
+        # large one, so explicitly seed the intended starting widths.
+        splitter.setChildrenCollapsible(False)
+        splitter.setSizes([900, 540])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
 
         self.progress_bar = QProgressBar()
@@ -396,9 +403,9 @@ class MainWindow(QMainWindow):
         search_row.addWidget(self.search_edit)
         layout.addLayout(search_row)
 
-        self.review_table = ReviewTable(0, 7, self._on_review_rows_dropped)
+        self.review_table = ReviewTable(0, 8, self._on_review_rows_dropped)
         self.review_table.setHorizontalHeaderLabels(
-            ["Balloon #", "Page", "Type", "Raw Text", "Nominal", "Tolerance", "Status"]
+            ["Balloon #", "Page", "Type", "Raw Text", "Nominal", "Tolerance", "Inspection Method", "Status"]
         )
         self.review_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -555,6 +562,16 @@ class MainWindow(QMainWindow):
 
         # View menu
         view_menu = menu_bar.addMenu("&View")
+        theme_menu = view_menu.addMenu("Theme")
+        self.theme_actions = QActionGroup(self)
+        self.theme_actions.setExclusive(True)
+        for theme in ("light", "dark"):
+            action = theme_menu.addAction(theme.capitalize())
+            action.setCheckable(True)
+            action.setChecked(self.settings.theme == theme)
+            self.theme_actions.addAction(action)
+            action.triggered.connect(lambda checked, choice=theme: self._change_theme(choice))
+        view_menu.addSeparator()
         zoom_in_act = QAction("Zoom In", self)
         zoom_in_act.setShortcut(QKeySequence("Ctrl+="))
         zoom_in_act.triggered.connect(self.pdf_view.zoom_in)
@@ -655,6 +672,29 @@ class MainWindow(QMainWindow):
         self.drawing_combo.currentIndexChanged.connect(self._on_drawing_combo_changed)
         self.drawing_combo.setVisible(False)
         toolbar.addWidget(self.drawing_combo)
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel(" Balloon Size: "))
+        self.balloon_size_spin = QSpinBox()
+        self.balloon_size_spin.setRange(50, 200)
+        self.balloon_size_spin.setSingleStep(10)
+        self.balloon_size_spin.setSuffix("%")
+        self.balloon_size_spin.setValue(self.settings.balloon_size_percent)
+        self.balloon_size_spin.setToolTip("Size of all balloons on screen and in exported PDFs (100% is the default)")
+        self.pdf_view.balloon_size_percent = self.settings.balloon_size_percent
+        self.balloon_size_spin.valueChanged.connect(self._change_balloon_size)
+        toolbar.addWidget(self.balloon_size_spin)
+
+    def _change_balloon_size(self, percent: int) -> None:
+        self.settings.balloon_size_percent = percent
+        self.settings.save()
+        self.pdf_view.set_balloon_size(percent)
+
+    def _change_theme(self, theme: str) -> None:
+        from balloon_app.theme import apply_theme
+
+        apply_theme(QApplication.instance(), theme)
+        self.settings.theme = theme
+        self.settings.save()
 
     # ------------------------------------------------------------------
     # Busy / progress
@@ -1252,10 +1292,11 @@ class MainWindow(QMainWindow):
             values = [
                 str(b.number),
                 str(b.page_number + 1),
-                CharacteristicType.display_name(b.char_type),
+                CharacteristicType.display_name(b.char_type, b.gdt_symbol),
                 b.raw_text,
                 "" if b.nominal is None else str(b.nominal),
                 self._format_tolerance(b),
+                b.inspection_method,
                 b.status.capitalize(),
             ]
             for col, value in enumerate(values):
@@ -1264,7 +1305,30 @@ class MainWindow(QMainWindow):
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, b.id)
                 table.setItem(row, col, item)
+            method_combo = QComboBox(table)
+            method_combo.addItems(COMMON_INSPECTION_METHODS)
+            if method_combo.findText(b.inspection_method) < 0:
+                method_combo.addItem(b.inspection_method)
+            method_combo.setCurrentText(b.inspection_method)
+            method_combo.setToolTip("Select an inspection method")
+            method_combo.textActivated.connect(
+                lambda method, balloon_id=b.id: self._set_inspection_method(balloon_id, method)
+            )
+            table.setCellWidget(row, 6, method_combo)
         table.resizeColumnsToContents()
+
+    def _set_inspection_method(self, balloon_id: str, method: str) -> None:
+        balloon = self._find_balloon(balloon_id)
+        if self.project is None or balloon is None or balloon.inspection_method == method:
+            return
+        before = {"inspection_method": balloon.inspection_method, "modified_at": balloon.modified_at}
+        balloon.inspection_method = method
+        balloon.touch()
+        after = {"inspection_method": balloon.inspection_method, "modified_at": balloon.modified_at}
+        self.undo_stack.push(BalloonFieldChangeCommand(
+            self.project, [balloon_id], {balloon_id: before}, {balloon_id: after},
+            self._refresh_all, text="Change Inspection Method",
+        ))
 
     def _set_status_for(self, ids: list[str], status: str, text: str) -> None:
         if not ids or self.project is None:
@@ -1699,6 +1763,7 @@ class MainWindow(QMainWindow):
         self._run_background(
             export_ballooned_pdf, self._on_export_pdf_done, f"Exporting ballooned PDF to {Path(path).name}...",
             self.drawing, balloons, path, include_pending, include_rejected,
+            balloon_size_percent=self.settings.balloon_size_percent,
         )
 
     def _on_export_pdf_done(self, result: PdfExportResult) -> None:
@@ -1764,9 +1829,13 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    from balloon_app.theme import apply_theme
+
     setup_logging()
     app = QApplication(sys.argv)
+    apply_theme(app, AppSettings.load().theme)
     app.setApplicationName("BalloonApp")
+    app.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "balloonapp.ico")))
     window = MainWindow()
     window.show()
     return app.exec()

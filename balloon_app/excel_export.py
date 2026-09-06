@@ -93,10 +93,12 @@ def _fmt_number(value: Optional[float], strip_leading_zero: bool = False) -> Opt
 def _designator(balloon: Balloon) -> str:
     if balloon.note.strip():
         return balloon.note.strip()
-    return CharacteristicType.display_name(balloon.char_type)
+    return CharacteristicType.display_name(balloon.char_type, balloon.gdt_symbol)
 
 
 def _requirement(balloon: Balloon, strip_leading_zero: bool) -> str:
+    if balloon.char_type == CharacteristicType.THREAD.value and balloon.thread_callout:
+        return balloon.thread_callout.strip()
     if balloon.char_type == CharacteristicType.NOTE.value:
         return balloon.raw_text.strip() or balloon.note.strip()
     if balloon.nominal is not None:

@@ -33,6 +33,7 @@ import numpy as np
 
 from balloon_app.config import AUTO_BALLOON_DPI, BALLOON_RADIUS_PDF_POINTS, CHARACTERISTIC_CLASSES, RULES_OCR_MODEL_VERSION
 from balloon_app.data_model import Balloon, BalloonSource, CharacteristicType, ReviewStatus
+from balloon_app.gdt_vision import SYMBOLS, find_gdt_frames
 from balloon_app.ocr_parser import (
     NUM,
     DefaultTolerances,
@@ -173,6 +174,8 @@ class Detection:
     raw_text: Optional[str] = None
     diameter_hint: bool = False
     gdt_frame_hint: bool = False
+    flatness_hint: bool = False
+    gdt_symbol_hint: Optional[str] = None
 
 
 class BaseDetector(ABC):
@@ -218,6 +221,17 @@ class RulesOcrDetector(BaseDetector):
                 "Tesseract OCR engine was not found on this system. Install it or set "
                 f"TESSERACT_PATH in Settings. ({exc})"
             )
+
+    def read_cell(self, image: np.ndarray) -> str:
+        """Read one frame compartment after the caller removes its borders."""
+        if not self.available or self._pytesseract is None:
+            return ""
+        padded = cv2.copyMakeBorder(image, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
+        try:
+            return self._pytesseract.image_to_string(padded, config="--psm 7").strip()
+        except Exception:
+            logger.exception("OCR of GD&T cell failed")
+            return ""
 
     def detect(self, image: np.ndarray) -> list[Detection]:
         if not self.available or self._pytesseract is None:
@@ -684,6 +698,7 @@ def auto_balloon_page(
     # (see PdfDocument.find_vector_gdt_frame). Checked on the same raw,
     # pre-merge blocks and for the same reason.
     gdt_frame_hint_bboxes: list[tuple[float, float, float, float]] = []
+    flatness_hint_bboxes: list[tuple[float, float, float, float]] = []
     for block in native_blocks:
         if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
             continue
@@ -691,6 +706,8 @@ def auto_balloon_page(
             diameter_hint_bboxes.append(block.bbox)
         if pdf_doc.find_vector_gdt_frame(page_number, block.bbox):
             gdt_frame_hint_bboxes.append(block.bbox)
+            if pdf_doc.find_vector_flatness_symbol(page_number, block.bbox):
+                flatness_hint_bboxes.append(block.bbox)
 
     merged_native_blocks = _merge_stacked_tolerance_fragments(_merge_nearby_text_blocks(native_blocks))
 
@@ -714,6 +731,7 @@ def auto_balloon_page(
                 raw_text=block.text,
                 diameter_hint=diameter_hint,
                 gdt_frame_hint=gdt_frame_hint,
+                flatness_hint=any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in flatness_hint_bboxes),
             )
         )
 
@@ -746,6 +764,51 @@ def auto_balloon_page(
             if not raw_detections:
                 message = "OCR ran but found no recognizable dimensions/tolerances on this page."
 
+    # Read symbols from the rendered ink as well as the text layer. This
+    # covers CAD vector paths, unmapped fonts, and scanned feature frames.
+    # OCR each enclosed value separately when selectable text is absent;
+    # full-page OCR often discards short text enclosed by table borders.
+    frame_ocr = None
+    if gray_image is not None:
+        for frame in find_gdt_frames(gray_image):
+            frame_used_ocr = False
+            cell_texts = []
+            cell_boxes = [rect_pixel_to_pdf(cell, dpi) for cell in frame.cells]
+            if title_block_cutoff_y is not None and cell_boxes[0][1] >= title_block_cutoff_y:
+                continue
+            for cell, box in zip(frame.cells, cell_boxes):
+                spans = [b for b in native_blocks if _bbox_center_within(b.bbox, box)]
+                spans.sort(key=lambda b: (round(b.bbox[1] / 5), b.bbox[0]))
+                cell_text = " ".join(b.text for b in spans)
+                if not cell_text:
+                    if frame_ocr is None:
+                        frame_ocr = RulesOcrDetector(tesseract_path)
+                    if frame_ocr.available:
+                        x0, y0, x1, y1 = cell
+                        pad = max(2, round((y1-y0) * 0.06))
+                        crop = gray_image[y0+pad:y1-pad, x0+pad:x1-pad]
+                        cell_text = frame_ocr.read_cell(crop)
+                        used_ocr = frame_used_ocr = True
+                    else:
+                        ocr_available = False
+                        message = frame_ocr.error or "GD&T frame values need OCR. Configure Tesseract in Settings."
+                cell_texts.append(cell_text.strip())
+            # Never invent a tolerance when neither PDF text nor OCR read it.
+            if not cell_texts or not re.search(NUM, cell_texts[0]):
+                continue
+            raw_text = " | ".join(cell_texts)
+            candidates = [d for d in candidates
+                          if not any(_bbox_center_within(d.bbox, box) for box in cell_boxes)]
+            candidates.append(Detection(
+                bbox=(cell_boxes[0][0], cell_boxes[0][1], cell_boxes[-1][2], cell_boxes[-1][3]),
+                label=CharacteristicType.GDT_FRAME.value,
+                confidence=min(frame.confidence, 0.55 if any(not t for t in cell_texts)
+                               else 0.75 if frame_used_ocr else 0.9),
+                raw_text=raw_text, gdt_frame_hint=True, gdt_symbol_hint=frame.symbol,
+            ))
+            if message == "OCR ran but found no recognizable dimensions/tolerances on this page.":
+                message = ""
+
     candidates = candidates[:300]  # sanity cap against pathological pages
     candidates.sort(key=lambda d: (round(d.bbox[1] / 10.0), d.bbox[0]))
 
@@ -759,7 +822,9 @@ def auto_balloon_page(
         # inspected requirement (e.g. a tapped hole's thread class *and* its
         # depth) -- each becomes its own balloon, placed near the same text.
         parsed_list = (
-            parse_characteristics(raw_text, diameter_hint=det.diameter_hint, gdt_frame_hint=det.gdt_frame_hint)
+            parse_characteristics((SYMBOLS[det.gdt_symbol_hint] + " " if det.gdt_symbol_hint
+                                   else "⏥ " if det.flatness_hint else "") + raw_text,
+                                  diameter_hint=det.diameter_hint, gdt_frame_hint=det.gdt_frame_hint)
             if raw_text
             else [None]
         )

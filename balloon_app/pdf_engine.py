@@ -265,6 +265,13 @@ class PdfDocument:
             drawings = []
         for path in drawings:
             for item in path.get("items", []):
+                if item[0] == "qu":
+                    quad = item[1]
+                    corners = [quad.ul, quad.ur, quad.lr, quad.ll]
+                    for a, b in zip(corners, corners[1:] + corners[:1]):
+                        a, b = a * rotation_matrix, b * rotation_matrix
+                        bboxes.append((min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y)))
+                    continue
                 local = _drawing_item_local_bbox(item)
                 if local is None:
                     continue
@@ -323,6 +330,45 @@ class PdfDocument:
                 return True
         return False
 
+    def find_vector_flatness_symbol(
+        self, page_number: int, bbox: tuple[float, float, float, float]
+    ) -> bool:
+        """Recognize a closed, horizontal parallelogram in the symbol cell.
+
+        Require an adjacent feature control frame to avoid interpreting part
+        outlines as symbols. Use individual edges, including PDF quad paths.
+        """
+        if not self.find_vector_gdt_frame(page_number, bbox):
+            return False
+        x0, y0, _, y1 = bbox
+        height = y1 - y0
+        nearby = [r for r in self._drawing_item_bboxes(page_number)
+                  if x0 - 3 * height <= r[0] < r[2] < x0
+                  and y0 <= r[1] <= r[3] <= y1]
+        eps = max(0.05, height * 0.015)
+        for cluster in _cluster_touching_rects(nearby, eps):
+            if len(cluster) != 4:
+                continue
+            horizontal = sorted((r for r in cluster if r[3] - r[1] <= eps), key=lambda r: r[1])
+            slanted = [r for r in cluster if r[3] - r[1] > eps]
+            if len(horizontal) != 2 or len(slanted) != 2:
+                continue
+            top, bottom = horizontal
+            symbol_height = bottom[1] - top[1]
+            width = top[2] - top[0]
+            shift = top[0] - bottom[0]
+            if not (0.2 * height <= symbol_height <= height
+                    and 0.6 * symbol_height <= width <= 2.5 * symbol_height
+                    and 0.2 * symbol_height <= shift <= symbol_height
+                    and abs(width - (bottom[2] - bottom[0])) <= eps):
+                continue
+            expected = [(bottom[0], top[1], top[0], bottom[1]),
+                        (bottom[2], top[1], top[2], bottom[1])]
+            if all(all(abs(a - b) <= eps for a, b in zip(actual, target))
+                   for actual, target in zip(sorted(slanted), expected)):
+                return True
+        return False
+
     def find_vector_gdt_frame(
         self, page_number: int, bbox: tuple[float, float, float, float]
     ) -> bool:
@@ -370,7 +416,9 @@ class PdfDocument:
             # anything via .intersects(), even genuine overlaps. Use a
             # plain numeric overlap test instead (already used for
             # clustering below) so real hairline strokes aren't missed.
-            nearby = [r for r in self._drawing_item_bboxes(page_number) if _rects_touch(search, r, 0.0)]
+            nearby = [r for r in self._drawing_item_bboxes(page_number)
+                      if _rects_touch(search, r, 0.0)
+                      and r[1] >= search[1] and r[3] <= search[3]]
         except Exception:
             logger.exception("Failed GD&T-frame geometry check on page %d of %s", page_number, self.path)
             return False

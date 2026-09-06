@@ -38,8 +38,16 @@ Please read this before relying on the tool in production:
   unusual symbol fonts, or heavily stylized datums) may not be fully parsed
   and often need manual correction of the symbol, tolerance, material
   condition, and datum fields.
+- **GD&T symbol vision** supports all 14 chart symbols: straightness,
+  flatness, circularity, cylindricity, angularity, perpendicularity,
+  parallelism, position, concentricity, symmetry, line profile, surface
+  profile, circular runout, and total runout. It examines upright, enclosed
+  feature-control frames in rendered PDFs, including vector symbols and
+  scanned images. Weak or ambiguous matches are left unnamed. Scanned
+  tolerance/datum text requires Tesseract; symbol recognition itself does
+  not. Heavily skewed, broken, tiny, or unusual symbols may need correction.
 - The bundled auto-ballooning pipeline is a **transparent, regex-based rule
-  engine** (`rules_ocr_v1`), not a trained machine-learning model. A YOLO
+  engine with geometric symbol matching** (`rules_ocr_v2_gdt`), not a trained machine-learning model. A YOLO
   detector interface exists and is fully wired in, but no pretrained model
   ships with the app -- you would need to train and supply your own `.pt`
   file (see below).
@@ -130,11 +138,34 @@ OCR is unavailable, and lets you continue ballooning that page manually.
 
 ## Running the app
 
-From the project root, with the virtual environment activated:
+After completing the installation steps above, open **PowerShell** (or the
+PowerShell terminal in your IDE) and run:
 
+```powershell
+cd D:\Websites\Ballooning_App\BalloonApp
+.\.venv\Scripts\pythonw.exe main.py
 ```
+
+This starts the latest source version without a console window. No virtual
+environment activation is needed. If you installed the project elsewhere,
+replace the folder path with your own.
+
+To see startup errors and logs in the terminal, use:
+
+```powershell
+.\.venv\Scripts\python.exe main.py
+```
+
+Alternatively, from the `BalloonApp` folder with the virtual environment
+already activated:
+
+```powershell
 python main.py
 ```
+
+After code updates, save your work and close the running app, then launch
+it again with these commands. An existing `.exe` in `dist` will only include
+the latest changes after it is rebuilt.
 
 ## How project data is stored
 

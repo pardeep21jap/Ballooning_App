@@ -9,8 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Optional
 
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtGui import QDoubleValidator
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QDoubleValidator, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -741,5 +741,12 @@ class AboutDialog(QDialog):
         buttons.accepted.connect(self.accept)
 
         layout = QVBoxLayout(self)
+        logo = QLabel()
+        logo.setPixmap(QPixmap(str(Path(__file__).parent / "resources" / "balloonapp-logo.png")).scaled(
+            96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
+        ))
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setAccessibleName("BalloonApp logo")
+        layout.addWidget(logo)
         layout.addWidget(text)
         layout.addWidget(buttons)

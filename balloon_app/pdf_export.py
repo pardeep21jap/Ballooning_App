@@ -63,8 +63,8 @@ def _rgba_unit(rgba: tuple[int, int, int, int]) -> tuple[float, float, float]:
     return (rgba[0] / 255.0, rgba[1] / 255.0, rgba[2] / 255.0)
 
 
-def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]]) -> None:
-    radius = BALLOON_RADIUS_PDF_POINTS
+def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]], balloon_size_percent: int = 100) -> None:
+    radius = BALLOON_RADIUS_PDF_POINTS * max(50, min(200, balloon_size_percent)) / 100
     for page_number, page_balloons in by_page.items():
         if page_number < 0 or page_number >= doc.page_count:
             logger.warning("Skipping %d balloon(s) for out-of-range page %d", len(page_balloons), page_number)
@@ -106,7 +106,7 @@ def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]])
             page.insert_textbox(
                 text_rect,
                 str(balloon.number),
-                fontsize=max(6.0, radius * 1.05),
+                fontsize=radius * 1.05,
                 fontname="helv",
                 color=(1, 1, 1),
                 align=1,
@@ -136,6 +136,7 @@ def export_ballooned_pdf(
     include_pending: bool = True,
     include_rejected: bool = False,
     raster_fallback_dpi: float = 300.0,
+    balloon_size_percent: int = 100,
 ) -> PdfExportResult:
     """Draw balloons onto a copy of the source PDF and save it to ``output_path``."""
     source_path = resolve_source_path(drawing)
@@ -158,7 +159,7 @@ def export_ballooned_pdf(
     doc: Optional[fitz.Document] = None
     try:
         doc = fitz.open(str(source_path))
-        _draw_balloons_on_doc(doc, by_page)
+        _draw_balloons_on_doc(doc, by_page, balloon_size_percent)
         fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=".tmp_", suffix=".pdf")
         os.close(fd)
         doc.save(tmp_name, garbage=3, deflate=True)
@@ -168,7 +169,7 @@ def export_ballooned_pdf(
             doc.close()
         try:
             doc = _build_raster_fallback_doc(source_path, raster_fallback_dpi)
-            _draw_balloons_on_doc(doc, by_page)
+            _draw_balloons_on_doc(doc, by_page, balloon_size_percent)
             fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=".tmp_", suffix=".pdf")
             os.close(fd)
             doc.save(tmp_name)
