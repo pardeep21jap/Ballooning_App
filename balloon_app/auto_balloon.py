@@ -370,6 +370,10 @@ _EMBEDDED_MINUS_RE = re.compile(rf"-\s*({NUM})")
 # are equivalent. Requires a preceding token (the nominal itself) so a
 # bare "0" is never mistaken for the whole value.
 _TRAILING_BARE_ZERO_RE = re.compile(r"(?<=\S)\s+(0(?:\.0+)?)\s*$")
+# The anchor's own value within (possibly already compound) base_text --
+# used to insert a stacked tolerance right after it, see the comment where
+# this is used in _merge_stacked_tolerance_fragments below.
+_FIRST_NUMBER_RE = re.compile(NUM)
 
 
 def _bboxes_are_near(
@@ -474,14 +478,22 @@ def _merge_stacked_tolerance_fragments(
 
         assigned = [j for j, anchor in fragment_anchor.items() if anchor == i]
         plus_idx = minus_idx = None
+        # A second fragment sharing the same sign as one already claimed
+        # (e.g. a "+.3 / +.1" double-positive tolerance style, not the more
+        # common "+X / -Y") -- kept and merged with its own true sign
+        # rather than silently dropped, which previously left it behind as
+        # its own stray candidate/balloon.
+        extra_idx = extra_sign = None
         for j in assigned:
             sign = _BARE_SIGNED_NUM_RE.match(blocks[j].text).group(1)
             if sign == "+" and plus_idx is None:
                 plus_idx = j
             elif sign == "-" and minus_idx is None:
                 minus_idx = j
+            elif extra_idx is None:
+                extra_idx, extra_sign = j, sign
 
-        if plus_idx is None and minus_idx is None:
+        if plus_idx is None and minus_idx is None and extra_idx is None:
             continue  # no external fragment to merge -- leave this block as-is
 
         base_text = nominal.text
@@ -505,14 +517,20 @@ def _merge_stacked_tolerance_fragments(
             minus_val = _BARE_SIGNED_NUM_RE.match(blocks[minus_idx].text).group(2)
             combined_bbox = _union_bbox(combined_bbox, blocks[minus_idx].bbox)
             used.add(minus_idx)
+        extra_val = None
+        if extra_idx is not None:
+            extra_val = _BARE_SIGNED_NUM_RE.match(blocks[extra_idx].text).group(2)
+            combined_bbox = _union_bbox(combined_bbox, blocks[extra_idx].bbox)
+            used.add(extra_idx)
 
         # A unilateral tolerance ("0 / +0.05") -- only one side has an
         # explicit sign; the other, always exactly 0, is conventionally
         # written bare since +0 and -0 are equivalent. That bare "0" sits
         # right after the nominal (same-line merged already, e.g. "Ø8 0"),
         # so only one of plus_val/minus_val was found above; the trailing
-        # bare number fills in the other side.
-        if (plus_val is None) != (minus_val is None):
+        # bare number fills in the other side. Not applicable when a
+        # same-sign extra fragment already supplies the second value.
+        if extra_val is None and (plus_val is None) != (minus_val is None):
             trailing_zero = _TRAILING_BARE_ZERO_RE.search(base_text)
             if trailing_zero:
                 base_text = base_text[: trailing_zero.start()].rstrip()
@@ -521,11 +539,26 @@ def _merge_stacked_tolerance_fragments(
                 else:
                     minus_val = trailing_zero.group(1)
 
-        parts = [base_text]
+        tol_parts = []
         if plus_val is not None:
-            parts.append(f"+{plus_val}")
+            tol_parts.append(f"+{plus_val}")
         if minus_val is not None:
-            parts.append(f"-{minus_val}")
+            tol_parts.append(f"-{minus_val}")
+        if extra_val is not None:
+            tol_parts.append(f"{extra_sign}{extra_val}")
+
+        # Insert the tolerance right after the anchor's own value rather
+        # than at the tail of base_text -- base_text may already be a
+        # compound "Ø12.0 ↧ 100.0" (nominal same-line-merged with a
+        # trailing depth clause *before* this stacked-tolerance pass ever
+        # runs), and appending there would misattach the tolerance past
+        # the depth instead of to the value it actually modifies.
+        value_match = _FIRST_NUMBER_RE.search(base_text)
+        if value_match:
+            head, tail = base_text[: value_match.end()], base_text[value_match.end() :].strip()
+        else:
+            head, tail = base_text, ""
+        parts = [head, *tol_parts] + ([tail] if tail else [])
         used.add(i)
         merged.append(TextBlock(text=" ".join(parts), bbox=combined_bbox))
 

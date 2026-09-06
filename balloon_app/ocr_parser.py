@@ -49,6 +49,24 @@ _THREAD_UNIFIED_RE = re.compile(
     re.IGNORECASE,
 )
 _THREAD_METRIC_RE = re.compile(rf"\bM\s?(\d+\.?\d*)\s*[xX×]\s*({NUM})\b")
+# A metric thread's tolerance-class designation, e.g. "M4-6H" (a tapped
+# hole's internal thread class, no pitch given -- coarse pitch is implied)
+# or "M10 x 1.5-6H" (class given alongside an explicit pitch). Case is
+# preserved in the captured class ("6H" vs "6g"): uppercase denotes an
+# internal thread, lowercase an external one -- meaningfully different, so
+# it must never be normalized.
+_THREAD_METRIC_CLASS_RE = re.compile(
+    rf"\bM\s?(\d+\.?\d*)\s*(?:[xX×]\s*({NUM})\s*)?-\s*(\d{{1,2}}[A-Za-z](?:\d{{1,2}}[A-Za-z])?)\b"
+)
+# A parallel pipe thread (ISO 228 "G" designation, e.g. "G1/2\" - 6H"),
+# common on hydraulic/pneumatic fittings. Deliberately restricted to a
+# fractional size (a literal "/"): a bare "G" + whole number, e.g. "G10",
+# is indistinguishable from common fiberglass-laminate material codes
+# (G10, G11) and would false-positive as a thread on a material note.
+# Case-sensitive ("G" only, not "g") for the same reason "M" isn't matched
+# case-insensitively elsewhere -- a lowercase "g" is too common a unit
+# abbreviation (grams) to treat as a thread prefix.
+_THREAD_PIPE_RE = re.compile(rf"\bG(\d+/\d+)(\s*[\"'])?(?:\s*-\s*([A-Za-z0-9]{{1,3}})\b)?")
 
 # A depth callout trailing a thread spec, e.g. "8-32 UNC-2B ▼0.500" (tapped
 # hole depth). CAD PDF exports draw the "depth" glyph from a custom
@@ -79,9 +97,25 @@ _ANGLE_HINT_RE = re.compile(r"°")
 # above -- CAD PDF exports often draw these from a custom dingbat font with
 # no ToUnicode mapping, so the extracted text can be an unrelated ASCII
 # character), so each also matches its common textual/abbreviation form.
-_DEPTH_HINT_RE = re.compile(r"[▼↓]|\bDEPTH\b|\bDEEP\b|\bDP\b", re.IGNORECASE)
+#
+# ⌵ is ASME's countersink symbol, but the same glyph is also one of the
+# unreliable extractions a CAD PDF export can produce for the unrelated
+# "depth" glyph (see _TRAILING_DECIMAL_RE above) -- e.g. a tapped hole's
+# "Ø3.3 ⌵ 12.0" (drill diameter, then depth) versus a countersink's
+# "⌵⌀0.500 X 82°" (diameter, then included angle). Position disambiguates:
+# only immediately *before* a diameter symbol does ⌵ mean countersink;
+# anywhere else (typically trailing a completed value) it's read as depth.
+# ↧ (downwards arrow from bar) is ASME's actual "depth" symbol and is
+# unambiguous -- unlike ⌵, it has no other meaning, so it's matched outright.
+_DEPTH_HINT_RE = re.compile(r"[▼↓⌵↧]|\bDEPTH\b|\bDEEP\b|\bDP\b", re.IGNORECASE)
+# Tolerance markup between a shape's value and a later trailing number --
+# ("Ø6.38 +0.005 -0.010") rules out reading that trailing number as a depth
+# via the symbol-agnostic fallback in _try_shape_with_secondary_value below.
+_DEPTH_BLOCKING_RE = re.compile(r"[+\-±]")
 _COUNTERBORE_HINT_RE = re.compile(r"[⌴]|C['’]?BORE|\bCOUNTERBORE\b", re.IGNORECASE)
-_COUNTERSINK_HINT_RE = re.compile(r"[⌵]|C['’]?SINK|\bCSK\b|\bCOUNTERSINK\b", re.IGNORECASE)
+_COUNTERSINK_HINT_RE = re.compile(
+    rf"[⌵]\s*[{_DIAMETER_SYMBOLS}]|C['’]?SINK|\bCSK\b|\bCOUNTERSINK\b", re.IGNORECASE
+)
 _SQUARE_HINT_RE = re.compile(r"[□]|\bSQ\b|\bSQUARE\b", re.IGNORECASE)
 
 # Paired "symbol/keyword + its own number" extractors, used to pull a shape
@@ -130,6 +164,24 @@ _VALUE_THEN_ANGLE_RE = re.compile(rf"({NUM})\s*[Xx]\s*({NUM})\s*°")
 # Numeric tolerance extraction patterns, tried in priority order.
 _ASYM_SLASH_RE = re.compile(rf"({NUM})\s*\+\s*({NUM})\s*/\s*-\s*({NUM})")
 _ASYM_SPACE_RE = re.compile(rf"({NUM})\s*\+\s*({NUM})\s+-\s*({NUM})")
+# A less common but valid style: both stacked deviations share the same
+# sign (e.g. "+.3" over "+.1" -- a hole enlarged by somewhere between 0.1
+# and 0.3, never undersized), rather than the usual "+X above / -Y below".
+# ASME lists the numerically larger (less restrictive) deviation on top
+# regardless of sign, but since the merge step that produces this text
+# (see _merge_stacked_tolerance_fragments) doesn't guarantee that order,
+# the two values are sorted here rather than assumed positional.
+_DOUBLE_PLUS_RE = re.compile(rf"({NUM})\s*\+\s*({NUM})\s+\+\s*({NUM})")
+_DOUBLE_MINUS_RE = re.compile(rf"({NUM})\s*-\s*({NUM})\s+-\s*({NUM})")
+# Same patterns, minus the leading nominal capture -- used to recognize a
+# tolerance immediately following a shape value already matched elsewhere
+# (see _extract_leading_tolerance below), via re.Pattern.match(text, pos)
+# which anchors at ``pos`` without needing a "^" in the pattern itself.
+_TAIL_ASYM_SLASH_RE = re.compile(rf"\s*\+\s*({NUM})\s*/\s*-\s*({NUM})")
+_TAIL_ASYM_SPACE_RE = re.compile(rf"\s*\+\s*({NUM})\s+-\s*({NUM})")
+_TAIL_SYMMETRIC_RE = re.compile(rf"\s*±\s*({NUM})")
+_TAIL_DOUBLE_PLUS_RE = re.compile(rf"\s*\+\s*({NUM})\s+\+\s*({NUM})")
+_TAIL_DOUBLE_MINUS_RE = re.compile(rf"\s*-\s*({NUM})\s+-\s*({NUM})")
 _SYMMETRIC_RE = re.compile(rf"({NUM})\s*±\s*({NUM})")
 _BARE_SYMMETRIC_TOL_RE = re.compile(rf"±\s*({NUM})")
 _LIMITS_RE = re.compile(rf"({NUM})\s*-\s*({NUM})")
@@ -219,6 +271,32 @@ def _extract_numeric_tolerance(text: str) -> Optional[dict]:
             "confidence": 0.9,
         }
 
+    m = _DOUBLE_PLUS_RE.search(search_text)
+    if m:
+        nominal, a, b = (float(g) for g in m.groups())
+        hi, lo = max(a, b), min(a, b)
+        return {
+            "nominal": _round(nominal),
+            "tol_plus": _round(hi),
+            "tol_minus": _round(-lo),
+            "lower_limit": _round(nominal + lo),
+            "upper_limit": _round(nominal + hi),
+            "confidence": 0.85,
+        }
+
+    m = _DOUBLE_MINUS_RE.search(search_text)
+    if m:
+        nominal, a, b = (float(g) for g in m.groups())
+        near, far = min(a, b), max(a, b)  # smaller magnitude = less negative = upper
+        return {
+            "nominal": _round(nominal),
+            "tol_plus": _round(-near),
+            "tol_minus": _round(far),
+            "lower_limit": _round(nominal - far),
+            "upper_limit": _round(nominal - near),
+            "confidence": 0.85,
+        }
+
     if "±" not in search_text and "+" not in search_text:
         m = _LIMITS_RE.search(search_text)
         if m:
@@ -249,15 +327,25 @@ def _extract_numeric_tolerance(text: str) -> Optional[dict]:
 
 
 def _try_thread(text: str) -> Optional[list[ParsedCharacteristic]]:
-    m = _THREAD_METRIC_RE.search(text)
+    m = _THREAD_METRIC_CLASS_RE.search(text)
     if m:
-        callout = f"M{m.group(1)} x {m.group(2)}"
+        size, pitch, tol_class = m.group(1), m.group(2), m.group(3)
+        callout = f"M{size}" + (f" x {pitch}" if pitch else "") + f"-{tol_class}"
     else:
-        m = _THREAD_UNIFIED_RE.search(text)
+        m = _THREAD_METRIC_RE.search(text)
         if m:
-            callout = f"{m.group(1)}-{m.group(2)} {m.group(3).upper()}"
+            callout = f"M{m.group(1)} x {m.group(2)}"
         else:
-            return None
+            m = _THREAD_UNIFIED_RE.search(text)
+            if m:
+                callout = f"{m.group(1)}-{m.group(2)} {m.group(3).upper()}"
+            else:
+                m = _THREAD_PIPE_RE.search(text)
+                if m:
+                    size, inch_mark, tol_class = m.group(1), m.group(2), m.group(3)
+                    callout = f"G{size}" + ('"' if inch_mark else "") + (f"-{tol_class}" if tol_class else "")
+                else:
+                    return None
 
     results = [
         ParsedCharacteristic(
@@ -302,6 +390,47 @@ def _resolve_shape_char_type(text: str) -> Optional[str]:
     return None
 
 
+def _extract_leading_tolerance(
+    text: str, pos: int, nominal: float
+) -> Optional[tuple[float, float, float, float, int]]:
+    """Tolerance markup immediately (whitespace-only gap) following a value
+    already matched ending at ``pos`` -- e.g. the "+.3 +.1" in "Ø12.0 +.3
+    +.1 ↧ 100.0", which belongs to the diameter, not to whatever trails
+    further along the same compound callout. That trailing content can be
+    a depth clause the stacked-tolerance merge step already appended
+    *ahead* of the tolerance fragments it found (see
+    _merge_stacked_tolerance_fragments), so this must be checked, and
+    consumed, before searching further along for a depth/angle.
+
+    Returns ``(tol_plus, tol_minus, lower_limit, upper_limit, new_pos)``
+    with ``new_pos`` placed right after the tolerance, or ``None`` if no
+    recognizable tolerance starts at ``pos``.
+    """
+    m = _TAIL_ASYM_SLASH_RE.match(text, pos)
+    if m:
+        plus, minus = float(m.group(1)), float(m.group(2))
+        return (_round(plus), _round(minus), _round(nominal - minus), _round(nominal + plus), m.end())
+    m = _TAIL_ASYM_SPACE_RE.match(text, pos)
+    if m:
+        plus, minus = float(m.group(1)), float(m.group(2))
+        return (_round(plus), _round(minus), _round(nominal - minus), _round(nominal + plus), m.end())
+    m = _TAIL_SYMMETRIC_RE.match(text, pos)
+    if m:
+        tol = float(m.group(1))
+        return (_round(tol), _round(tol), _round(nominal - tol), _round(nominal + tol), m.end())
+    m = _TAIL_DOUBLE_PLUS_RE.match(text, pos)
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        hi, lo = max(a, b), min(a, b)
+        return (_round(hi), _round(-lo), _round(nominal + lo), _round(nominal + hi), m.end())
+    m = _TAIL_DOUBLE_MINUS_RE.match(text, pos)
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        near, far = min(a, b), max(a, b)
+        return (_round(-near), _round(far), _round(nominal - far), _round(nominal - near), m.end())
+    return None
+
+
 def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteristic]]:
     """A shape value paired with a trailing depth *or* angle callout on the
     same line -- each is inspected with a different gauge, so it becomes
@@ -313,11 +442,6 @@ def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteri
     Matches how :func:`_try_thread` already splits a thread callout from
     its trailing depth.
     """
-    has_depth = bool(_DEPTH_HINT_RE.search(text))
-    has_degree = "°" in text
-    if not has_depth and not has_degree:
-        return None  # nothing to pair with -- let the single-value path handle it
-
     shape_char_type = _resolve_shape_char_type(text)
     if shape_char_type is None:
         return None
@@ -334,19 +458,35 @@ def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteri
     if not m:
         return None
 
+    nominal = float(m.group(1))
+    leading_tol = _extract_leading_tolerance(text, m.end(), nominal)
+    search_start = m.end() if leading_tol is None else leading_tol[4]
+
+    has_depth = bool(_DEPTH_HINT_RE.search(text))
+    has_degree = "°" in text
+
     secondary: Optional[ParsedCharacteristic] = None
-    if has_depth:
-        depth_match = _TRAILING_DECIMAL_RE.search(text, m.end())
-        if depth_match:
+    depth_match = _TRAILING_DECIMAL_RE.search(text, search_start)
+    if depth_match:
+        # A recognized depth symbol/keyword always confirms it. Otherwise,
+        # still read an isolated trailing number as a depth as long as
+        # nothing between the two numbers looks like tolerance markup
+        # (+/-/±) -- this drawing's CAD export may draw the depth glyph as
+        # vector line art rather than a font character (the same class of
+        # problem PdfDocument.find_vector_diameter_symbol works around for
+        # Ø), so it can contribute no recognizable character -- or none at
+        # all -- to the extracted text, not just an unreliable one.
+        gap = text[search_start : depth_match.start()]
+        if has_depth or not _DEPTH_BLOCKING_RE.search(gap):
             secondary = ParsedCharacteristic(
                 char_type=CharacteristicType.DEPTH.value,
                 raw_text=text,
                 nominal=_round(float(depth_match.group(1))),
                 nominal_text=depth_match.group(1),
-                confidence=0.8,
+                confidence=0.8 if has_depth else 0.6,
             )
     if secondary is None and has_degree:
-        angle_match = _TRAILING_ANGLE_RE.search(text, m.end())
+        angle_match = _TRAILING_ANGLE_RE.search(text, search_start)
         if angle_match:
             secondary = ParsedCharacteristic(
                 char_type=CharacteristicType.ANGLE.value,
@@ -361,8 +501,12 @@ def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteri
     primary = ParsedCharacteristic(
         char_type=shape_char_type,
         raw_text=text,
-        nominal=_round(float(m.group(1))),
+        nominal=_round(nominal),
         nominal_text=m.group(1),
+        tol_plus=leading_tol[0] if leading_tol else None,
+        tol_minus=leading_tol[1] if leading_tol else None,
+        lower_limit=leading_tol[2] if leading_tol else None,
+        upper_limit=leading_tol[3] if leading_tol else None,
         confidence=0.85,
     )
     return [primary, secondary]

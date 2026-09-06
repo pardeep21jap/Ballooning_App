@@ -188,6 +188,82 @@ class TestHoleFeatureModifiers:
         assert len(results) == 1
         assert results[0].char_type == CharacteristicType.DIAMETER.value
 
+    def test_diameter_with_downwards_arrow_from_bar_depth_symbol_splits_into_two(self):
+        # "6 x Ø3.3 ↧ 12.0" -- ↧ (U+21A7) is ASME's actual "depth" symbol,
+        # distinct from the mangled/ambiguous glyphs handled elsewhere.
+        results = parse_characteristics("6 x Ø3.3 ↧ 12.0")
+        assert len(results) == 2
+        diameter, depth = results
+        assert diameter.char_type == CharacteristicType.DIAMETER.value
+        assert _close(diameter.nominal, 3.3)
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 12.0)
+
+    def test_diameter_with_vector_drawn_depth_glyph_still_splits(self):
+        # Real-world case: this drawing's CAD PDF export draws the depth
+        # glyph as vector line art rather than a font character, so it
+        # contributes no character at all to the extracted text -- not
+        # even a mangled one. "6 x Ø3.3 12.0" (diameter then a bare
+        # trailing number, no symbol of any kind between them) must still
+        # split into diameter + depth, since nothing between the two
+        # numbers looks like tolerance markup.
+        results = parse_characteristics("6 x Ø3.3 12.0")
+        assert len(results) == 2
+        diameter, depth = results
+        assert diameter.char_type == CharacteristicType.DIAMETER.value
+        assert _close(diameter.nominal, 3.3)
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 12.0)
+
+    def test_diameter_with_asymmetric_tolerance_is_not_mistaken_for_depth(self):
+        # A genuine tolerance on the diameter itself -- the "+"/"-" markup
+        # between the nominal and the next number must block the new
+        # symbol-agnostic depth fallback from misreading it as a depth.
+        results = parse_characteristics("Ø6.38 +0.005 -0.010")
+        assert len(results) == 1
+        result = results[0]
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert _close(result.nominal, 6.38)
+        assert _close(result.tol_plus, 0.005)
+        assert _close(result.tol_minus, 0.010)
+
+    def test_diameter_with_symmetric_tolerance_is_not_mistaken_for_depth(self):
+        results = parse_characteristics("Ø0.250 ±0.005")
+        assert len(results) == 1
+        assert _close(results[0].tol_plus, 0.005)
+
+    def test_diameter_with_double_positive_tolerance_and_depth_splits_into_two(self):
+        # "Ø12.0 +.3 +.1 ↧ 100.0" -- a double-positive stacked tolerance
+        # ("+.3" over "+.1", both on the same side of nominal) immediately
+        # followed by a depth clause. Must split into exactly two
+        # characteristics -- not three (the tolerance fragment must not
+        # become its own stray balloon) -- and the tolerance must attach to
+        # the diameter rather than being misread as the depth value.
+        results = parse_characteristics("Ø12.0 +.3 +.1 ↧ 100.0")
+        assert len(results) == 2
+        diameter, depth = results
+        assert diameter.char_type == CharacteristicType.DIAMETER.value
+        assert _close(diameter.nominal, 12.0)
+        assert _close(diameter.lower_limit, 12.1)
+        assert _close(diameter.upper_limit, 12.3)
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 100.0)
+
+    def test_diameter_with_countersink_glyph_used_as_depth_splits_into_two(self):
+        # "6 x Ø3.3 ⌵ 12.0" -- a drilled hole's diameter and depth, where
+        # this drawing's CAD export happens to render the depth glyph as
+        # "⌵" (ASME's countersink symbol) rather than "▼"/"↓". Since ⌵ only
+        # means countersink when it immediately precedes a diameter symbol
+        # ("⌵⌀..."), here -- trailing an already-stated diameter -- it must
+        # be read as depth instead, not silently drop the 12.0.
+        results = parse_characteristics("6 x Ø3.3 ⌵ 12.0")
+        assert len(results) == 2
+        diameter, depth = results
+        assert diameter.char_type == CharacteristicType.DIAMETER.value
+        assert _close(diameter.nominal, 3.3)
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 12.0)
+
     def test_square_with_depth_splits_into_two(self):
         results = parse_characteristics("SQ 1.250 ▼0.375")
         assert len(results) == 2
@@ -282,6 +358,69 @@ class TestThread:
         # not a decimal -- must not be picked up as a depth value.
         results = parse_characteristics("1/4-20 UNC-2B")
         assert len(results) == 1
+
+    def test_metric_thread_class_without_pitch(self):
+        # "M4-6H" -- a tapped hole's thread size and internal tolerance
+        # class, coarse pitch implied. Previously unmatched by any thread
+        # pattern (no "x pitch", no UNC/UNF suffix), so it fell through to
+        # being misread as a numeric range "4 to 6".
+        result = parse_characteristic("M4-6H")
+        assert result.char_type == CharacteristicType.THREAD.value
+        assert result.thread_callout == "M4-6H"
+
+    def test_metric_thread_class_preserves_case(self):
+        # Case is meaningful: uppercase (6H) is an internal thread class,
+        # lowercase (6g) an external one -- must never be normalized.
+        result = parse_characteristic("M6-6g")
+        assert result.thread_callout == "M6-6g"
+
+    def test_metric_thread_class_with_explicit_pitch(self):
+        result = parse_characteristic("M10 x 1.5-6H")
+        assert result.char_type == CharacteristicType.THREAD.value
+        assert result.thread_callout == "M10 x 1.5-6H"
+
+    def test_metric_thread_class_with_depth_splits_into_two(self):
+        # "M4 - 6H ⌵ 8.0" -- a tapped hole's thread class and its tapped
+        # depth, packed into one line, with the ambiguous "⌵" depth glyph
+        # (see the countersink/depth split above) sitting between them.
+        results = parse_characteristics("M4 - 6H ⌵ 8.0")
+        assert len(results) == 2
+        thread, depth = results
+        assert thread.char_type == CharacteristicType.THREAD.value
+        assert thread.thread_callout == "M4-6H"
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 8.0)
+
+    def test_metric_thread_class_with_downwards_arrow_depth_splits_into_two(self):
+        results = parse_characteristics("M4 - 6H ↧ 8.0")
+        assert len(results) == 2
+        thread, depth = results
+        assert thread.thread_callout == "M4-6H"
+        assert _close(depth.nominal, 8.0)
+
+    def test_pipe_thread_with_class_and_depth_splits_into_two(self):
+        # "G1/2\" - 6H" -- an ISO 228 parallel pipe thread (BSPP), common on
+        # hydraulic/pneumatic fittings. Previously unmatched by any thread
+        # pattern (no "M" prefix, no UNC/UNF suffix), so the leading "1" in
+        # the "1/2" fraction was misread as a bogus depth/nominal value.
+        results = parse_characteristics('G1/2" - 6H ↧ 18.0')
+        assert len(results) == 2
+        thread, depth = results
+        assert thread.char_type == CharacteristicType.THREAD.value
+        assert thread.thread_callout == 'G1/2"-6H'
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 18.0)
+
+    def test_pipe_thread_without_class_is_a_single_characteristic(self):
+        result = parse_characteristic('G3/8"')
+        assert result.char_type == CharacteristicType.THREAD.value
+        assert result.thread_callout == 'G3/8"'
+
+    def test_whole_number_material_code_is_not_mistaken_for_pipe_thread(self):
+        # "G10" (a fiberglass-laminate material code) must not be read as a
+        # pipe thread -- only a fractional size ("G1/2") is unambiguous.
+        result = parse_characteristic("G10 FIBERGLASS")
+        assert result.char_type != CharacteristicType.THREAD.value
 
 
 class TestSurfaceFinish:

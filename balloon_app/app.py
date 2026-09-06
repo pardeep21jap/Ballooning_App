@@ -1232,7 +1232,14 @@ class MainWindow(QMainWindow):
         if b.tol_plus is not None and b.tol_minus is not None:
             if abs(b.tol_plus - b.tol_minus) < 1e-9:
                 return f"±{b.tol_plus}"
-            return f"+{b.tol_plus}/-{b.tol_minus}"
+            # tol_minus is defined via lower_limit = nominal - tol_minus, so
+            # the deviation as it would actually be written on the drawing
+            # is -tol_minus -- almost always positive (the common "+X/-Y"
+            # case), but a same-sign stacked tolerance ("+.3 over +.1", see
+            # ocr_parser._extract_leading_tolerance) stores tol_minus
+            # negative to keep that formula correct, and must still display
+            # with its own true sign ("+0.3/+0.1"), not a hardcoded "-".
+            return f"{b.tol_plus:+g}/{-b.tol_minus:+g}"
         if b.lower_limit is not None and b.upper_limit is not None:
             return f"{b.lower_limit} to {b.upper_limit}"
         return ""

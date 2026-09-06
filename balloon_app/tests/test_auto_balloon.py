@@ -409,6 +409,36 @@ class TestStackedToleranceFragments:
         merged = _merge_stacked_tolerance_fragments(blocks)
         assert len(merged) == 2
 
+    def test_double_positive_fragments_both_merge_not_just_the_first(self):
+        # A less common but valid style: both stacked deviations share the
+        # same sign ("+.3" over "+.1", not the usual "+X above / -Y
+        # below"). Previously only the first same-sign fragment encountered
+        # was bucketed and the second was silently left behind as its own
+        # stray candidate/balloon.
+        blocks = [
+            TextBlock(text="+.3", bbox=(100, 180, 115, 190)),
+            TextBlock(text="Ø12.0", bbox=(80, 195, 130, 208)),
+            TextBlock(text="+.1", bbox=(100, 210, 115, 220)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "Ø12.0 +.3 +.1"
+
+    def test_tolerance_inserted_after_the_value_not_at_the_tail_of_a_compound_anchor(self):
+        # The anchor block may already be a compound "Ø12.0 ↧ 100.0" --
+        # same-line-merged with a trailing depth clause *before* this
+        # stacked-tolerance pass ever runs. Appending the tolerance at the
+        # tail of that (the old behavior) would misattach it past the
+        # depth instead of to the diameter it actually modifies.
+        blocks = [
+            TextBlock(text="+.3", bbox=(133, 180, 148, 190)),
+            TextBlock(text="Ø12.0 ↧ 100.0", bbox=(80, 195, 230, 208)),
+            TextBlock(text="+.1", bbox=(133, 210, 148, 220)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "Ø12.0 +.3 +.1 ↧ 100.0"
+
     def test_no_sign_fragments_leaves_blocks_untouched(self):
         blocks = [TextBlock(text="6.38", bbox=(80, 195, 110, 208))]
         merged = _merge_stacked_tolerance_fragments(blocks)
