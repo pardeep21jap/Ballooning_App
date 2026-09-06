@@ -199,3 +199,99 @@ class TestFindVectorDiameterSymbol:
         pdf_doc.find_vector_diameter_symbol(0, bbox)
         assert pdf_doc._drawing_items_cache[0] is cached_items  # reused, not recomputed
         pdf_doc.close()
+
+
+class TestFindVectorGdtFrame:
+    """A GD&T feature control frame's symbol (flatness, straightness, etc.)
+    is almost always drawn as vector line art, contributing no character at
+    all to the extracted text. find_vector_gdt_frame looks for the frame's
+    boxed-compartment structure -- not the specific symbol -- immediately
+    left of the tolerance value's own text bbox.
+    """
+
+    def _draw_frame(self, page, bbox, divider: bool = True, symbol_cell: bool = True):
+        x0, y0, x1, y1 = bbox
+        height = y1 - y0
+        padding = height * 0.15
+        top, bottom = y0 - padding, y1 + padding
+        divider_x = x0 - padding
+        outer_left_x = divider_x - height * 1.2 if symbol_cell else divider_x
+        right_x = x1 + padding
+
+        shape = page.new_shape()
+        shape.draw_line((outer_left_x, top), (right_x, top))
+        shape.draw_line((outer_left_x, bottom), (right_x, bottom))
+        shape.draw_line((outer_left_x, top), (outer_left_x, bottom))
+        if divider and symbol_cell:
+            shape.draw_line((divider_x, top), (divider_x, bottom))
+        shape.draw_line((right_x, top), (right_x, bottom))
+        shape.finish()
+        shape.commit()
+
+    def test_detects_boxed_compartment_immediately_left_of_value(self, tmp_path):
+        pdf_path = tmp_path / "gdt_frame.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "0.01", fontsize=12)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        self._draw_frame(page, bbox)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_gdt_frame(0, bbox) is True
+        pdf_doc.close()
+
+    def test_no_nearby_geometry_returns_false(self, tmp_path):
+        pdf_path = tmp_path / "plain.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "0.01", fontsize=12)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_gdt_frame(0, bbox) is False
+        pdf_doc.close()
+
+    def test_snug_box_with_no_divider_is_not_mistaken_for_a_frame(self, tmp_path):
+        # A single enclosing box with no internal divider (e.g. a "basic
+        # dimension" box) must not be read as a GD&T frame -- there's only
+        # one compartment, not a separate symbol cell next to this value.
+        pdf_path = tmp_path / "basic_dim.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "0.01", fontsize=12)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        self._draw_frame(page, bbox, divider=False, symbol_cell=False)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_gdt_frame(0, bbox) is False
+        pdf_doc.close()
+
+    def test_distant_leader_line_is_not_mistaken_for_a_divider(self, tmp_path):
+        # A leader/extension line kept at a visible distance and far taller
+        # than the text -- not a snug, adjacent divider -- must not count.
+        pdf_path = tmp_path / "leader.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "0.01", fontsize=12)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        x0, y0, x1, y1 = bbox
+        shape = page.new_shape()
+        shape.draw_line((x0 - 40, y0 - 50), (x0 - 40, y1 + 50))  # far left, far taller
+        shape.finish()
+        shape.commit()
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_gdt_frame(0, bbox) is False
+        pdf_doc.close()

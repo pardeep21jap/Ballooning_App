@@ -783,7 +783,9 @@ def apply_default_tolerance(
     return parsed
 
 
-def parse_characteristics(text: str, diameter_hint: bool = False) -> list[ParsedCharacteristic]:
+def parse_characteristics(
+    text: str, diameter_hint: bool = False, gdt_frame_hint: bool = False
+) -> list[ParsedCharacteristic]:
     """Classify and parse a chunk of drawing text into one or more characteristics.
 
     Usually returns a single item, but a compound callout that packs two
@@ -802,6 +804,16 @@ def parse_characteristics(text: str, diameter_hint: bool = False) -> list[Parsed
     appears in the text itself. Only affects the bare-value fallback below;
     a callout that already matches a more specific pattern (thread, GD&T,
     depth, etc.) is unaffected.
+
+    ``gdt_frame_hint``: the caller found a GD&T feature control frame's
+    boxed-compartment structure drawn as vector line art around this text
+    (see :meth:`balloon_app.pdf_engine.PdfDocument.find_vector_gdt_frame`).
+    A frame's own symbol (flatness, straightness, etc.) is virtually always
+    drawn this way, contributing no character at all to the text -- unlike
+    ``diameter_hint``, there's no reliable way to tell *which* symbol from
+    vector art alone, so this only prevents a bare tolerance value like
+    "0.01" from being misread as a plain linear dimension; the specific
+    symbol is left for the user to fill in during review.
     """
     text = (text or "").strip()
     if not text:
@@ -856,6 +868,15 @@ def parse_characteristics(text: str, diameter_hint: bool = False) -> list[Parsed
         char_type = CharacteristicType.RADIUS.value
     elif is_angle:
         char_type = CharacteristicType.ANGLE.value
+    elif gdt_frame_hint and numeric is not None:
+        return [
+            ParsedCharacteristic(
+                char_type=CharacteristicType.GDT_FRAME.value,
+                raw_text=text,
+                gdt_tolerance=numeric.get("nominal_text") or text,
+                confidence=0.55,
+            )
+        ]
     elif numeric is not None:
         char_type = CharacteristicType.LINEAR_DIMENSION.value
     else:
@@ -894,11 +915,13 @@ def parse_characteristics(text: str, diameter_hint: bool = False) -> list[Parsed
     ]
 
 
-def parse_characteristic(text: str, diameter_hint: bool = False) -> ParsedCharacteristic:
+def parse_characteristic(
+    text: str, diameter_hint: bool = False, gdt_frame_hint: bool = False
+) -> ParsedCharacteristic:
     """Classify and parse a chunk of drawing text into a single characteristic.
 
     Convenience wrapper around :func:`parse_characteristics` for callers
     that only need one representative result (e.g. estimating a confidence
     label for a detection) rather than every characteristic packed into it.
     """
-    return parse_characteristics(text, diameter_hint=diameter_hint)[0]
+    return parse_characteristics(text, diameter_hint=diameter_hint, gdt_frame_hint=gdt_frame_hint)[0]

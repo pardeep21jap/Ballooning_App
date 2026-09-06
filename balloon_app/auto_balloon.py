@@ -172,6 +172,7 @@ class Detection:
     confidence: float
     raw_text: Optional[str] = None
     diameter_hint: bool = False
+    gdt_frame_hint: bool = False
 
 
 class BaseDetector(ABC):
@@ -677,11 +678,19 @@ def auto_balloon_page(
     # span -- merging can stack a value with its +/- tolerance into a much
     # taller box that throws off the "immediately to the left" geometry check.
     diameter_hint_bboxes: list[tuple[float, float, float, float]] = []
+    # Likewise, a GD&T feature control frame's symbol (flatness,
+    # straightness, etc.) is almost always drawn as vector line art, so it
+    # never shows up in the text at all -- not even as a mangled character
+    # (see PdfDocument.find_vector_gdt_frame). Checked on the same raw,
+    # pre-merge blocks and for the same reason.
+    gdt_frame_hint_bboxes: list[tuple[float, float, float, float]] = []
     for block in native_blocks:
         if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
             continue
         if pdf_doc.find_vector_diameter_symbol(page_number, block.bbox):
             diameter_hint_bboxes.append(block.bbox)
+        if pdf_doc.find_vector_gdt_frame(page_number, block.bbox):
+            gdt_frame_hint_bboxes.append(block.bbox)
 
     merged_native_blocks = _merge_stacked_tolerance_fragments(_merge_nearby_text_blocks(native_blocks))
 
@@ -696,8 +705,16 @@ def auto_balloon_page(
                 logger.debug("Discarding candidate with no ink under its bbox: %r", block.text)
                 continue
         diameter_hint = any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in diameter_hint_bboxes)
+        gdt_frame_hint = any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in gdt_frame_hint_bboxes)
         candidates.append(
-            Detection(bbox=block.bbox, label="", confidence=0.0, raw_text=block.text, diameter_hint=diameter_hint)
+            Detection(
+                bbox=block.bbox,
+                label="",
+                confidence=0.0,
+                raw_text=block.text,
+                diameter_hint=diameter_hint,
+                gdt_frame_hint=gdt_frame_hint,
+            )
         )
 
     used_ocr = False
@@ -741,7 +758,11 @@ def auto_balloon_page(
         # A single detected text chunk can pack more than one independently
         # inspected requirement (e.g. a tapped hole's thread class *and* its
         # depth) -- each becomes its own balloon, placed near the same text.
-        parsed_list = parse_characteristics(raw_text, diameter_hint=det.diameter_hint) if raw_text else [None]
+        parsed_list = (
+            parse_characteristics(raw_text, diameter_hint=det.diameter_hint, gdt_frame_hint=det.gdt_frame_hint)
+            if raw_text
+            else [None]
+        )
         if default_tolerances is not None:
             parsed_list = [
                 apply_default_tolerance(p, default_tolerances) if p is not None else None

@@ -37,6 +37,20 @@ _DIAMETER_SYMBOL_MIN_SIZE_PT = 2.0
 _DIAMETER_SYMBOL_MAX_SIZE_PT = 14.0
 _DIAMETER_SYMBOL_TOUCH_EPS = 0.8
 
+# Heuristic thresholds for find_vector_gdt_frame (see its docstring): a GD&T
+# feature control frame's compartment divider is a snug-height, hairline
+# vertical stroke -- unlike an extension/dimension/leader line, which is
+# either much longer than the text it's near or kept at a visible distance
+# from it for legibility.
+_GDT_FRAME_SEARCH_LEFT_MULTIPLIER = 4.0
+_GDT_FRAME_MIN_HEIGHT_RATIO = 0.7
+_GDT_FRAME_MAX_HEIGHT_RATIO = 1.8
+_GDT_FRAME_MIN_LEFT_EXTENSION_RATIO = 0.4
+_GDT_FRAME_DIVIDER_MAX_WIDTH_PT = 1.0
+_GDT_FRAME_DIVIDER_MIN_HEIGHT_RATIO = 0.6
+_GDT_FRAME_DIVIDER_MAX_GAP_PT = 2.5
+_GDT_FRAME_TOUCH_EPS = 1.0
+
 
 def dpi_to_zoom(dpi: float) -> float:
     """Convert a target DPI to the zoom factor PyMuPDF's Matrix expects."""
@@ -306,6 +320,90 @@ class PdfDocument:
                 _DIAMETER_SYMBOL_MIN_SIZE_PT <= width <= _DIAMETER_SYMBOL_MAX_SIZE_PT
                 and _DIAMETER_SYMBOL_MIN_SIZE_PT <= cheight <= _DIAMETER_SYMBOL_MAX_SIZE_PT
             ):
+                return True
+        return False
+
+    def find_vector_gdt_frame(
+        self, page_number: int, bbox: tuple[float, float, float, float]
+    ) -> bool:
+        """Best-effort detection of a GD&T feature control frame's boxed
+        compartment structure immediately left of ``bbox`` (the tolerance
+        value's own text span).
+
+        A feature control frame's symbol (flatness, straightness, etc.) is
+        almost always drawn as vector line art -- a hand-drawn icon inside
+        its own compartment -- rather than a font character, so it
+        contributes *no* character at all to the extracted text (unlike the
+        merely-mangled symbols handled elsewhere in this module). There is
+        no reliable way to identify *which* symbol from vector art alone
+        without per-symbol shape templates, but the frame's structure --
+        a divider between the symbol compartment and this value's
+        compartment, with a further compartment (or outer border) still
+        further left -- is a distinctive, low-false-positive signal: it
+        means *some* GD&T frame is present, even if which symbol it is
+        still needs a human to fill in.
+
+        Looks for a hairline vertical stroke close to ``bbox``'s own left
+        edge, snug to its height (the divider), that is part of a larger
+        cluster of vector ink extending further left again (the symbol
+        compartment and/or outer border) -- as opposed to an extension,
+        dimension, or leader line, which is either far longer than the
+        text it's near or kept at a visible distance from it. Returns
+        ``False`` (never raises) if the page has no usable vector-drawing
+        data.
+        """
+        x0, y0, x1, y1 = bbox
+        height = y1 - y0
+        if height <= 0:
+            return False
+        search = (
+            x0 - height * _GDT_FRAME_SEARCH_LEFT_MULTIPLIER,
+            y0 - height * 0.3,
+            x1 + height * 0.3,
+            y1 + height * 0.3,
+        )
+
+        try:
+            # A frame's borders/dividers are virtually always perfectly
+            # axis-aligned lines -- zero-width or zero-height boxes, which
+            # fitz.Rect treats as "empty" and never reports as intersecting
+            # anything via .intersects(), even genuine overlaps. Use a
+            # plain numeric overlap test instead (already used for
+            # clustering below) so real hairline strokes aren't missed.
+            nearby = [r for r in self._drawing_item_bboxes(page_number) if _rects_touch(search, r, 0.0)]
+        except Exception:
+            logger.exception("Failed GD&T-frame geometry check on page %d of %s", page_number, self.path)
+            return False
+
+        for cluster in _cluster_touching_rects(nearby, _GDT_FRAME_TOUCH_EPS):
+            cx0 = min(r[0] for r in cluster)
+            cx1 = max(r[2] for r in cluster)
+            cy0 = min(r[1] for r in cluster)
+            cy1 = max(r[3] for r in cluster)
+            cluster_height = cy1 - cy0
+            if cluster_height <= 0:
+                continue
+            height_ratio = cluster_height / height
+            if not (_GDT_FRAME_MIN_HEIGHT_RATIO <= height_ratio <= _GDT_FRAME_MAX_HEIGHT_RATIO):
+                continue
+            # Must extend meaningfully left of the value's own left edge --
+            # room for a separate symbol compartment, not just a snug box
+            # around the value itself (a plain "basic dimension" box has no
+            # such extra width).
+            if (x0 - cx0) < height * _GDT_FRAME_MIN_LEFT_EXTENSION_RATIO:
+                continue
+            # Must contain an actual internal divider: a thin, tall segment
+            # sitting right at the value's own left edge (not the cluster's
+            # outer border) -- proves there are at least two compartments,
+            # not just a single enclosing box.
+            has_divider = any(
+                (r[2] - r[0]) <= _GDT_FRAME_DIVIDER_MAX_WIDTH_PT
+                and (r[3] - r[1]) >= height * _GDT_FRAME_DIVIDER_MIN_HEIGHT_RATIO
+                and r[0] < x0
+                and (x0 - r[2]) <= _GDT_FRAME_DIVIDER_MAX_GAP_PT
+                for r in cluster
+            )
+            if has_divider:
                 return True
         return False
 

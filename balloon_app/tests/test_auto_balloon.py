@@ -644,3 +644,72 @@ class TestVectorDrawnDiameterSymbol:
 
         assert len(result.balloons) == 1
         assert result.balloons[0].char_type == CharacteristicType.LINEAR_DIMENSION.value
+
+
+def _draw_gdt_frame(page, near_bbox, symbol_cell=True, divider=True):
+    """Draw a boxed-compartment frame just left of ``near_bbox``, mimicking
+    a CAD PDF export that draws a GD&T feature control frame's symbol as
+    line art rather than a font character."""
+    x0, y0, x1, y1 = near_bbox
+    height = y1 - y0
+    padding = height * 0.15
+    top, bottom = y0 - padding, y1 + padding
+    divider_x = x0 - padding
+    outer_left_x = divider_x - height * 1.2 if symbol_cell else divider_x
+    right_x = x1 + padding
+
+    shape = page.new_shape()
+    shape.draw_line((outer_left_x, top), (right_x, top))
+    shape.draw_line((outer_left_x, bottom), (right_x, bottom))
+    shape.draw_line((outer_left_x, top), (outer_left_x, bottom))
+    if divider and symbol_cell:
+        shape.draw_line((divider_x, top), (divider_x, bottom))
+    shape.draw_line((right_x, top), (right_x, bottom))
+    shape.finish()
+    shape.commit()
+
+
+class TestVectorDrawnGdtFrame:
+    """A GD&T feature control frame's symbol (flatness, straightness, etc.)
+    is almost always drawn as vector line art -- unlike the countersink/
+    depth glyph mangling handled elsewhere in this file, there is no
+    substitute character to recover here at all, only the frame's boxed-
+    compartment structure. The app must at least recognize these as a GD&T
+    frame (symbol left blank for review) instead of a plain dimension.
+    """
+
+    def test_bare_value_with_adjacent_frame_becomes_gdt_frame(self, tmp_path):
+        pdf_path = tmp_path / "vector_gdt_frame.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "0.01", fontsize=12)
+        text_bbox = page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"]
+        _draw_gdt_frame(page, text_bbox)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.char_type == CharacteristicType.GDT_FRAME.value
+        assert balloon.gdt_tolerance == "0.01"
+
+    def test_bare_value_without_nearby_frame_stays_linear_dimension(self, tmp_path):
+        pdf_path = tmp_path / "no_frame.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "0.01", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        assert result.balloons[0].char_type == CharacteristicType.LINEAR_DIMENSION.value
