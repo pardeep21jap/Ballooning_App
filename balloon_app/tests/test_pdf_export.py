@@ -180,6 +180,136 @@ def test_balloon_number_text_is_rendered_on_rotated_page(tmp_path):
     assert label_center.distance_to(fitz.Point(target_x, target_y)) < 15
 
 
+@pytest.mark.parametrize("number", [9, 14])
+def test_balloon_number_is_vertically_centered_in_circle(tmp_path, number):
+    """Regression test: the balloon's number must sit in the vertical
+    center of its circle, not float above it.
+
+    insert_textbox lays a line out top-down from the box's top edge,
+    reserving the font's full ascender+descender height -- room a bare
+    digit (no descender) never uses -- so a box simply spanning the
+    circle's diameter left the digit's actual ink sitting well above
+    center, with all the leftover space stuck below it.
+    """
+    source_path = tmp_path / "source.pdf"
+    doc = fitz.open()
+    doc.new_page(width=200, height=200)
+    doc.save(str(source_path))
+    doc.close()
+
+    drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
+    center_x, center_y = 100.0, 100.0
+    balloon = Balloon(number=number, drawing_id=drawing.id, page_number=0, x=center_x, y=center_y)
+
+    output_path = tmp_path / "out.pdf"
+    export_ballooned_pdf(drawing, [balloon], output_path)
+
+    out_doc = fitz.open(str(output_path))
+    out_page = out_doc[0]
+    zoom = 4.0
+    pix = out_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    out_doc.close()
+
+    radius = 9.0
+    x0, y0 = int((center_x - radius) * zoom), int((center_y - radius) * zoom)
+    x1, y1 = int((center_x + radius) * zoom), int((center_y + radius) * zoom)
+    crop = img[y0:y1, x0:x1]
+    h, w, _ = crop.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    # Exclude the crop's corners (outside the circle, plain white page
+    # background) so only white pixels actually inside the balloon --
+    # i.e. the digit itself -- count.
+    inside_circle = np.sqrt((xx - w / 2) ** 2 + (yy - h / 2) ** 2) < (radius * zoom * 0.85)
+    white_mask = (crop[:, :, 0] > 200) & (crop[:, :, 1] > 200) & (crop[:, :, 2] > 200) & inside_circle
+    ys, _xs = np.where(white_mask)
+    assert len(ys) > 0, "balloon number was not found inside the circle"
+    vertical_offset_pt = (ys.mean() - h / 2) / zoom
+    assert abs(vertical_offset_pt) < 1.0, f"number is {vertical_offset_pt:+.2f}pt off circle center vertically"
+
+
+def test_leader_line_stops_at_balloon_edge_not_center(tmp_path):
+    """Regression test: the leader line must terminate at the balloon
+    circle's circumference, not its center. Drawing all the way to the
+    center reads -- through the circle's fill_opacity, which isn't fully
+    opaque -- as a line pointing into the middle of the balloon rather than
+    stopping cleanly at its edge.
+    """
+    source_path = tmp_path / "source.pdf"
+    doc = fitz.open()
+    doc.new_page(width=200, height=200)
+    doc.save(str(source_path))
+    doc.close()
+
+    drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
+    center_x, center_y = 150.0, 150.0
+    leader_x, leader_y = 50.0, 50.0
+    balloon = Balloon(
+        number=1, drawing_id=drawing.id, page_number=0,
+        x=center_x, y=center_y, leader_x=leader_x, leader_y=leader_y,
+    )
+
+    output_path = tmp_path / "out.pdf"
+    export_ballooned_pdf(drawing, [balloon], output_path)
+
+    out_doc = fitz.open(str(output_path))
+    lines = [
+        item for d in out_doc[0].get_drawings() for item in d["items"] if item[0] == "l"
+    ]
+    out_doc.close()
+    assert lines, "leader line was not drawn"
+    _, p1, p2 = lines[0]
+    center = fitz.Point(center_x, center_y)
+    # The endpoint nearer the balloon must sit on the circle's radius, not
+    # coincide with its center.
+    balloon_end = p2 if p1.distance_to(center) > p2.distance_to(center) else p1
+    assert balloon_end.distance_to(center) == pytest.approx(9.0, abs=0.5)
+
+
+def test_stamp_text_is_vertically_centered_in_its_border(tmp_path):
+    """Regression test: the "BALLOONED DRAWING" stamp text must sit in the
+    vertical center of its pill-shaped border, not float above it -- the
+    same top-down insert_textbox layout bug fixed for balloon numbers
+    (see test_balloon_number_is_vertically_centered_in_circle) also
+    affected the stamp, which shares the same box for its border and text.
+    """
+    source_path = tmp_path / "source.pdf"
+    doc = fitz.open()
+    doc.new_page(width=600, height=400)
+    doc.save(str(source_path))
+    doc.close()
+
+    drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
+    output_path = tmp_path / "out.pdf"
+    export_ballooned_pdf(drawing, [], output_path)
+
+    out_doc = fitz.open(str(output_path))
+    out_page = out_doc[0]
+    borders = [d["rect"] for d in out_page.get_drawings() if d["type"] == "s"]
+    assert borders, "stamp border was not drawn"
+    border = borders[0]
+    border_center_y = (border.y0 + border.y1) / 2.0
+
+    zoom = 8.0
+    pix = out_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csRGB, alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    out_doc.close()
+
+    # Inset from the border rect so only the text's own ink counts, not the
+    # border stroke itself (both are drawn in the same dark-red color).
+    inset = 2.0
+    x0, y0 = int((border.x0 + inset) * zoom), int((border.y0 + inset) * zoom)
+    x1, y1 = int((border.x1 - inset) * zoom), int((border.y1 - inset) * zoom)
+    crop = img[y0:y1, x0:x1]
+    red_mask = (crop[:, :, 0] > 140) & (crop[:, :, 1] < 90) & (crop[:, :, 2] < 90)
+    ys, _xs = np.where(red_mask)
+    assert len(ys) > 0, "stamp text ink was not found inside the border"
+    text_center_y = border.y0 + inset + ys.mean() / zoom
+    assert abs(text_center_y - border_center_y) < 1.0, (
+        f"stamp text is {text_center_y - border_center_y:+.2f}pt off the border's vertical center"
+    )
+
+
 def test_stamp_is_rendered_in_top_left_corner(tmp_path):
     """Every exported page must be stamped 'Ballooned Drawing' near the
     visual top-left corner, even on a page with no balloons on it.

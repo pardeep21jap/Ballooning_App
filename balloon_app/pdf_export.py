@@ -24,7 +24,6 @@ from balloon_app.config import (
     STAMP_CORNER_RADIUS_PERCENT,
     STAMP_FONT_SIZE_PDF_POINTS,
     STAMP_MARGIN_PDF_POINTS,
-    STAMP_MAX_WIDTH_PDF_POINTS,
     STAMP_TEXT,
     status_color,
 )
@@ -71,6 +70,28 @@ def _rgba_unit(rgba: tuple[int, int, int, int]) -> tuple[float, float, float]:
     return (rgba[0] / 255.0, rgba[1] / 255.0, rgba[2] / 255.0)
 
 
+def _vertical_ink_center_offset(font: fitz.Font, text: str, fontsize: float) -> float:
+    """Distance below a top-aligned insert_textbox line's top edge at which
+    ``text``'s actual glyph ink -- not the font's full ascender-to-descender
+    box -- is vertically centered.
+
+    insert_textbox lays a line out top-down, reserving room for the font's
+    full ascender and descender: headroom for accents above and descenders
+    below the baseline that all-caps labels and bare digits never use. Left
+    at the box's un-shifted top, that reserved-but-unused space ends up
+    entirely below the text, making it look like it floats above the
+    center of whatever box it's placed in instead of sitting in the middle
+    of it. Shifting a box up by this offset (instead of half its height)
+    lands the ink itself in the middle.
+    """
+    tops = [font.glyph_bbox(ord(ch)).y1 for ch in set(text) if not ch.isspace()]
+    bottoms = [font.glyph_bbox(ord(ch)).y0 for ch in set(text) if not ch.isspace()]
+    if not tops:
+        return font.ascender * fontsize / 2.0
+    ink_center_em = (max(tops) + min(bottoms)) / 2.0
+    return fontsize * (font.ascender - ink_center_em)
+
+
 def _draw_balloons_on_doc(
     doc: fitz.Document,
     by_page: dict[int, list[Balloon]],
@@ -78,6 +99,7 @@ def _draw_balloons_on_doc(
     stamp_size_percent: int = 100,
 ) -> None:
     radius = BALLOON_RADIUS_PDF_POINTS * max(50, min(200, balloon_size_percent)) / 100
+    number_font = fitz.Font(fontname="helv")
     for page_number, page_balloons in by_page.items():
         if page_number < 0 or page_number >= doc.page_count:
             logger.warning("Skipping %d balloon(s) for out-of-range page %d", len(page_balloons), page_number)
@@ -103,8 +125,15 @@ def _draw_balloons_on_doc(
                 bx0, by0, bx1, by1 = balloon.bbox()  # type: ignore[misc]
                 leader_start = fitz.Point((bx0 + bx1) / 2.0, (by0 + by1) / 2.0)
 
-            if leader_start is not None and leader_start.distance_to(center) > radius:
-                page.draw_line(leader_start * derotation_matrix, center * derotation_matrix, color=color, width=0.75)
+            if leader_start is not None:
+                distance = leader_start.distance_to(center)
+                if distance > radius:
+                    # Stop the line at the circle's edge, not its center --
+                    # otherwise it reads as pointing into the balloon rather
+                    # than terminating at it (visible through the circle's
+                    # fill_opacity, which isn't fully opaque).
+                    edge = center + (leader_start - center) * (radius / distance)
+                    page.draw_line(leader_start * derotation_matrix, edge * derotation_matrix, color=color, width=0.75)
 
             page.draw_circle(center * derotation_matrix, radius, color=color, fill=color, width=1.0, fill_opacity=0.85)
 
@@ -113,13 +142,19 @@ def _draw_balloons_on_doc(
             # size, so a shorter box (previously radius * 0.75 tall) caused
             # it to silently draw nothing -- on every export, regardless of
             # page rotation -- because the number never "fit".
-            text_rect = fitz.Rect(center.x - radius, center.y - radius, center.x + radius, center.y + radius)
+            fontsize = radius * 1.05
+            number_text = str(balloon.number)
+            ink_center_offset = _vertical_ink_center_offset(number_font, number_text, fontsize)
+            text_rect = fitz.Rect(
+                center.x - radius, center.y - ink_center_offset,
+                center.x + radius, center.y - ink_center_offset + 2 * radius,
+            )
             text_rect = text_rect * derotation_matrix
             text_rect.normalize()
             page.insert_textbox(
                 text_rect,
-                str(balloon.number),
-                fontsize=radius * 1.05,
+                number_text,
+                fontsize=fontsize,
                 fontname="helv",
                 color=(1, 1, 1),
                 align=1,
@@ -146,24 +181,38 @@ def _stamp_page(page: fitz.Page, stamp_size_percent: int = 100) -> None:
 
     derotation_matrix = page.derotation_matrix
     rect = page.rect
-    box_width = min(STAMP_MAX_WIDTH_PDF_POINTS * scale, rect.width - 2 * margin)
+    font = fitz.Font(fontname="hebo")
+    text_width = font.text_length(STAMP_TEXT, fontsize=fontsize)
+    # Snug the pill to the actual text width plus a little breathing room,
+    # rather than a fixed box width -- STAMP_TEXT is much narrower than that
+    # fixed width, which left a wide dead gap on either side of it.
+    horizontal_padding = fontsize * 1.0
+    box_width = min(text_width + 2 * horizontal_padding, rect.width - 2 * margin)
     # insert_textbox's internal fit check needs noticeably more headroom
     # than the font's nominal size (see the balloon-number box above) --
     # anything under ~2x fontsize silently fails to fit and draws nothing.
     box_height = fontsize * 2.0
-    box = fitz.Rect(
-        rect.x0 + margin,
-        rect.y0 + margin,
-        rect.x0 + margin + box_width,
-        rect.y0 + margin + box_height,
-    )
+    box_x0, box_y0 = rect.x0 + margin, rect.y0 + margin
+    box = fitz.Rect(box_x0, box_y0, box_x0 + box_width, box_y0 + box_height)
+
+    # The visible pill border stays exactly this box, but insert_textbox's
+    # top-down layout would leave the text's actual ink sitting above its
+    # center (see _vertical_ink_center_offset) -- so the text is placed in
+    # a same-size box shifted to land the ink in the middle of `box`
+    # instead, independent of the border's own position.
+    ink_center_offset = _vertical_ink_center_offset(font, STAMP_TEXT, fontsize)
+    text_box_y0 = box_y0 + box_height / 2.0 - ink_center_offset
+    text_box = fitz.Rect(box.x0, text_box_y0, box.x1, text_box_y0 + box_height)
+
     box = box * derotation_matrix
     box.normalize()
+    text_box = text_box * derotation_matrix
+    text_box.normalize()
 
     stamp_color = (0.75, 0, 0)
     page.draw_rect(box, color=stamp_color, width=max(0.5, 1.1 * scale), radius=STAMP_CORNER_RADIUS_PERCENT)
     page.insert_textbox(
-        box,
+        text_box,
         STAMP_TEXT,
         fontsize=fontsize,
         fontname="hebo",

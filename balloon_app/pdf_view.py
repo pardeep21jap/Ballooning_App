@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QEvent, QMutex, QObject, QPointF, QRectF, QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap, QTransform, QWheelEvent
+from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetricsF, QImage, QPainter, QPen, QPixmap, QTransform, QWheelEvent
 from PyQt6.QtWidgets import QGraphicsItem, QGraphicsLineItem, QGraphicsObject, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
 from balloon_app.config import (
@@ -28,7 +28,6 @@ from balloon_app.config import (
     STAMP_CORNER_RADIUS_PERCENT,
     STAMP_FONT_SIZE_PDF_POINTS,
     STAMP_MARGIN_PDF_POINTS,
-    STAMP_MAX_WIDTH_PDF_POINTS,
     STAMP_TEXT,
     status_color,
 )
@@ -611,7 +610,16 @@ class PdfGraphicsView(QGraphicsView):
         margin = STAMP_MARGIN_PDF_POINTS * scale * px_per_pt
         font_size = STAMP_FONT_SIZE_PDF_POINTS * scale * px_per_pt
         page_width = self._pixmap_item.pixmap().width()
-        width = min(STAMP_MAX_WIDTH_PDF_POINTS * scale * px_per_pt, page_width - 2 * margin)
+        # Snug the pill to the actual text width plus a little breathing
+        # room, matching the export's stamp (see pdf_export.py's
+        # _stamp_page) instead of a fixed width that leaves a wide dead gap
+        # on either side of STAMP_TEXT.
+        preview_font = QFont()
+        preview_font.setBold(True)
+        preview_font.setPointSizeF(max(1.0, font_size))
+        text_width = QFontMetricsF(preview_font).horizontalAdvance(STAMP_TEXT)
+        horizontal_padding = font_size * 1.0
+        width = min(text_width + 2 * horizontal_padding, page_width - 2 * margin)
         height = font_size * 2.0
 
         if self._stamp_item is None:

@@ -647,6 +647,13 @@ def auto_balloon_page(
 ) -> AutoBalloonResult:
     """Run the full auto-balloon pipeline for a single page.
 
+    ``existing_balloons`` does double duty: it keeps new balloon markers
+    from being placed on top of ones that already exist (see ``occupied``
+    below), and -- since it also carries each existing balloon's source
+    bbox -- it's used to skip any newly-found candidate whose source region
+    overlaps one that's already ballooned, so re-running auto-balloon on an
+    already-ballooned page doesn't propose duplicates of what's there.
+
     ``default_tolerances``, when given, backfills tol_plus/tol_minus (and
     the resulting limits) on any detected dimension that has a nominal but
     no explicit tolerance of its own -- e.g. "9X Ø0.250 THRU" relying on the
@@ -808,6 +815,23 @@ def auto_balloon_page(
             ))
             if message == "OCR ran but found no recognizable dimensions/tolerances on this page.":
                 message = ""
+
+    # Re-running auto-balloon on a page that already has balloons (manual
+    # re-run, or "Auto-Balloon Entire Drawing" after touching up one page)
+    # must not re-propose a characteristic that's already ballooned there --
+    # drop any candidate whose source region is essentially the same region
+    # an existing balloon on this page was already detected from.
+    existing_bboxes = [
+        b.bbox() for b in existing_balloons if b.page_number == page_number and b.has_bbox()
+    ]
+    if existing_bboxes:
+        candidates = [
+            det for det in candidates
+            if not any(
+                _bbox_center_within(det.bbox, eb) or _bbox_center_within(eb, det.bbox)
+                for eb in existing_bboxes
+            )
+        ]
 
     candidates = candidates[:300]  # sanity cap against pathological pages
     candidates.sort(key=lambda d: (round(d.bbox[1] / 10.0), d.bbox[0]))

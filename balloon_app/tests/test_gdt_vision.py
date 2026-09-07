@@ -80,7 +80,14 @@ def test_all_symbols_from_vector_pdf(tmp_path, name, dpi):
     assert balloon.gdt_symbol == name
     assert balloon.gdt_tolerance == "0.01"
     assert balloon.datums == "A"
-    assert balloon.nominal is None
+    # A feature control frame's stated value is the maximum allowed
+    # variation, zero being the best case: nominal is the box value, upper
+    # limit equals it, lower limit is 0.0.
+    assert balloon.nominal == pytest.approx(0.01)
+    assert balloon.tol_plus == pytest.approx(0.0)
+    assert balloon.tol_minus == pytest.approx(0.01)
+    assert balloon.lower_limit == pytest.approx(0.0)
+    assert balloon.upper_limit == pytest.approx(0.01)
     assert balloon.status == "pending"
 
 

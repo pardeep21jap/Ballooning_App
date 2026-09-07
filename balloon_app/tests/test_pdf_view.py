@@ -47,8 +47,14 @@ def test_stamp_item_appears_top_left_and_scales_with_stamp_size():
     app = QApplication.instance() or QApplication([])
     view = PdfGraphicsView()
     try:
-        pixels = bytes([255] * (200 * 200 * 3))
-        view._on_rendered(view._request_counter, pixels, 200, 200, 96)
+        # A realistically large page -- the stamp's width is snugged to its
+        # text plus a little padding (see _sync_stamp_item), and clamped
+        # against the page width as a safety cap for pathologically small
+        # pages; a tiny 200x200 stub page would hit that cap at 200% stamp
+        # size well before the scaling behavior under test ever mattered.
+        page_size = 2000
+        pixels = bytes([255] * (page_size * page_size * 3))
+        view._on_rendered(view._request_counter, pixels, page_size, page_size, 96)
 
         assert isinstance(view._stamp_item, StampItem)
         assert view._stamp_item in view.scene().items()
@@ -66,7 +72,7 @@ def test_stamp_item_appears_top_left_and_scales_with_stamp_size():
 
         # A fresh render (e.g. after switching pages) must keep the badge,
         # not silently drop it -- same expectation as balloon items.
-        view._on_rendered(view._request_counter, pixels, 200, 200, 96)
+        view._on_rendered(view._request_counter, pixels, page_size, page_size, 96)
         assert view._stamp_item is not None
         assert view._stamp_item in view.scene().items()
 

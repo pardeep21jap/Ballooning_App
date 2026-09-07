@@ -616,6 +616,7 @@ def _try_gdt(text: str) -> Optional[ParsedCharacteristic]:
 
             datum_letters = _SINGLE_UPPER_LETTER_RE.findall(remainder)
             datums = ", ".join(dict.fromkeys(datum_letters)) if datum_letters else None
+            limits = _gdt_tolerance_limits(tolerance)
 
             return ParsedCharacteristic(
                 char_type=CharacteristicType.GDT_FRAME.value,
@@ -625,6 +626,7 @@ def _try_gdt(text: str) -> Optional[ParsedCharacteristic]:
                 material_condition=material_condition,
                 datums=datums,
                 confidence=0.75,
+                **limits,
             )
 
     # Fallback: no recognizable GD&T symbol, but a pipe-delimited
@@ -640,8 +642,28 @@ def _try_gdt(text: str) -> Optional[ParsedCharacteristic]:
             gdt_tolerance=tolerance,
             datums=", ".join(dict.fromkeys(datum_letters)),
             confidence=0.55,
+            **_gdt_tolerance_limits(tolerance),
         )
     return None
+
+
+def _gdt_tolerance_limits(tolerance: Optional[str | float]) -> dict:
+    """A GD&T feature control frame's stated value is always the *maximum*
+    allowed variation, with zero as the implicit best case -- there is no
+    separate plus/minus split the way a dimensional tolerance has one. So a
+    flatness callout of 0.01, for example, is treated as nominal 0.01 with a
+    unilateral -0.01/-0.0 tolerance: upper limit 0.01, lower limit 0.0.
+    """
+    if tolerance is None or tolerance == "":
+        return {}
+    value = _round(float(tolerance))
+    return {
+        "nominal": value,
+        "tol_plus": 0.0,
+        "tol_minus": value,
+        "lower_limit": 0.0,
+        "upper_limit": value,
+    }
 
 
 def _try_general_tolerance(text: str) -> Optional[ParsedCharacteristic]:
@@ -875,6 +897,7 @@ def parse_characteristics(
                 raw_text=text,
                 gdt_tolerance=numeric.get("nominal_text") or text,
                 confidence=0.55,
+                **_gdt_tolerance_limits(numeric.get("nominal")),
             )
         ]
     elif numeric is not None:

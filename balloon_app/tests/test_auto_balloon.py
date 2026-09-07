@@ -552,6 +552,54 @@ class TestZoneMarginWholeNumberDimensions:
         assert not ({"1", "2", "3", "4"} & raw_texts)
 
 
+class TestRerunSkipsAlreadyBalloonedRegions:
+    def test_second_run_does_not_reballoon_existing_regions(self, tmp_path):
+        """Re-running auto-balloon on a page that's already been ballooned
+        (manual re-run, or picking up where "Auto-Balloon Entire Drawing"
+        left off) must not propose duplicates of characteristics that are
+        already ballooned there."""
+        pdf_path = tmp_path / "rerun.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=600)
+        page.insert_text((200, 200), "50.00 ±0.05", fontsize=12)
+        page.insert_text((200, 300), "Ø25.0", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        first = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        assert len(first.balloons) == 2
+
+        second = auto_balloon_page(pdf_doc, "drawing-1", 0, first.balloons, 3, dpi=200)
+        pdf_doc.close()
+
+        assert second.balloons == []
+
+    def test_new_region_still_ballooned_alongside_existing(self, tmp_path):
+        """A genuinely new characteristic added after the first pass must
+        still be proposed, even though other regions on the page are
+        already ballooned."""
+        pdf_path = tmp_path / "rerun_partial.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=600)
+        page.insert_text((200, 200), "50.00 ±0.05", fontsize=12)
+        page.insert_text((200, 300), "Ø25.0", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        first = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        only_first = first.balloons[:1]
+
+        second = auto_balloon_page(pdf_doc, "drawing-1", 0, only_first, 2, dpi=200)
+        pdf_doc.close()
+
+        assert len(second.balloons) == 1
+        assert second.balloons[0].raw_text != only_first[0].raw_text
+
+
 def _draw_small_circle(page, near_bbox, radius=3.0, gap=1.5):
     """Draw a small vector circle just left of ``near_bbox``, mimicking a
     CAD PDF export that draws the Ø glyph as line art instead of text."""
@@ -714,7 +762,12 @@ class TestVectorDrawnGdtFrame:
         assert balloon.char_type == CharacteristicType.GDT_FRAME.value
         assert balloon.gdt_symbol == ("Flatness" if symbol == "flatness" else None)
         assert balloon.gdt_tolerance == "0.01"
-        assert balloon.nominal is None
+        # A feature control frame's stated value is the maximum allowed
+        # variation, zero being the best case: nominal is the box value,
+        # upper limit equals it, lower limit is 0.0.
+        assert balloon.nominal == pytest.approx(0.01)
+        assert balloon.lower_limit == pytest.approx(0.0)
+        assert balloon.upper_limit == pytest.approx(0.01)
 
     def test_bare_value_with_adjacent_frame_becomes_gdt_frame(self, tmp_path):
         pdf_path = tmp_path / "vector_gdt_frame.pdf"

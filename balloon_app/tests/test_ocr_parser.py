@@ -448,6 +448,18 @@ class TestGdt:
         assert result.char_type == CharacteristicType.GDT_FRAME.value
         assert result.datums == "A, B, C"
 
+    def test_tolerance_value_is_unilateral_zero_to_value(self):
+        # A feature control frame's stated value (e.g. flatness 0.01) is the
+        # maximum allowed variation, with zero as the best case -- so nominal
+        # is the box value, upper limit equals it, and lower limit is 0.0.
+        result = parse_characteristic("⏥ 0.01")
+        assert result.char_type == CharacteristicType.GDT_FRAME.value
+        assert _close(result.nominal, 0.01)
+        assert _close(result.tol_plus, 0.0)
+        assert _close(result.tol_minus, 0.01)
+        assert _close(result.lower_limit, 0.0)
+        assert _close(result.upper_limit, 0.01)
+
 
 class TestGeneralToleranceAndFallback:
     def test_general_tolerance_note(self):
