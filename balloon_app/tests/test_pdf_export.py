@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from balloon_app.data_model import Balloon, Drawing
-from balloon_app.pdf_export import export_ballooned_pdf
+from balloon_app.pdf_export import STAMP_TEXT, export_ballooned_pdf
 
 fitz = pytest.importorskip("pymupdf")
 
@@ -27,6 +27,29 @@ def test_export_uses_selected_balloon_size(tmp_path, percent, diameter):
         assert circle.width == pytest.approx(diameter)
         assert circle.height == pytest.approx(diameter)
         assert "1" in exported[0].get_text()
+
+
+@pytest.mark.parametrize("percent, expected_text_width", [(50, 28.75), (100, 57.50), (200, 114.99)])
+def test_export_uses_selected_stamp_size(tmp_path, percent, expected_text_width):
+    source = tmp_path / "source.pdf"
+    doc = fitz.open()
+    doc.new_page(width=400, height=400)
+    doc.save(source)
+    doc.close()
+    drawing = Drawing(file_name="source.pdf", original_path=str(source), page_count=1)
+    output = tmp_path / "output.pdf"
+    export_ballooned_pdf(drawing, [], output, stamp_size_percent=percent)
+    with fitz.open(output) as exported:
+        spans = [
+            span
+            for block in exported[0].get_text("dict")["blocks"]
+            for line in block.get("lines", [])
+            for span in line["spans"]
+            if span["text"].strip() == STAMP_TEXT
+        ]
+        assert spans, "stamp text not found"
+        bbox = spans[0]["bbox"]
+        assert (bbox[2] - bbox[0]) == pytest.approx(expected_text_width, abs=1.0)
 
 
 def test_balloon_lands_on_target_on_rotated_page(tmp_path):
@@ -155,3 +178,70 @@ def test_balloon_number_text_is_rendered_on_rotated_page(tmp_path):
     out_doc.close()
     label_center = fitz.Point((label_rect.x0 + label_rect.x1) / 2, (label_rect.y0 + label_rect.y1) / 2)
     assert label_center.distance_to(fitz.Point(target_x, target_y)) < 15
+
+
+def test_stamp_is_rendered_in_top_left_corner(tmp_path):
+    """Every exported page must be stamped 'Ballooned Drawing' near the
+    visual top-left corner, even on a page with no balloons on it.
+    """
+    source_path = tmp_path / "source.pdf"
+    doc = fitz.open()
+    doc.new_page(width=200, height=400)
+    doc.save(str(source_path))
+    doc.close()
+
+    drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
+    output_path = tmp_path / "out.pdf"
+    export_ballooned_pdf(drawing, [], output_path)
+
+    out_doc = fitz.open(str(output_path))
+    spans = [
+        span
+        for block in out_doc[0].get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        for span in line["spans"]
+    ]
+    out_doc.close()
+
+    matches = [s for s in spans if s["text"].strip() == STAMP_TEXT]
+    assert matches, f"stamp text not found (found: {[s['text'] for s in spans]})"
+    bbox = matches[0]["bbox"]
+    assert bbox[0] < 100 and bbox[1] < 100, f"stamp not near top-left corner: {bbox}"
+
+
+def test_stamp_is_upright_in_top_left_corner_on_rotated_page(tmp_path):
+    """The stamp must stay in the page's visual top-left corner and read
+    upright even when the source page has a /Rotate value, mirroring the
+    derotation handling used for balloons.
+    """
+    source_path = tmp_path / "source.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=200, height=400)
+    page.set_rotation(90)
+    doc.save(str(source_path))
+    doc.close()
+
+    drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
+    output_path = tmp_path / "out.pdf"
+    export_ballooned_pdf(drawing, [], output_path)
+
+    out_doc = fitz.open(str(output_path))
+    out_page = out_doc[0]
+    spans = [
+        span
+        for block in out_page.get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        for span in line["spans"]
+    ]
+
+    matches = [s for s in spans if s["text"].strip() == STAMP_TEXT]
+    assert matches, f"stamp text not found (found: {[s['text'] for s in spans]})"
+    # Map the drawn (mediabox-space) bbox back into display space, the same
+    # way test_balloon_number_text_is_rendered_on_rotated_page does, to
+    # check it landed in the visual top-left corner of the rotated page.
+    label_rect = fitz.Rect(matches[0]["bbox"]) * out_page.rotation_matrix
+    label_rect.normalize()
+    out_doc.close()
+    assert label_rect.x0 < 100 and label_rect.y0 < 100, (
+        f"stamp not near visual top-left corner: {label_rect}"
+    )

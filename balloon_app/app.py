@@ -592,6 +592,17 @@ class MainWindow(QMainWindow):
         view_menu.addAction(actual_size_act)
 
         view_menu.addSeparator()
+        rotate_cw_act = QAction("Rotate View Clockwise", self)
+        rotate_cw_act.setShortcut(QKeySequence("Ctrl+R"))
+        rotate_cw_act.triggered.connect(self.pdf_view.rotate_view_cw)
+        view_menu.addAction(rotate_cw_act)
+
+        rotate_ccw_act = QAction("Rotate View Counterclockwise", self)
+        rotate_ccw_act.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        rotate_ccw_act.triggered.connect(self.pdf_view.rotate_view_ccw)
+        view_menu.addAction(rotate_ccw_act)
+
+        view_menu.addSeparator()
         self.prev_page_action = QAction("Previous Page", self)
         self.prev_page_action.setShortcut(QKeySequence("PgUp"))
         self.prev_page_action.triggered.connect(lambda: self._load_page(self.current_page - 1))
@@ -657,6 +668,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(zoom_in_act)
         toolbar.addAction(zoom_out_act)
         toolbar.addAction(fit_page_act)
+        toolbar.addAction(rotate_cw_act)
         toolbar.addSeparator()
         toolbar.addAction(self.add_balloon_act)
         toolbar.addAction(auto_page_act)
@@ -683,6 +695,7 @@ class MainWindow(QMainWindow):
         self.pdf_view.balloon_size_percent = self.settings.balloon_size_percent
         self.balloon_size_spin.valueChanged.connect(self._change_balloon_size)
         toolbar.addWidget(self.balloon_size_spin)
+        self.pdf_view.stamp_size_percent = self.settings.stamp_size_percent
 
     def _change_balloon_size(self, percent: int) -> None:
         self.settings.balloon_size_percent = percent
@@ -1749,10 +1762,13 @@ class MainWindow(QMainWindow):
         if self.project is None or self.drawing is None:
             QMessageBox.information(self, "No Drawing", "Open or add a PDF drawing first.")
             return
-        dialog = ExportPdfOptionsDialog(self)
+        dialog = ExportPdfOptionsDialog(self, stamp_size_percent=self.settings.stamp_size_percent)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         include_pending, include_rejected = dialog.options()
+        self.settings.stamp_size_percent = dialog.stamp_size_percent()
+        self.settings.save()
+        self.pdf_view.set_stamp_size(self.settings.stamp_size_percent)
         default_name = f"{Path(self.drawing.file_name).stem}_ballooned.pdf"
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Ballooned PDF", str(Path(self._default_export_dir()) / default_name), "PDF Files (*.pdf)"
@@ -1764,6 +1780,7 @@ class MainWindow(QMainWindow):
             export_ballooned_pdf, self._on_export_pdf_done, f"Exporting ballooned PDF to {Path(path).name}...",
             self.drawing, balloons, path, include_pending, include_rejected,
             balloon_size_percent=self.settings.balloon_size_percent,
+            stamp_size_percent=self.settings.stamp_size_percent,
         )
 
     def _on_export_pdf_done(self, result: PdfExportResult) -> None:

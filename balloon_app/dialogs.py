@@ -630,7 +630,7 @@ class ExportExcelOptionsDialog(QDialog):
 
 
 class ExportPdfOptionsDialog(QDialog):
-    def __init__(self, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None, stamp_size_percent: int = 100):
         super().__init__(parent)
         self.setWindowTitle("Export Ballooned PDF")
 
@@ -643,6 +643,17 @@ class ExportPdfOptionsDialog(QDialog):
         info.setWordWrap(True)
         info.setStyleSheet("color: gray;")
 
+        self.stamp_size_spin = QSpinBox()
+        self.stamp_size_spin.setRange(50, 200)
+        self.stamp_size_spin.setSingleStep(10)
+        self.stamp_size_spin.setSuffix("%")
+        self.stamp_size_spin.setValue(stamp_size_percent)
+        self.stamp_size_spin.setToolTip('Size of the "Ballooned Drawing" stamp in the top-left corner')
+        stamp_size_row = QHBoxLayout()
+        stamp_size_row.addWidget(QLabel('"Ballooned Drawing" stamp size:'))
+        stamp_size_row.addWidget(self.stamp_size_spin)
+        stamp_size_row.addStretch(1)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -651,10 +662,14 @@ class ExportPdfOptionsDialog(QDialog):
         layout.addWidget(info)
         layout.addWidget(self.include_pending_check)
         layout.addWidget(self.include_rejected_check)
+        layout.addLayout(stamp_size_row)
         layout.addWidget(buttons)
 
     def options(self) -> tuple[bool, bool]:
         return self.include_pending_check.isChecked(), self.include_rejected_check.isChecked()
+
+    def stamp_size_percent(self) -> int:
+        return self.stamp_size_spin.value()
 
 
 class RenumberDialog(QDialog):

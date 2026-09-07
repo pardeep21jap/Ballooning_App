@@ -19,7 +19,15 @@ from typing import Optional
 
 import pymupdf as fitz  # PyMuPDF (import name predates the "pymupdf" package rename)
 
-from balloon_app.config import BALLOON_RADIUS_PDF_POINTS, status_color
+from balloon_app.config import (
+    BALLOON_RADIUS_PDF_POINTS,
+    STAMP_CORNER_RADIUS_PERCENT,
+    STAMP_FONT_SIZE_PDF_POINTS,
+    STAMP_MARGIN_PDF_POINTS,
+    STAMP_MAX_WIDTH_PDF_POINTS,
+    STAMP_TEXT,
+    status_color,
+)
 from balloon_app.data_model import Balloon, Drawing, ReviewStatus
 
 logger = logging.getLogger("balloon_app.pdf_export")
@@ -63,7 +71,12 @@ def _rgba_unit(rgba: tuple[int, int, int, int]) -> tuple[float, float, float]:
     return (rgba[0] / 255.0, rgba[1] / 255.0, rgba[2] / 255.0)
 
 
-def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]], balloon_size_percent: int = 100) -> None:
+def _draw_balloons_on_doc(
+    doc: fitz.Document,
+    by_page: dict[int, list[Balloon]],
+    balloon_size_percent: int = 100,
+    stamp_size_percent: int = 100,
+) -> None:
     radius = BALLOON_RADIUS_PDF_POINTS * max(50, min(200, balloon_size_percent)) / 100
     for page_number, page_balloons in by_page.items():
         if page_number < 0 or page_number >= doc.page_count:
@@ -113,6 +126,52 @@ def _draw_balloons_on_doc(doc: fitz.Document, by_page: dict[int, list[Balloon]],
                 rotate=page.rotation,
             )
 
+    for page in doc:
+        _stamp_page(page, stamp_size_percent)
+
+
+def _stamp_page(page: fitz.Page, stamp_size_percent: int = 100) -> None:
+    """Stamp "Ballooned Drawing" in the page's visual top-left corner.
+
+    Positioned in page.rect space (the app's display convention, top-left
+    origin) and mapped through derotation_matrix -- same approach as the
+    balloon overlay in _draw_balloons_on_doc -- so it lands in the visual
+    top-left corner and reads upright regardless of the page's /Rotate.
+    ``stamp_size_percent`` scales the whole badge (font + box) uniformly,
+    the same way balloon_size_percent scales balloons.
+    """
+    scale = max(50, min(200, stamp_size_percent)) / 100
+    fontsize = STAMP_FONT_SIZE_PDF_POINTS * scale
+    margin = STAMP_MARGIN_PDF_POINTS * scale
+
+    derotation_matrix = page.derotation_matrix
+    rect = page.rect
+    box_width = min(STAMP_MAX_WIDTH_PDF_POINTS * scale, rect.width - 2 * margin)
+    # insert_textbox's internal fit check needs noticeably more headroom
+    # than the font's nominal size (see the balloon-number box above) --
+    # anything under ~2x fontsize silently fails to fit and draws nothing.
+    box_height = fontsize * 2.0
+    box = fitz.Rect(
+        rect.x0 + margin,
+        rect.y0 + margin,
+        rect.x0 + margin + box_width,
+        rect.y0 + margin + box_height,
+    )
+    box = box * derotation_matrix
+    box.normalize()
+
+    stamp_color = (0.75, 0, 0)
+    page.draw_rect(box, color=stamp_color, width=max(0.5, 1.1 * scale), radius=STAMP_CORNER_RADIUS_PERCENT)
+    page.insert_textbox(
+        box,
+        STAMP_TEXT,
+        fontsize=fontsize,
+        fontname="hebo",
+        color=stamp_color,
+        align=1,
+        rotate=page.rotation,
+    )
+
 
 def _build_raster_fallback_doc(source_path: Path, dpi: float) -> fitz.Document:
     src = fitz.open(str(source_path))
@@ -137,6 +196,7 @@ def export_ballooned_pdf(
     include_rejected: bool = False,
     raster_fallback_dpi: float = 300.0,
     balloon_size_percent: int = 100,
+    stamp_size_percent: int = 100,
 ) -> PdfExportResult:
     """Draw balloons onto a copy of the source PDF and save it to ``output_path``."""
     source_path = resolve_source_path(drawing)
@@ -159,7 +219,7 @@ def export_ballooned_pdf(
     doc: Optional[fitz.Document] = None
     try:
         doc = fitz.open(str(source_path))
-        _draw_balloons_on_doc(doc, by_page, balloon_size_percent)
+        _draw_balloons_on_doc(doc, by_page, balloon_size_percent, stamp_size_percent)
         fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=".tmp_", suffix=".pdf")
         os.close(fd)
         doc.save(tmp_name, garbage=3, deflate=True)
@@ -169,7 +229,7 @@ def export_ballooned_pdf(
             doc.close()
         try:
             doc = _build_raster_fallback_doc(source_path, raster_fallback_dpi)
-            _draw_balloons_on_doc(doc, by_page, balloon_size_percent)
+            _draw_balloons_on_doc(doc, by_page, balloon_size_percent, stamp_size_percent)
             fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=".tmp_", suffix=".pdf")
             os.close(fd)
             doc.save(tmp_name)

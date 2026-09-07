@@ -18,10 +18,20 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QEvent, QMutex, QObject, QPointF, QRectF, QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap, QWheelEvent
+from PyQt6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap, QTransform, QWheelEvent
 from PyQt6.QtWidgets import QGraphicsItem, QGraphicsLineItem, QGraphicsObject, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
-from balloon_app.config import COLOR_SELECTED_OUTLINE, MAX_ZOOM, MIN_ZOOM, status_color
+from balloon_app.config import (
+    COLOR_SELECTED_OUTLINE,
+    MAX_ZOOM,
+    MIN_ZOOM,
+    STAMP_CORNER_RADIUS_PERCENT,
+    STAMP_FONT_SIZE_PDF_POINTS,
+    STAMP_MARGIN_PDF_POINTS,
+    STAMP_MAX_WIDTH_PDF_POINTS,
+    STAMP_TEXT,
+    status_color,
+)
 from balloon_app.data_model import Balloon
 from balloon_app.pdf_engine import PdfDocument, pdf_to_pixel, pixel_to_pdf
 
@@ -157,6 +167,53 @@ class LeaderHandleItem(QGraphicsObject):
         self.dragFinished.emit(self.balloon_id)
 
 
+class StampItem(QGraphicsObject):
+    """Static "Ballooned Drawing" badge shown in the page's top-left corner.
+
+    Mirrors the look of the stamp drawn onto exported PDFs (pdf_export.py's
+    ``_stamp_page``) so the on-screen preview matches the export -- a
+    transparent-background box with a red border and bold red text. It is
+    not interactive (no selection/drag), just an overlay.
+    """
+
+    def __init__(self, text: str, width: float, height: float, font_size: float):
+        super().__init__()
+        self.text = text
+        self.width = width
+        self.height = height
+        self.font_size = font_size
+        self.setZValue(20.0)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
+    def boundingRect(self) -> QRectF:
+        return QRectF(0, 0, self.width, self.height)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: D102
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = QColor(191, 0, 0)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+        outer_radius = self.height * STAMP_CORNER_RADIUS_PERCENT
+        outer_pen = QPen(color)
+        outer_pen.setWidthF(max(1.0, self.height * 0.09))
+        painter.setPen(outer_pen)
+        painter.drawRoundedRect(self.boundingRect(), outer_radius, outer_radius)
+
+        font = QFont()
+        font.setBold(True)
+        font.setPointSizeF(max(1.0, self.font_size))
+        painter.setPen(QPen(color))
+        painter.setFont(font)
+        painter.drawText(self.boundingRect(), int(Qt.AlignmentFlag.AlignCenter), self.text)
+
+    def set_geometry(self, width: float, height: float, font_size: float) -> None:
+        self.prepareGeometryChange()
+        self.width = width
+        self.height = height
+        self.font_size = font_size
+        self.update()
+
+
 class _RenderWorker(QObject):
     """Runs PyMuPDF page rendering on a dedicated background thread."""
 
@@ -218,11 +275,14 @@ class PdfGraphicsView(QGraphicsView):
         self._page_number = 0
         self._welcome_logo = QPixmap(str(Path(__file__).parent / "resources" / "balloonapp-logo.png"))
         self._zoom_level = 1.0
+        self._view_rotation = 0
         self.balloon_size_percent = 100
+        self.stamp_size_percent = 100
         self._effective_dpi = ACTUAL_SIZE_DPI
         self._balloon_items: dict[str, BalloonItem] = {}
         self._leader_items: dict[str, QGraphicsLineItem] = {}
         self._leader_handle_items: dict[str, LeaderHandleItem] = {}
+        self._stamp_item: Optional[StampItem] = None
         self._selected_balloon_id: Optional[str] = None
         self._current_balloons: list[Balloon] = []
 
@@ -290,6 +350,7 @@ class PdfGraphicsView(QGraphicsView):
         self._balloon_items.clear()
         self._leader_items.clear()
         self._leader_handle_items.clear()
+        self._stamp_item = None
         self._current_balloons = []
         self._selected_balloon_id = None
         self._page_number = 0
@@ -301,6 +362,8 @@ class PdfGraphicsView(QGraphicsView):
         self._pan_start_pos = None
         self._click_start_pos = None
         self.unsetCursor()
+        self._view_rotation = 0
+        self.setTransform(QTransform())
         self._scene.setSceneRect(0, 0, 0, 0)
         self.viewport().update()
         self.renderFinished.emit()
@@ -318,12 +381,39 @@ class PdfGraphicsView(QGraphicsView):
         self.balloon_size_percent = max(50, min(200, percent))
         self._sync_balloon_items()
 
+    def set_stamp_size(self, percent: int) -> None:
+        self.stamp_size_percent = max(50, min(200, percent))
+        self._sync_stamp_item()
+
     # ------------------------------------------------------------------
     # Zoom
     # ------------------------------------------------------------------
     @property
     def zoom_level(self) -> float:
         return self._zoom_level
+
+    # ------------------------------------------------------------------
+    # View rotation
+    # ------------------------------------------------------------------
+    @property
+    def view_rotation(self) -> int:
+        return self._view_rotation
+
+    def rotate_view_cw(self) -> None:
+        self._set_view_rotation(self._view_rotation + 90)
+
+    def rotate_view_ccw(self) -> None:
+        self._set_view_rotation(self._view_rotation - 90)
+
+    def _set_view_rotation(self, degrees: int) -> None:
+        # Rebuilt from scratch each time (rather than composing successive
+        # QGraphicsView.rotate() calls) so repeated rotation never
+        # accumulates floating-point drift away from an exact multiple of
+        # 90 degrees.
+        self._view_rotation = degrees % 360
+        transform = QTransform()
+        transform.rotate(self._view_rotation)
+        self.setTransform(transform)
 
     def zoom_in(self) -> None:
         self.set_zoom(self._zoom_level * ZOOM_STEP)
@@ -350,6 +440,10 @@ class PdfGraphicsView(QGraphicsView):
         page_h_px = page_h_pt / 72.0 * ACTUAL_SIZE_DPI
         if page_w_px <= 0 or page_h_px <= 0:
             return
+        if self._view_rotation % 180 == 90:
+            # Sideways view: the page's on-screen bounding box has its
+            # width/height swapped relative to the unrotated page.
+            page_w_px, page_h_px = page_h_px, page_w_px
         zoom = min(avail_w / page_w_px, avail_h / page_h_px)
         self.set_zoom(zoom)
 
@@ -409,6 +503,7 @@ class PdfGraphicsView(QGraphicsView):
 
         self._scene.setSceneRect(0, 0, width, height)
         self._sync_balloon_items()
+        self._sync_stamp_item()
 
         if getattr(self, "_pending_center_pdf", None) is not None:
             px, py = pdf_to_pixel(*self._pending_center_pdf, dpi)
@@ -501,6 +596,30 @@ class PdfGraphicsView(QGraphicsView):
                     del self._leader_items[balloon.id]
                 if balloon.id in self._leader_handle_items:
                     self._scene.removeItem(self._leader_handle_items.pop(balloon.id))
+
+    def _sync_stamp_item(self) -> None:
+        """Position the "Ballooned Drawing" badge in the page's top-left
+        corner, sized in the same PDF-points-scaled-by-DPI way as balloons
+        (see _sync_balloon_items) so it matches the exported PDF's stamp.
+        """
+        if self._pixmap_item is None:
+            return
+
+        dpi = self._last_render_dpi()
+        px_per_pt = dpi / 72.0
+        scale = self.stamp_size_percent / 100
+        margin = STAMP_MARGIN_PDF_POINTS * scale * px_per_pt
+        font_size = STAMP_FONT_SIZE_PDF_POINTS * scale * px_per_pt
+        page_width = self._pixmap_item.pixmap().width()
+        width = min(STAMP_MAX_WIDTH_PDF_POINTS * scale * px_per_pt, page_width - 2 * margin)
+        height = font_size * 2.0
+
+        if self._stamp_item is None:
+            self._stamp_item = StampItem(STAMP_TEXT, width, height, font_size)
+            self._scene.addItem(self._stamp_item)
+        else:
+            self._stamp_item.set_geometry(width, height, font_size)
+        self._stamp_item.setPos(margin, margin)
 
     def _on_item_moved(self, balloon_id: str, scene_pos: QPointF) -> None:
         # NOTE: deliberately does not trigger a full _sync_balloon_items() resync

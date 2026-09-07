@@ -64,6 +64,18 @@ MAX_ZOOM = 8.0
 DEFAULT_CONFIDENCE_THRESHOLD = 0.6
 BALLOON_RADIUS_PDF_POINTS = 9.0
 
+# "Ballooned Drawing" corner stamp -- shared by the on-screen viewer
+# (pdf_view.py) and the PDF export (pdf_export.py) so both render it
+# identically, scaled by the same stamp_size_percent setting. A simple
+# vector rounded-rect "rubber stamp" look, not a raster image, so it stays
+# crisp and legible at any stamp size instead of turning to noise when
+# scaled down.
+STAMP_TEXT = "BALLOONED DRAWING"
+STAMP_MARGIN_PDF_POINTS = 8.0
+STAMP_FONT_SIZE_PDF_POINTS = 5.0
+STAMP_MAX_WIDTH_PDF_POINTS = 85.0
+STAMP_CORNER_RADIUS_PERCENT = 0.35  # rounded-corner radius, as % of the box's shorter side
+
 RULES_OCR_MODEL_VERSION = "rules_ocr_v2_gdt"
 
 # ---------------------------------------------------------------------------
@@ -128,6 +140,7 @@ class AppSettings:
     recent_projects: list[str] = field(default_factory=list)
     max_recent_projects: int = 10
     balloon_size_percent: int = 100
+    stamp_size_percent: int = 100
     theme: str = "dark"
 
     @classmethod
@@ -148,6 +161,7 @@ class AppSettings:
             ),
             recent_projects=recent,
             balloon_size_percent=max(50, min(200, int(qs.value("balloon_size_percent", 100, type=int)))),
+            stamp_size_percent=max(50, min(200, int(qs.value("stamp_size_percent", 100, type=int)))),
             theme="light" if qs.value("theme", "dark", type=str) == "light" else "dark",
         )
 
@@ -161,6 +175,7 @@ class AppSettings:
         qs.setValue("use_yolo_if_available", self.use_yolo_if_available)
         qs.setValue("recent_projects", self.recent_projects)
         qs.setValue("balloon_size_percent", self.balloon_size_percent)
+        qs.setValue("stamp_size_percent", self.stamp_size_percent)
         qs.setValue("theme", self.theme)
         qs.sync()
 
