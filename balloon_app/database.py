@@ -1,4 +1,4 @@
-"""SQLite-backed persistence for BalloonApp projects.
+"""SQLite-backed persistence for BalloonIQ projects.
 
 Each project is a single portable SQLite file (extension ``.bpdb``) that can
 live anywhere, including inside ``projects/<name>/``. In addition to the

@@ -1,4 +1,4 @@
-"""BalloonApp entry point.
+"""BalloonIQ entry point.
 
 Run from the project root with:
 

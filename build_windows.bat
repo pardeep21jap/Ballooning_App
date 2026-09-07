@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ============================================================
-echo  BalloonApp - Windows EXE build
+echo  BalloonIQ - Windows EXE build
 echo ============================================================
 echo.
 
@@ -66,7 +66,7 @@ rem ------------------------------------------------------------------
 echo [4/5] Cleaning previous build output (build\, dist\, *.spec)...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
-if exist "BalloonApp.spec" del /q "BalloonApp.spec"
+if exist "BalloonIQ.spec" del /q "BalloonIQ.spec"
 echo.
 
 rem ------------------------------------------------------------------
@@ -76,7 +76,7 @@ rem    so user data is never locked inside the build).
 rem ------------------------------------------------------------------
 echo [5/5] Building with PyInstaller (this can take a few minutes)...
 "%PYTHON_EXE%" -m PyInstaller ^
-    --name "BalloonApp" ^
+    --name "BalloonIQ" ^
     --windowed ^
     --icon "balloon_app\resources\balloonapp.ico" ^
     --noconfirm ^
@@ -93,10 +93,10 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  Build complete.
-echo  Executable: dist\BalloonApp\BalloonApp.exe
+echo  Executable: dist\BalloonIQ\BalloonIQ.exe
 echo.
 echo  Note: projects\, datasets\, and models\ are NOT bundled.
-echo  Copy them next to BalloonApp.exe (or let the app recreate
+echo  Copy them next to BalloonIQ.exe (or let the app recreate
 echo  empty ones on first run) before distributing.
 echo ============================================================
 

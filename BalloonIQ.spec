@@ -25,7 +25,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='BalloonApp',
+    name='BalloonIQ',
     icon='balloon_app/resources/balloonapp.ico',
     debug=False,
     bootloader_ignore_signals=False,
@@ -45,5 +45,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='BalloonApp',
+    name='BalloonIQ',
 )

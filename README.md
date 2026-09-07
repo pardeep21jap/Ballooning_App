@@ -1,6 +1,6 @@
-# BalloonApp
+# BalloonIQ
 
-BalloonApp is an **offline, local-first Windows desktop application** for
+BalloonIQ is an **offline, local-first Windows desktop application** for
 ballooning mechanical-engineering PDF drawings and generating a generic
 Excel inspection sheet. It is built for manufacturing, quality, machining,
 injection-molding, and inspection engineers who need to turn a PDF drawing
@@ -123,7 +123,7 @@ with real vector text (most CAD-exported PDFs) do not need OCR at all.
    `C:\Program Files\Tesseract-OCR\tesseract.exe`
 3. Either:
    - Add that folder to your system `PATH`, **or**
-   - Open BalloonApp's **Tools -> Settings** dialog and paste the full path
+   - Open BalloonIQ's **Tools -> Settings** dialog and paste the full path
      to `tesseract.exe` into the "Tesseract Path" field, **or**
    - Set the `TESSERACT_PATH` environment variable to the full executable
      path before launching the app, e.g. in PowerShell:
@@ -132,7 +132,7 @@ with real vector text (most CAD-exported PDFs) do not need OCR at all.
      $env:TESSERACT_PATH = "C:\Program Files\Tesseract-OCR\tesseract.exe"
      ```
 
-If Tesseract is not installed and not configured, BalloonApp will not
+If Tesseract is not installed and not configured, BalloonIQ will not
 crash -- it shows a clear status message when a page has no native text and
 OCR is unavailable, and lets you continue ballooning that page manually.
 
@@ -251,7 +251,7 @@ drawing:
 Every edit is tracked: the balloon's **original auto-prediction is kept**
 alongside your corrected values, and its status becomes `edited`
 automatically if you change a pending/accepted auto-proposal's data. This
-is exactly the feedback BalloonApp uses to build a training dataset.
+is exactly the feedback BalloonIQ uses to build a training dataset.
 
 Open **Tools -> Teach / Training Data...** to see a summary (total
 balloons, auto proposals, accepted/edited/rejected counts, manual
@@ -316,15 +316,15 @@ build_windows.bat
 
 `build_windows.bat` will use your existing `.venv` if present (creating one
 otherwise is not required, but recommended), install PyInstaller if
-missing, and produce a one-folder build under `dist\BalloonApp\` containing
-`BalloonApp.exe` plus all dependencies. It bundles the `balloon_app`
+missing, and produce a one-folder build under `dist\BalloonIQ\` containing
+`BalloonIQ.exe` plus all dependencies. It bundles the `balloon_app`
 package and the `resources` folder; it does **not** bundle your
 `projects/`, `datasets/`, or `models/` folders (those stay external, next
 to the built executable, so your data isn't locked inside the build).
 
 ## Future YOLO training workflow
 
-BalloonApp **does not train models itself**. It only exports a dataset from
+BalloonIQ **does not train models itself**. It only exports a dataset from
 your reviewed balloons via **Tools -> Teach / Training Data -> Export
 Training Dataset** (or programmatically via
 `balloon_app.training_export.export_training_dataset`). The export
@@ -345,7 +345,7 @@ produces, under `datasets/`:
   nominal/tolerance/GD&T, status, confidence, model version, and whether it
   was exported as a positive label.
 
-To actually train a YOLO model later (outside of BalloonApp), a typical
+To actually train a YOLO model later (outside of BalloonIQ), a typical
 workflow looks like:
 
 ```
@@ -367,7 +367,7 @@ pip install ultralytics
 yolo detect train data=data.yaml model=yolov8n.pt epochs=100 imgsz=1280
 ```
 
-Then, in BalloonApp's **Tools -> Settings**, point "YOLO Model (.pt) Path"
+Then, in BalloonIQ's **Tools -> Settings**, point "YOLO Model (.pt) Path"
 at your trained weights (or drop the file into `models/`) and check "Use
 YOLO model when available." If `ultralytics` is not installed or the model
 file is missing/unreadable, the app automatically and silently falls back

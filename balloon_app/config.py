@@ -16,8 +16,8 @@ from pathlib import Path
 
 from PyQt6.QtCore import QSettings
 
-APP_NAME = "BalloonApp"
-APP_ORG = "BalloonApp"
+APP_NAME = "BalloonIQ"
+APP_ORG = "BalloonIQ"
 APP_VERSION = "0.1.0"
 
 

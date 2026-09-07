@@ -736,11 +736,11 @@ class ConfidenceThresholdDialog(QDialog):
 class AboutDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.setWindowTitle("About BalloonApp")
+        self.setWindowTitle("About BalloonIQ")
         self.setMinimumWidth(420)
 
         text = QLabel(
-            f"<h2>BalloonApp</h2>"
+            f"<h2>BalloonIQ</h2>"
             f"<p>Version {__version__}</p>"
             "<p>An offline, local-first tool for ballooning mechanical-engineering PDF "
             "drawings and generating generic Excel inspection sheets.</p>"
@@ -761,7 +761,7 @@ class AboutDialog(QDialog):
             96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
         ))
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        logo.setAccessibleName("BalloonApp logo")
+        logo.setAccessibleName("BalloonIQ logo")
         layout.addWidget(logo)
         layout.addWidget(text)
         layout.addWidget(buttons)

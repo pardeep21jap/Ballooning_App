@@ -1,1 +1,1 @@
-"""Test package for BalloonApp."""
+"""Test package for BalloonIQ."""

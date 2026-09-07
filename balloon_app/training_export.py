@@ -107,7 +107,7 @@ def _write_classes_files(manifests_dir: Path) -> Path:
 
     txt_path.write_text("\n".join(CHARACTERISTIC_CLASSES) + "\n", encoding="utf-8")
 
-    lines = ["# Class mapping for the BalloonApp rules/OCR + future YOLO pipeline.", "names:"]
+    lines = ["# Class mapping for the BalloonIQ rules/OCR + future YOLO pipeline.", "names:"]
     for i, name in enumerate(CHARACTERISTIC_CLASSES):
         lines.append(f"  {i}: {name}")
     yaml_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

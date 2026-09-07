@@ -312,7 +312,7 @@ class ReviewTable(QTableWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("BalloonApp")
+        self.setWindowTitle("BalloonIQ")
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "balloonapp.ico")))
         self.resize(1440, 900)
 
@@ -643,7 +643,7 @@ class MainWindow(QMainWindow):
 
         # Help menu
         help_menu = menu_bar.addMenu("&Help")
-        about_act = QAction("About BalloonApp", self)
+        about_act = QAction("About BalloonIQ", self)
         about_act.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_act)
 
@@ -755,9 +755,9 @@ class MainWindow(QMainWindow):
     def _update_window_title(self) -> None:
         if self.project:
             star = "*" if self._is_dirty() else ""
-            self.setWindowTitle(f"{self.project.name}{star} - BalloonApp")
+            self.setWindowTitle(f"{self.project.name}{star} - BalloonIQ")
         else:
-            self.setWindowTitle("BalloonApp")
+            self.setWindowTitle("BalloonIQ")
 
     def _confirm_discard_changes(self) -> bool:
         if self.project is None or not self._is_dirty():
@@ -805,7 +805,7 @@ class MainWindow(QMainWindow):
     def _open_project(self) -> None:
         if not self._confirm_discard_changes():
             return
-        path, _ = QFileDialog.getOpenFileName(self, "Open Project", str(PROJECTS_DIR), "BalloonApp Project (*.bpdb)")
+        path, _ = QFileDialog.getOpenFileName(self, "Open Project", str(PROJECTS_DIR), "BalloonIQ Project (*.bpdb)")
         if not path:
             return
         self._open_project_path(Path(path))
@@ -894,7 +894,7 @@ class MainWindow(QMainWindow):
             return False
         default_name = _sanitize_filename(self.project.name)
         default_path = str(PROJECTS_DIR / default_name / f"{default_name}.bpdb")
-        path, _ = QFileDialog.getSaveFileName(self, "Save Project As", default_path, "BalloonApp Project (*.bpdb)")
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project As", default_path, "BalloonIQ Project (*.bpdb)")
         if not path:
             return False
         if not path.lower().endswith(".bpdb"):
@@ -1851,7 +1851,7 @@ def main() -> int:
     setup_logging()
     app = QApplication(sys.argv)
     apply_theme(app, AppSettings.load().theme)
-    app.setApplicationName("BalloonApp")
+    app.setApplicationName("BalloonIQ")
     app.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "balloonapp.ico")))
     window = MainWindow()
     window.show()
