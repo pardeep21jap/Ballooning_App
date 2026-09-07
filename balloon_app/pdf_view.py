@@ -31,7 +31,7 @@ from balloon_app.config import (
     STAMP_TEXT,
     status_color,
 )
-from balloon_app.data_model import Balloon
+from balloon_app.data_model import Balloon, ReviewStatus
 from balloon_app.pdf_engine import PdfDocument, pdf_to_pixel, pixel_to_pdf
 
 logger = logging.getLogger("balloon_app.pdf_view")
@@ -375,6 +375,7 @@ class PdfGraphicsView(QGraphicsView):
     def refresh_balloons(self, balloons: list[Balloon]) -> None:
         self._current_balloons = balloons
         self._sync_balloon_items()
+        self._sync_stamp_item()
 
     def set_balloon_size(self, percent: int) -> None:
         self.balloon_size_percent = max(50, min(200, percent))
@@ -600,8 +601,22 @@ class PdfGraphicsView(QGraphicsView):
         """Position the "Ballooned Drawing" badge in the page's top-left
         corner, sized in the same PDF-points-scaled-by-DPI way as balloons
         (see _sync_balloon_items) so it matches the exported PDF's stamp.
+
+        The badge certifies the drawing as fully reviewed, so it's only
+        shown once every balloon on the drawing (all pages, not just the
+        one currently displayed -- see ``_current_balloons``) is Accepted;
+        a drawing with no balloons at all isn't "ballooned" either.
         """
         if self._pixmap_item is None:
+            return
+
+        all_accepted = bool(self._current_balloons) and all(
+            b.status == ReviewStatus.ACCEPTED.value for b in self._current_balloons
+        )
+        if not all_accepted:
+            if self._stamp_item is not None:
+                self._scene.removeItem(self._stamp_item)
+                self._stamp_item = None
             return
 
         dpi = self._last_render_dpi()

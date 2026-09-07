@@ -6,6 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt6.QtWidgets import QApplication
 
+from balloon_app.data_model import Balloon, ReviewStatus
 from balloon_app.pdf_view import PdfGraphicsView, StampItem
 
 
@@ -54,6 +55,9 @@ def test_stamp_item_appears_top_left_and_scales_with_stamp_size():
         # size well before the scaling behavior under test ever mattered.
         page_size = 2000
         pixels = bytes([255] * (page_size * page_size * 3))
+        # The stamp only shows once every balloon on the drawing is
+        # Accepted (see test_stamp_hidden_unless_every_balloon_is_accepted).
+        view._current_balloons = [Balloon(status=ReviewStatus.ACCEPTED.value)]
         view._on_rendered(view._request_counter, pixels, page_size, page_size, 96)
 
         assert isinstance(view._stamp_item, StampItem)
@@ -79,6 +83,45 @@ def test_stamp_item_appears_top_left_and_scales_with_stamp_size():
         # load_document(None) tears the whole scene down; nothing should
         # dangle a reference to the destroyed C++ item afterwards.
         view.load_document(None)
+        assert view._stamp_item is None
+    finally:
+        view.shutdown()
+        view.close()
+        app.processEvents()
+
+
+def test_stamp_hidden_unless_every_balloon_is_accepted():
+    """The "Ballooned Drawing" badge certifies the drawing as fully
+    reviewed, so it must stay hidden while any balloon isn't Accepted --
+    including while there are no balloons at all, e.g. right after adding a
+    PDF drawing, before anything has been ballooned or reviewed -- and
+    appear only once every balloon's status is exactly Accepted.
+    """
+    app = QApplication.instance() or QApplication([])
+    view = PdfGraphicsView()
+    try:
+        pixels = bytes([255] * (200 * 200 * 3))
+        view._on_rendered(view._request_counter, pixels, 200, 200, 96)
+        assert view._stamp_item is None, "stamp must not appear with no balloons at all"
+
+        for status in (ReviewStatus.PENDING.value, ReviewStatus.EDITED.value, ReviewStatus.REJECTED.value):
+            view.refresh_balloons([
+                Balloon(status=ReviewStatus.ACCEPTED.value),
+                Balloon(status=status),
+            ])
+            assert view._stamp_item is None, f"stamp must not appear while a balloon is {status!r}"
+
+        view.refresh_balloons([
+            Balloon(status=ReviewStatus.ACCEPTED.value),
+            Balloon(status=ReviewStatus.ACCEPTED.value),
+        ])
+        assert view._stamp_item is not None, "stamp must appear once every balloon is Accepted"
+
+        # Regressing a single balloon back to pending must hide it again.
+        view.refresh_balloons([
+            Balloon(status=ReviewStatus.ACCEPTED.value),
+            Balloon(status=ReviewStatus.PENDING.value),
+        ])
         assert view._stamp_item is None
     finally:
         view.shutdown()

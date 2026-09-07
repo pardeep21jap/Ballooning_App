@@ -39,9 +39,8 @@ from balloon_app.ocr_parser import DefaultTolerances, compute_limits, decimal_pl
 from balloon_app.training_export import TeachStats
 
 COMMON_INSPECTION_METHODS = [
-    "", "Caliper", "Micrometer", "CMM", "Height Gauge", "Optical Comparator",
-    "Thread Gage", "Surface Comparator", "Visual", "Ring/Plug Gage", "Pin Gauge",
-    "Protractor", "GO/NO-GO", "Other",
+    "", "Caliper", "Micrometer", "CMM", "Height Gauge", "Visual", "Pin Gauge",
+    "Protractor", "GO/NO-GO", "Surface Roughness Tester",
 ]
 
 

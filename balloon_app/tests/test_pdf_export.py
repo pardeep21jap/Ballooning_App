@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from balloon_app.data_model import Balloon, Drawing
+from balloon_app.data_model import Balloon, Drawing, ReviewStatus
 from balloon_app.pdf_export import STAMP_TEXT, export_ballooned_pdf
 
 fitz = pytest.importorskip("pymupdf")
@@ -38,7 +38,11 @@ def test_export_uses_selected_stamp_size(tmp_path, percent, expected_text_width)
     doc.close()
     drawing = Drawing(file_name="source.pdf", original_path=str(source), page_count=1)
     output = tmp_path / "output.pdf"
-    export_ballooned_pdf(drawing, [], output, stamp_size_percent=percent)
+    # The stamp only renders once every balloon is Accepted (see
+    # test_stamp_hidden_unless_every_balloon_is_accepted) -- a default
+    # Balloon() already is, so one is enough to exercise the stamp itself.
+    balloon = Balloon(drawing_id=drawing.id, page_number=0)
+    export_ballooned_pdf(drawing, [balloon], output, stamp_size_percent=percent)
     with fitz.open(output) as exported:
         spans = [
             span
@@ -281,7 +285,11 @@ def test_stamp_text_is_vertically_centered_in_its_border(tmp_path):
 
     drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
     output_path = tmp_path / "out.pdf"
-    export_ballooned_pdf(drawing, [], output_path)
+    # The stamp only renders once every balloon is Accepted (see
+    # test_stamp_hidden_unless_every_balloon_is_accepted) -- a default
+    # Balloon() already is.
+    balloon = Balloon(drawing_id=drawing.id, page_number=0)
+    export_ballooned_pdf(drawing, [balloon], output_path)
 
     out_doc = fitz.open(str(output_path))
     out_page = out_doc[0]
@@ -310,9 +318,56 @@ def test_stamp_text_is_vertically_centered_in_its_border(tmp_path):
     )
 
 
+def _stamp_texts(output_path) -> list[str]:
+    out_doc = fitz.open(str(output_path))
+    spans = [
+        span
+        for block in out_doc[0].get_text("dict")["blocks"]
+        for line in block.get("lines", [])
+        for span in line["spans"]
+    ]
+    out_doc.close()
+    return [s["text"].strip() for s in spans if s["text"].strip() == STAMP_TEXT]
+
+
+def test_stamp_hidden_unless_every_balloon_is_accepted(tmp_path):
+    """The "Ballooned Drawing" stamp certifies the drawing as fully
+    reviewed, so it must not appear on the export -- not on any page --
+    while any balloon isn't Accepted, including right after adding a PDF
+    drawing before anything has been ballooned at all (no balloons yet).
+    """
+    source_path = tmp_path / "source.pdf"
+    doc = fitz.open()
+    doc.new_page(width=200, height=200)
+    doc.save(str(source_path))
+    doc.close()
+    drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
+
+    no_balloons_out = tmp_path / "no_balloons.pdf"
+    export_ballooned_pdf(drawing, [], no_balloons_out)
+    assert not _stamp_texts(no_balloons_out), "stamp must not appear with no balloons at all"
+
+    for status in (ReviewStatus.PENDING.value, ReviewStatus.EDITED.value, ReviewStatus.REJECTED.value):
+        mixed_out = tmp_path / f"mixed_{status}.pdf"
+        balloons = [
+            Balloon(drawing_id=drawing.id, page_number=0, status=ReviewStatus.ACCEPTED.value),
+            Balloon(drawing_id=drawing.id, page_number=0, status=status),
+        ]
+        export_ballooned_pdf(drawing, balloons, mixed_out, include_pending=True, include_rejected=True)
+        assert not _stamp_texts(mixed_out), f"stamp must not appear while a balloon is {status!r}"
+
+    all_accepted_out = tmp_path / "all_accepted.pdf"
+    balloons = [
+        Balloon(drawing_id=drawing.id, page_number=0, status=ReviewStatus.ACCEPTED.value),
+        Balloon(drawing_id=drawing.id, page_number=0, status=ReviewStatus.ACCEPTED.value),
+    ]
+    export_ballooned_pdf(drawing, balloons, all_accepted_out)
+    assert _stamp_texts(all_accepted_out), "stamp must appear once every balloon is Accepted"
+
+
 def test_stamp_is_rendered_in_top_left_corner(tmp_path):
     """Every exported page must be stamped 'Ballooned Drawing' near the
-    visual top-left corner, even on a page with no balloons on it.
+    visual top-left corner, once every balloon on the drawing is Accepted.
     """
     source_path = tmp_path / "source.pdf"
     doc = fitz.open()
@@ -322,7 +377,8 @@ def test_stamp_is_rendered_in_top_left_corner(tmp_path):
 
     drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
     output_path = tmp_path / "out.pdf"
-    export_ballooned_pdf(drawing, [], output_path)
+    balloon = Balloon(drawing_id=drawing.id, page_number=0)
+    export_ballooned_pdf(drawing, [balloon], output_path)
 
     out_doc = fitz.open(str(output_path))
     spans = [
@@ -353,7 +409,8 @@ def test_stamp_is_upright_in_top_left_corner_on_rotated_page(tmp_path):
 
     drawing = Drawing(file_name="source.pdf", original_path=str(source_path), page_count=1)
     output_path = tmp_path / "out.pdf"
-    export_ballooned_pdf(drawing, [], output_path)
+    balloon = Balloon(drawing_id=drawing.id, page_number=0)
+    export_ballooned_pdf(drawing, [balloon], output_path)
 
     out_doc = fitz.open(str(output_path))
     out_page = out_doc[0]

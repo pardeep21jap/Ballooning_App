@@ -97,6 +97,7 @@ def _draw_balloons_on_doc(
     by_page: dict[int, list[Balloon]],
     balloon_size_percent: int = 100,
     stamp_size_percent: int = 100,
+    show_stamp: bool = True,
 ) -> None:
     radius = BALLOON_RADIUS_PDF_POINTS * max(50, min(200, balloon_size_percent)) / 100
     number_font = fitz.Font(fontname="helv")
@@ -161,8 +162,9 @@ def _draw_balloons_on_doc(
                 rotate=page.rotation,
             )
 
-    for page in doc:
-        _stamp_page(page, stamp_size_percent)
+    if show_stamp:
+        for page in doc:
+            _stamp_page(page, stamp_size_percent)
 
 
 def _stamp_page(page: fitz.Page, stamp_size_percent: int = 100) -> None:
@@ -260,6 +262,12 @@ def export_ballooned_pdf(
     for b in filtered:
         by_page.setdefault(b.page_number, []).append(b)
 
+    # The "Ballooned Drawing" stamp certifies the drawing as fully reviewed,
+    # so it only belongs on the export once every balloon on it -- not just
+    # the ones this export happens to include -- is Accepted. A drawing
+    # with no balloons at all isn't "ballooned" either.
+    show_stamp = bool(balloons) and all(b.status == ReviewStatus.ACCEPTED.value for b in balloons)
+
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -268,7 +276,7 @@ def export_ballooned_pdf(
     doc: Optional[fitz.Document] = None
     try:
         doc = fitz.open(str(source_path))
-        _draw_balloons_on_doc(doc, by_page, balloon_size_percent, stamp_size_percent)
+        _draw_balloons_on_doc(doc, by_page, balloon_size_percent, stamp_size_percent, show_stamp)
         fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=".tmp_", suffix=".pdf")
         os.close(fd)
         doc.save(tmp_name, garbage=3, deflate=True)
@@ -278,7 +286,7 @@ def export_ballooned_pdf(
             doc.close()
         try:
             doc = _build_raster_fallback_doc(source_path, raster_fallback_dpi)
-            _draw_balloons_on_doc(doc, by_page, balloon_size_percent, stamp_size_percent)
+            _draw_balloons_on_doc(doc, by_page, balloon_size_percent, stamp_size_percent, show_stamp)
             fd, tmp_name = tempfile.mkstemp(dir=str(output_path.parent), prefix=".tmp_", suffix=".pdf")
             os.close(fd)
             doc.save(tmp_name)
