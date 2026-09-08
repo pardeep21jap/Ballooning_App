@@ -9,6 +9,7 @@ import pytest
 from balloon_app.pdf_engine import (
     PdfDocument,
     dpi_to_zoom,
+    normalize_cad_text,
     pdf_to_pixel,
     pixel_to_pdf,
     rect_pdf_to_pixel,
@@ -16,6 +17,10 @@ from balloon_app.pdf_engine import (
 )
 
 fitz = pytest.importorskip("pymupdf")
+
+
+def test_normalize_legacy_cad_symbol_font_escapes():
+    assert normalize_cad_text("3X \x01n\x025.3 \x01x\x0214 45\x01$\x02") == "3X Ø5.3 ↧14 45°"
 
 
 def test_dpi_to_zoom():

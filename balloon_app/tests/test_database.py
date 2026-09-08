@@ -21,6 +21,7 @@ def populated_project() -> Project:
             char_type="diameter", raw_text="Ø10 ±0.02", nominal=10.0, tol_plus=0.02, tol_minus=0.02,
             lower_limit=9.98, upper_limit=10.02, source=BalloonSource.AUTO.value,
             status=ReviewStatus.ACCEPTED.value, confidence=0.87, model_version="rules_ocr_v1",
+            guessed_symbol_marker="n",
             original_prediction={"char_type": "diameter", "nominal": 10.0},
         )
     )
@@ -59,6 +60,7 @@ def test_save_and_load_roundtrip(tmp_path: Path, populated_project: Project):
     assert balloon.tol_plus == pytest.approx(0.02)
     assert balloon.status == ReviewStatus.ACCEPTED.value
     assert balloon.original_prediction == {"char_type": "diameter", "nominal": 10.0}
+    assert balloon.guessed_symbol_marker == "n"
 
     critical_balloon = next(b for b in loaded.balloons if b.number == 2)
     assert critical_balloon.critical is True

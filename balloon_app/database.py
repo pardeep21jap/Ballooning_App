@@ -75,6 +75,7 @@ CREATE TABLE IF NOT EXISTS balloon (
     datums TEXT,
     surface_finish TEXT,
     thread_callout TEXT,
+    guessed_symbol_marker TEXT,
     note TEXT,
     inspection_method TEXT,
     critical INTEGER,
@@ -135,6 +136,7 @@ class ProjectDatabase:
         self._conn.executescript(SCHEMA)
         self._migrate_project_columns()
         self._migrate_drawing_columns()
+        self._migrate_balloon_columns()
         self._conn.commit()
 
     def _migrate_project_columns(self) -> None:
@@ -168,6 +170,15 @@ class ProjectDatabase:
         for column, sql_type in new_columns.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE drawing ADD COLUMN {column} {sql_type}")
+
+    def _migrate_balloon_columns(self) -> None:
+        """Add balloon columns introduced after a project file's schema was created."""
+        assert self._conn is not None
+        existing = {row["name"] for row in self._conn.execute("PRAGMA table_info(balloon)")}
+        new_columns = {"guessed_symbol_marker": "TEXT"}
+        for column, sql_type in new_columns.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE balloon ADD COLUMN {column} {sql_type}")
 
     def close(self) -> None:
         if self._conn is not None:
@@ -243,15 +254,17 @@ class ProjectDatabase:
                             char_type, raw_text, nominal, tol_plus, tol_minus,
                             lower_limit, upper_limit, gdt_symbol, gdt_tolerance,
                             material_condition, datums, surface_finish, thread_callout,
+                            guessed_symbol_marker,
                             note, inspection_method, critical, source, model_version,
                             confidence, status, created_at, modified_at, original_prediction
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             b.id, b.drawing_id, b.number, b.page_number, b.x, b.y,
                             b.leader_x, b.leader_y, b.bbox_x0, b.bbox_y0, b.bbox_x1, b.bbox_y1,
                             b.char_type, b.raw_text, b.nominal, b.tol_plus, b.tol_minus,
                             b.lower_limit, b.upper_limit, b.gdt_symbol, b.gdt_tolerance,
                             b.material_condition, b.datums, b.surface_finish, b.thread_callout,
+                            b.guessed_symbol_marker,
                             b.note, b.inspection_method, int(b.critical), b.source, b.model_version,
                             b.confidence, b.status, b.created_at, b.modified_at,
                             json.dumps(b.original_prediction) if b.original_prediction else None,
@@ -335,6 +348,7 @@ class ProjectDatabase:
                         datums=brow["datums"],
                         surface_finish=brow["surface_finish"],
                         thread_callout=brow["thread_callout"],
+                        guessed_symbol_marker=brow["guessed_symbol_marker"],
                         note=brow["note"] or "",
                         inspection_method=brow["inspection_method"] or "",
                         critical=bool(brow["critical"]),

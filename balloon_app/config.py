@@ -7,6 +7,7 @@ run with ``python main.py`` or packaged with PyInstaller.
 
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
 import os
@@ -126,6 +127,17 @@ CHARACTERISTIC_CLASSES: list[str] = [
 ]
 
 
+def _load_learned_symbols(qs: QSettings) -> dict[str, str]:
+    raw = qs.value("learned_symbols", "", type=str)
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+
+
 @dataclass
 class AppSettings:
     """User-editable settings, persisted via QSettings (registry-backed)."""
@@ -141,6 +153,12 @@ class AppSettings:
     balloon_size_percent: int = 100
     stamp_size_percent: int = 100
     theme: str = "light"
+    # A marker letter (a mangled dimensioning-symbol glyph -- see
+    # ocr_parser._resolve_learned_marker) -> the characteristic type it
+    # actually means, taught by confirming a correction in the UI. Global
+    # (not per-project) since the same CAD export tool/font typically
+    # produces the same mangling across every drawing from that source.
+    learned_symbols: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -162,6 +180,7 @@ class AppSettings:
             balloon_size_percent=max(50, min(200, int(qs.value("balloon_size_percent", 100, type=int)))),
             stamp_size_percent=max(50, min(200, int(qs.value("stamp_size_percent", 100, type=int)))),
             theme="dark" if qs.value("theme", "light", type=str) == "dark" else "light",
+            learned_symbols=_load_learned_symbols(qs),
         )
 
     def save(self) -> None:
@@ -176,6 +195,7 @@ class AppSettings:
         qs.setValue("balloon_size_percent", self.balloon_size_percent)
         qs.setValue("stamp_size_percent", self.stamp_size_percent)
         qs.setValue("theme", self.theme)
+        qs.setValue("learned_symbols", json.dumps(self.learned_symbols))
         qs.sync()
 
     def add_recent_project(self, path: str) -> None:
@@ -184,6 +204,18 @@ class AppSettings:
             self.recent_projects.remove(path)
         self.recent_projects.insert(0, path)
         self.recent_projects = self.recent_projects[: self.max_recent_projects]
+        self.save()
+
+    def learn_symbol(self, marker: str, char_type: str) -> None:
+        """Teach a mangled-symbol marker letter what it actually means,
+        persisting immediately so it applies from the very next auto-balloon
+        run, in this project and every other one.
+        """
+        self.learned_symbols[marker.strip().lower()] = char_type
+        self.save()
+
+    def forget_symbol(self, marker: str) -> None:
+        self.learned_symbols.pop(marker.strip().lower(), None)
         self.save()
 
     def effective_tesseract_path(self) -> str | None:

@@ -7,6 +7,8 @@ Every color used below is one flat value or an alpha-blend of it -- no
 per-widget one-offs -- so the whole app reads as one system.
 """
 
+from pathlib import Path
+
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
 
@@ -28,6 +30,12 @@ _BORDER = "rgba(0, 32, 73, 0.22)"
 _BORDER_STRONG = "rgba(0, 32, 73, 0.4)"
 _LINE = "#d7d3d3"
 _DISABLED = "#9b9797"
+
+_RESOURCE_DIR = Path(__file__).parent / "resources"
+_SPIN_UP_LIGHT = (_RESOURCE_DIR / "spin-up-light.svg").as_posix()
+_SPIN_DOWN_LIGHT = (_RESOURCE_DIR / "spin-down-light.svg").as_posix()
+_SPIN_UP_DARK = (_RESOURCE_DIR / "spin-up-dark.svg").as_posix()
+_SPIN_DOWN_DARK = (_RESOURCE_DIR / "spin-down-dark.svg").as_posix()
 
 
 def apply_theme(app: QApplication, theme: str) -> None:
@@ -93,16 +101,20 @@ def apply_light_theme(app: QApplication) -> None:
 
         QToolBar {{
             background: {_PAGE_BG}; border: none; border-bottom: 2px solid {_BORDER};
-            spacing: 3px; padding: 5px 8px;
+            spacing: 3px; padding: 1px 8px;
         }}
         QToolBar QToolButton {{
             background: transparent; border: 1px solid transparent; border-radius: 0px;
-            padding: 6px 10px; font-size: 12px;
+            padding: 1px 6px; font-size: 12px;
         }}
         QToolBar QToolButton:hover {{ background: {_SURFACE}; }}
         QToolBar QToolButton:pressed {{ background: {_LINE}; }}
         QToolBar QToolButton:checked {{ background: {_ACCENT}; color: #ffffff; }}
-        QToolBar::separator {{ background: {_LINE}; width: 1px; margin: 6px 5px; }}
+        QToolBar::separator {{ background: {_LINE}; width: 1px; margin: 2px 5px; }}
+        QToolBar QSpinBox, QToolBar QComboBox {{ padding-top: 0px; padding-bottom: 0px; min-height: 9px; }}
+        QToolBar QPushButton {{ padding: 1px 9px; font-weight: 400; }}
+        QToolBar#mainToolbar QSpinBox, QToolBar#mainToolbar QComboBox,
+        QToolBar#mainToolbar QPushButton {{ max-height: 22px; }}
 
         QStatusBar {{ background: {_SURFACE}; border-top: 1px solid {_BORDER}; color: {_INK_SOFT}; }}
         QStatusBar::item {{ border: none; }}
@@ -119,6 +131,29 @@ def apply_light_theme(app: QApplication) -> None:
         QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border: 1px solid {_ACCENT}; }}
         QLineEdit:disabled {{ background: {_SURFACE}; color: {_DISABLED}; }}
 
+        /* Styling the border/padding above opts a spin box out of native
+           complex-control drawing, so its up/down buttons need explicit
+           subcontrol rules -- without these they reserve their usual space
+           but paint nothing at all. */
+        QSpinBox::up-button, QDoubleSpinBox::up-button {{
+            subcontrol-origin: border; subcontrol-position: top right;
+            width: 16px; height: 11px; border-left: 1px solid {_LINE}; border-bottom: 1px solid {_LINE};
+        }}
+        QSpinBox::down-button, QDoubleSpinBox::down-button {{
+            subcontrol-origin: border; subcontrol-position: bottom right;
+            width: 16px; height: 11px; border-left: 1px solid {_LINE};
+        }}
+        QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+        QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{ background: {_SURFACE}; }}
+        QSpinBox::up-button:pressed, QDoubleSpinBox::up-button:pressed,
+        QSpinBox::down-button:pressed, QDoubleSpinBox::down-button:pressed {{ background: {_LINE}; }}
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
+            image: url("{_SPIN_UP_LIGHT}"); width: 7px; height: 4px;
+        }}
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
+            image: url("{_SPIN_DOWN_LIGHT}"); width: 7px; height: 4px;
+        }}
+
         QComboBox {{
             background: #ffffff; border: 1px solid {_LINE}; border-radius: 0px;
             padding: 4px 6px; padding-right: 22px; min-height: 18px;
@@ -131,7 +166,12 @@ def apply_light_theme(app: QApplication) -> None:
             subcontrol-origin: padding; subcontrol-position: top right;
             width: 20px; border: none; border-left: 1px solid {_LINE};
         }}
-        QComboBox::down-arrow {{ width: 9px; height: 9px; }}
+        QComboBox::down-arrow {{
+            width: 0; height: 0;
+            border-left: 4px solid transparent; border-right: 4px solid transparent;
+            border-top: 5px solid {_INK_SOFT};
+        }}
+        QComboBox::down-arrow:disabled {{ border-top-color: {_DISABLED}; }}
         QComboBox QAbstractItemView {{
             background: #ffffff; border: 1px solid {_BORDER_STRONG};
             selection-background-color: {_ACCENT_TINT}; selection-color: {_INK}; outline: none;
@@ -263,4 +303,12 @@ def apply_dark_theme(app: QApplication) -> None:
             border: 1px solid #454c57; padding: 4px;
         }
         QToolTip { color: #ffffff; background-color: #343941; border: 1px solid #667080; }
-    """)
+        QToolBar#mainToolbar QSpinBox, QToolBar#mainToolbar QComboBox,
+        QToolBar#mainToolbar QPushButton { max-height: 22px; }
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+            image: url("__SPIN_UP_DARK__"); width: 7px; height: 4px;
+        }
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+            image: url("__SPIN_DOWN_DARK__"); width: 7px; height: 4px;
+        }
+    """.replace("__SPIN_UP_DARK__", _SPIN_UP_DARK).replace("__SPIN_DOWN_DARK__", _SPIN_DOWN_DARK))

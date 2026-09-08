@@ -152,7 +152,7 @@ _QTY_TWO_VALUE_RE = re.compile(
 # priority. "R" is excluded from the mangled-letter class since it's never
 # mangled -- it's already an unambiguous, real radius symbol on its own.
 _QTY_SINGLE_MANGLED_DIAMETER_RE = re.compile(
-    rf"^\s*(\d+)\s*[Xx]\s+(?![Rr])[A-Za-z]\s*({NUM})\b"
+    rf"^\s*(\d+)\s*[Xx]\s+(?![Rr])([A-Za-z])\s*({NUM})\b"
 )
 
 # A number immediately followed by the degree sign, e.g. "82°" in
@@ -185,7 +185,33 @@ _VALUE_THEN_ANGLE_RE = re.compile(rf"({NUM})\s*[Xx]\s*({NUM})\s*°")
 # value -- never a bare whole number -- so a drawing/revision code like
 # "A2048" is never mistaken for one; a diameter is essentially always
 # given to several decimal places, an alphanumeric code never is.
-_BARE_MANGLED_DIAMETER_RE = re.compile(r"^(?![Rr])[A-Za-z]\s*(\d+\.\d+|\.\d+)$")
+_BARE_MANGLED_DIAMETER_RE = re.compile(r"^(?![Rr])([A-Za-z])\s*(\d+\.\d+|\.\d+)$")
+
+# What a marker letter resolves to as a canonical display symbol, once its
+# char_type is known (whether from a learned mapping or the bare default
+# guess) -- used to rewrite raw_text so a garbled font substitution never
+# shows through verbatim (see _try_bare_mangled_diameter et al.).
+_CANONICAL_SYMBOL_FOR_TYPE: dict[str, str] = {
+    CharacteristicType.DIAMETER.value: "⌀",
+    CharacteristicType.DEPTH.value: "▼",
+    CharacteristicType.COUNTERSINK.value: "⌵⌀",
+    CharacteristicType.COUNTERBORE.value: "⌴⌀",
+    CharacteristicType.SQUARE.value: "□",
+}
+
+
+def _resolve_learned_marker(marker: str, learned_symbols: Optional[dict[str, str]]) -> tuple[str, float]:
+    """The (char_type, confidence) a mangled marker letter should resolve
+    to: a previously-learned mapping if one exists (the user confirmed it,
+    so it's treated as confident), otherwise the bare default assumption --
+    diameter, by far the most commonly mangled symbol on a mechanical
+    drawing -- at the same low confidence these fallbacks have always used.
+    """
+    if learned_symbols:
+        learned = learned_symbols.get(marker.strip().lower())
+        if learned:
+            return learned, 0.75
+    return CharacteristicType.DIAMETER.value, 0.55
 
 # Numeric tolerance extraction patterns, tried in priority order.
 _ASYM_SLASH_RE = re.compile(rf"({NUM})\s*\+\s*({NUM})\s*/\s*-\s*({NUM})")
@@ -248,6 +274,16 @@ class ParsedCharacteristic:
     note: str = ""
     confidence: float = 0.3
     extra: dict = field(default_factory=dict)
+    # The mangled letter a "font substituted the real symbol" fallback (see
+    # _resolve_learned_marker) read the char_type from -- whether resolved
+    # via a previously learned mapping or the bare default guess (assume
+    # diameter). Preserved even though raw_text is rewritten to the
+    # canonical symbol for display, since without it the marker would be
+    # unrecoverable if the user later corrects this guess and the app
+    # should remember (or update) what it means. None for anything that
+    # didn't go through this path -- a real symbol/keyword was actually
+    # present in the text.
+    guessed_symbol_marker: Optional[str] = None
 
 
 def _round(value: float) -> float:
@@ -572,7 +608,9 @@ def _try_qty_prefixed_two_values(text: str) -> Optional[list[ParsedCharacteristi
     ]
 
 
-def _try_qty_prefixed_mangled_diameter(text: str) -> Optional[ParsedCharacteristic]:
+def _try_qty_prefixed_mangled_diameter(
+    text: str, learned_symbols: Optional[dict[str, str]] = None
+) -> Optional[ParsedCharacteristic]:
     """Structural fallback for a quantity-prefixed diameter whose glyph was
     mangled into an unrelated letter with no second value to split on (see
     _try_qty_prefixed_two_values for when there is one) -- e.g. "9X
@@ -583,22 +621,25 @@ def _try_qty_prefixed_mangled_diameter(text: str) -> Optional[ParsedCharacterist
     just the wrong one -- see PdfDocument.find_vector_diameter_symbol,
     which only helps when the glyph is missing from the text entirely).
 
-    ``raw_text`` is rewritten to replace the mangled letter with the
-    canonical Ø, keeping the quantity prefix and any trailing note (e.g.
-    "9X ⌀0.250 THRU") since those are real content, unlike the single
-    mangled letter itself.
+    ``raw_text`` is rewritten to replace the mangled letter with its
+    resolved canonical symbol, keeping the quantity prefix and any trailing
+    note (e.g. "9X ⌀0.250 THRU") since those are real content, unlike the
+    single mangled letter itself.
     """
     m = _QTY_SINGLE_MANGLED_DIAMETER_RE.match(text)
     if not m:
         return None
-    qty, value = m.group(1), m.group(2)
-    cleaned_text = f"{qty}X ⌀{value}{text[m.end():]}"
+    qty, marker, value = m.group(1), m.group(2), m.group(3)
+    char_type, confidence = _resolve_learned_marker(marker, learned_symbols)
+    symbol = _CANONICAL_SYMBOL_FOR_TYPE.get(char_type, "⌀")
+    cleaned_text = f"{qty}X {symbol}{value}{text[m.end():]}"
     return ParsedCharacteristic(
-        char_type=CharacteristicType.DIAMETER.value,
+        char_type=char_type,
         raw_text=cleaned_text,
         nominal=_round(float(value)),
         nominal_text=value,
-        confidence=0.55,
+        confidence=confidence,
+        guessed_symbol_marker=marker.strip().lower(),
     )
 
 
@@ -639,27 +680,36 @@ def _try_bare_value_with_angle(text: str) -> Optional[list[ParsedCharacteristic]
     ]
 
 
-def _try_bare_mangled_diameter(text: str) -> Optional[ParsedCharacteristic]:
-    """Structural fallback for a lone diameter glyph mangled into an
-    unrelated letter with nothing else around it, e.g. "n 0.551" (see
+def _try_bare_mangled_diameter(
+    text: str, learned_symbols: Optional[dict[str, str]] = None
+) -> Optional[ParsedCharacteristic]:
+    """Structural fallback for a lone dimensioning-symbol glyph mangled into
+    an unrelated letter with nothing else around it, e.g. "n 0.551" (see
     _BARE_MANGLED_DIAMETER_RE above).
 
+    Defaults to assuming a diameter (by far the most commonly mangled
+    symbol) unless ``learned_symbols`` says this specific marker letter
+    means something else for this font -- see _resolve_learned_marker.
+
     ``raw_text`` is rewritten from the mangled source ("n 0.551") to its
-    canonical symbol form ("⌀0.551") -- the original letter carries no
-    information (it's an artifact of the drawing's font, not real
-    content), so showing it verbatim would only confuse review, not aid
-    traceability.
+    resolved canonical symbol form ("⌀0.551") -- the original letter
+    carries no information on its own (it's an artifact of the drawing's
+    font, not real content), so showing it verbatim would only confuse
+    review, not aid traceability.
     """
     m = _BARE_MANGLED_DIAMETER_RE.match(text.strip())
     if not m:
         return None
-    value = m.group(1)
+    marker, value = m.group(1), m.group(2)
+    char_type, confidence = _resolve_learned_marker(marker, learned_symbols)
+    symbol = _CANONICAL_SYMBOL_FOR_TYPE.get(char_type, "⌀")
     return ParsedCharacteristic(
-        char_type=CharacteristicType.DIAMETER.value,
-        raw_text=f"⌀{value}",
+        char_type=char_type,
+        raw_text=f"{symbol}{value}",
         nominal=_round(float(value)),
         nominal_text=value,
-        confidence=0.55,
+        confidence=confidence,
+        guessed_symbol_marker=marker.strip().lower(),
     )
 
 
@@ -886,7 +936,10 @@ def apply_default_tolerance(
 
 
 def parse_characteristics(
-    text: str, diameter_hint: bool = False, gdt_frame_hint: bool = False
+    text: str,
+    diameter_hint: bool = False,
+    gdt_frame_hint: bool = False,
+    learned_symbols: Optional[dict[str, str]] = None,
 ) -> list[ParsedCharacteristic]:
     """Classify and parse a chunk of drawing text into one or more characteristics.
 
@@ -898,6 +951,13 @@ def parse_characteristics(
 
     The original text is always preserved in ``raw_text`` regardless of
     whether parsing fully succeeds, so nothing is ever silently lost.
+
+    ``learned_symbols``: marker letter -> char_type, taught by confirming a
+    correction in the UI (see AppSettings.learn_symbol). Consulted only by
+    the "font mangled a real symbol into an unrelated letter" fallbacks
+    (_try_bare_mangled_diameter, _try_qty_prefixed_mangled_diameter), which
+    otherwise default to assuming a diameter -- overriding that default is
+    the whole point of remembering a correction instead of repeating it.
 
     ``diameter_hint``: the caller found evidence (outside of ``text`` --
     e.g. a Ø glyph drawn as vector line art rather than a font character,
@@ -938,7 +998,7 @@ def parse_characteristics(
     if qty_two_values is not None:
         return qty_two_values
 
-    qty_mangled_diameter = _try_qty_prefixed_mangled_diameter(text)
+    qty_mangled_diameter = _try_qty_prefixed_mangled_diameter(text, learned_symbols)
     if qty_mangled_diameter is not None:
         return [qty_mangled_diameter]
 
@@ -946,7 +1006,7 @@ def parse_characteristics(
     if value_and_angle is not None:
         return value_and_angle
 
-    mangled_diameter = _try_bare_mangled_diameter(text)
+    mangled_diameter = _try_bare_mangled_diameter(text, learned_symbols)
     if mangled_diameter is not None:
         return [mangled_diameter]
 
@@ -1027,7 +1087,10 @@ def parse_characteristics(
 
 
 def parse_characteristic(
-    text: str, diameter_hint: bool = False, gdt_frame_hint: bool = False
+    text: str,
+    diameter_hint: bool = False,
+    gdt_frame_hint: bool = False,
+    learned_symbols: Optional[dict[str, str]] = None,
 ) -> ParsedCharacteristic:
     """Classify and parse a chunk of drawing text into a single characteristic.
 
@@ -1035,4 +1098,6 @@ def parse_characteristic(
     that only need one representative result (e.g. estimating a confidence
     label for a detection) rather than every characteristic packed into it.
     """
-    return parse_characteristics(text, diameter_hint=diameter_hint, gdt_frame_hint=gdt_frame_hint)[0]
+    return parse_characteristics(
+        text, diameter_hint=diameter_hint, gdt_frame_hint=gdt_frame_hint, learned_symbols=learned_symbols
+    )[0]

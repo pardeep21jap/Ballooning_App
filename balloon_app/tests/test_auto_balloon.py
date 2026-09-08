@@ -269,6 +269,63 @@ class TestCountersinkDiameterAngleCallout:
 
 
 class TestTitleBlockExclusion:
+    def test_lower_left_dimensions_survive_lower_right_title_block(self, tmp_path):
+        """A right-side title block must not erase a drawing view that
+        shares the same lower-page y coordinates.
+        """
+        pdf_path = tmp_path / "right_side_title_block.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=1000, height=800)
+        page.insert_text((100, 700), "24.52", fontsize=12)
+        # Metadata above and left of the anchor labels is still within the
+        # bordered title block and must be excluded.
+        page.insert_text((730, 620), "2026", fontsize=12)
+        page.insert_text((750, 650), "1:1", fontsize=12)
+        page.insert_text((800, 680), "TITLE", fontsize=10)
+        page.insert_text((800, 700), "PART NUMBER", fontsize=10)
+        page.insert_text((900, 715), "126427", fontsize=10)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = [b.raw_text for b in result.balloons]
+        assert "24.52" in raw_texts
+        assert not any("126427" in text for text in raw_texts)
+        assert "2026" not in raw_texts
+        assert "1:1" not in raw_texts
+
+    def test_a4_sized_title_block_left_edge_is_covered(self, tmp_path):
+        """On a smaller (A4-proportioned) sheet, a right-anchored title
+        block's own box commonly starts well to the left of where the
+        anchor phrase itself sits -- e.g. "UNLESS OTHERWISE SPECIFIED"
+        near 57% of the page width, with the box's own tolerance-table
+        fields ("ONE PLACE DECIMAL", "INTERPRET GD&T PER...") starting
+        around 39%. A fixed page-width-fraction cutoff undershoots this
+        and lets those fields leak through as balloons.
+        """
+        pdf_path = tmp_path / "a4_title_block.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=842, height=595)  # A4 landscape, in points
+        page.insert_text((100, 100), "0.375", fontsize=12)  # a real dimension, well above
+        page.insert_text((480, 500), "UNLESS OTHERWISE SPECIFIED:", fontsize=8)
+        page.insert_text((330, 540), "ONE PLACE DECIMAL  0.2", fontsize=8)
+        page.insert_text((330, 555), "INTERPRET GD&T PER ANSI Y14.5", fontsize=8)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = [b.raw_text for b in result.balloons]
+        assert any("0.375" in t for t in raw_texts)
+        assert not any("0.2" in t or "14.5" in t for t in raw_texts)
+
     def test_title_block_note_is_not_ballooned(self, tmp_path):
         """A drawing's title block (numeric tolerance table, fractional
         callouts, etc.) must never be auto-ballooned, even though its text
@@ -463,6 +520,26 @@ class TestSameLineTextMergingDoesNotAbsorbIndependentValues:
 
 
 class TestStackedToleranceFragments:
+    def test_unsigned_dot_zero_upper_and_signed_lower_merge_into_one(self):
+        blocks = [
+            TextBlock(text=".000", bbox=(120, 180, 145, 190)),
+            TextBlock(text="Ø0.375", bbox=(80, 195, 125, 208)),
+            TextBlock(text="-.001", bbox=(120, 210, 145, 220)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "Ø0.375 +.000 -.001"
+
+    def test_unsigned_zero_upper_and_signed_lower_merge_into_one(self):
+        blocks = [
+            TextBlock(text="0.000", bbox=(120, 180, 150, 190)),
+            TextBlock(text="Ø0.375", bbox=(80, 195, 130, 208)),
+            TextBlock(text="-0.001", bbox=(120, 210, 150, 220)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        assert len(merged) == 1
+        assert merged[0].text == "Ø0.375 +0.000 -0.001"
+
     def test_plus_above_and_minus_below_merge_into_one(self):
         # A common drawing convention: the nominal on its own line, with
         # the asymmetric tolerance stacked above/below it as separate lines.
@@ -1001,3 +1078,49 @@ class TestVectorDrawnGdtFrame:
 
         assert len(result.balloons) == 1
         assert result.balloons[0].char_type == CharacteristicType.LINEAR_DIMENSION.value
+
+
+class TestLearnedSymbolsThroughPipeline:
+    def test_learned_marker_resolves_mangled_symbol_end_to_end(self, tmp_path):
+        """A previously-taught marker letter (see AppSettings.learn_symbol)
+        must resolve a mangled symbol correctly through the full pipeline,
+        not just at the parser level -- and the resulting balloon must
+        carry the marker so a further correction could still refine it.
+        """
+        pdf_path = tmp_path / "learned_marker.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "w 0.375", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(
+            pdf_doc, "drawing-1", 0, [], 1, dpi=200,
+            learned_symbols={"w": CharacteristicType.COUNTERSINK.value},
+        )
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.char_type == CharacteristicType.COUNTERSINK.value
+        assert balloon.nominal == pytest.approx(0.375)
+        assert balloon.guessed_symbol_marker == "w"
+
+    def test_no_learned_symbols_keeps_default_diameter_guess(self, tmp_path):
+        pdf_path = tmp_path / "unlearned_marker.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "w 0.375", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        assert result.balloons[0].char_type == CharacteristicType.DIAMETER.value
+        assert result.balloons[0].guessed_symbol_marker == "w"

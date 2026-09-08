@@ -266,7 +266,8 @@ def export_ballooned_pdf(
     # so it only belongs on the export once every balloon on it -- not just
     # the ones this export happens to include -- is Accepted. A drawing
     # with no balloons at all isn't "ballooned" either.
-    show_stamp = bool(balloons) and all(b.status == ReviewStatus.ACCEPTED.value for b in balloons)
+    reviewed_statuses = (ReviewStatus.ACCEPTED.value, ReviewStatus.EDITED.value)
+    show_stamp = bool(balloons) and all(b.status in reviewed_statuses for b in balloons)
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

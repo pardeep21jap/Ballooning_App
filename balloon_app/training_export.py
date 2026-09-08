@@ -32,6 +32,7 @@ from balloon_app.config import AUTO_BALLOON_DPI, CHARACTERISTIC_CLASSES, DATASET
 from balloon_app.data_model import Balloon, BalloonSource, Project, ReviewStatus
 from balloon_app.pdf_engine import PdfDocument, PdfLoadError, rect_pdf_to_pixel
 from balloon_app.pdf_export import resolve_source_path
+from balloon_app.learning import memory_stats
 
 logger = logging.getLogger("balloon_app.training_export")
 
@@ -50,6 +51,8 @@ class TeachStats:
     manual_additions: int = 0
     labeled_pages: int = 0
     model_versions: list[str] = field(default_factory=list)
+    learned_corrections: int = 0
+    suppressed_patterns: int = 0
 
 
 def compute_teach_stats(project: Project) -> TeachStats:
@@ -68,6 +71,7 @@ def compute_teach_stats(project: Project) -> TeachStats:
     }
     versions = sorted({b.model_version for b in auto if b.model_version})
 
+    learned_corrections, suppressed_patterns = memory_stats()
     return TeachStats(
         total_balloons=len(project.balloons),
         auto_proposals=len(auto),
@@ -77,6 +81,8 @@ def compute_teach_stats(project: Project) -> TeachStats:
         manual_additions=len(manual),
         labeled_pages=len(labeled_pages),
         model_versions=versions,
+        learned_corrections=learned_corrections,
+        suppressed_patterns=suppressed_patterns,
     )
 
 

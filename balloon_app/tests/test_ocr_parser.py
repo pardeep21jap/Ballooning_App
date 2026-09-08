@@ -119,6 +119,44 @@ class TestDiameterAndRadius:
         result = parse_characteristic("A2048")
         assert result.char_type != CharacteristicType.DIAMETER.value
 
+    def test_bare_mangled_symbol_records_marker_for_learning(self):
+        # The bare default guess (no learned_symbols given) still records
+        # which marker letter it guessed from, so a later correction can
+        # teach the app what "n" actually means for this drawing's font.
+        result = parse_characteristic("n 0.551")
+        assert result.guessed_symbol_marker == "n"
+
+    def test_learned_marker_overrides_default_diameter_guess(self):
+        # Once the user has taught the app that "w" means Countersink (not
+        # the bare default assumption of Diameter) for this font, the same
+        # marker on a different value must resolve the same way -- this is
+        # exactly the generalization a per-exact-text memory can't provide.
+        result = parse_characteristic("w 0.375", learned_symbols={"w": CharacteristicType.COUNTERSINK.value})
+        assert result.char_type == CharacteristicType.COUNTERSINK.value
+        assert _close(result.nominal, 0.375)
+        assert result.guessed_symbol_marker == "w"
+        assert result.raw_text == "⌵⌀0.375"
+
+    def test_learned_marker_is_case_and_space_insensitive(self):
+        result = parse_characteristic("W 0.375", learned_symbols={"w": CharacteristicType.SQUARE.value})
+        assert result.char_type == CharacteristicType.SQUARE.value
+
+    def test_unlearned_marker_still_falls_back_to_diameter_default(self):
+        # A learned_symbols map that doesn't mention this particular
+        # marker must not change the existing default behavior.
+        result = parse_characteristic("n 0.551", learned_symbols={"w": CharacteristicType.SQUARE.value})
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert result.guessed_symbol_marker == "n"
+
+    def test_learned_marker_applies_to_qty_prefixed_mangled_diameter(self):
+        result = parse_characteristic(
+            "9X w0.250 THRU", learned_symbols={"w": CharacteristicType.DEPTH.value}
+        )
+        assert result.char_type == CharacteristicType.DEPTH.value
+        assert _close(result.nominal, 0.25)
+        assert result.guessed_symbol_marker == "w"
+        assert result.raw_text == "9X ▼0.250 THRU"
+
 
 class TestHoleFeatureModifiers:
     def test_depth_symbol(self):
@@ -580,6 +618,13 @@ class TestAutoBalloonPreFilter:
         page_size = (1000.0, 800.0)
         top_margin_bbox = (500.0, 2.0, 510.0, 14.0)  # y0 within the top 4% of page height
         assert _looks_like_characteristic("3", bbox=top_margin_bbox, page_size=page_size) is False
+
+    def test_bare_integer_inside_bottom_zone_margin_stays_rejected(self):
+        from balloon_app.auto_balloon import _looks_like_characteristic
+
+        page_size = (1000.0, 800.0)
+        bottom_margin_bbox = (500.0, 785.0, 510.0, 798.0)
+        assert _looks_like_characteristic("3", bbox=bottom_margin_bbox, page_size=page_size) is False
 
 
 class TestComputeLimits:

@@ -10,7 +10,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QSize, QThread, Qt, pyqtSignal
+import math
+
+from PyQt6.QtCore import QPointF, QRectF, QSize, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -20,6 +22,8 @@ from PyQt6.QtGui import (
     QIcon,
     QKeySequence,
     QPainter,
+    QPainterPath,
+    QPen,
     QPixmap,
     QUndoCommand,
     QUndoStack,
@@ -68,6 +72,7 @@ from balloon_app.dialogs import (
     DefaultTolerancesDialog,
     ExportExcelOptionsDialog,
     ExportPdfOptionsDialog,
+    LearnedSymbolsDialog,
     NewProjectDialog,
     ProjectPropertiesDialog,
     RenumberDialog,
@@ -80,11 +85,24 @@ from balloon_app.pdf_engine import PdfDocument, PdfLoadError
 from balloon_app.pdf_export import PdfExportResult, export_ballooned_pdf, resolve_source_path
 from balloon_app.pdf_view import PdfGraphicsView
 from balloon_app.training_export import TrainingExportResult, compute_teach_stats, export_training_dataset
+from balloon_app.learning import apply_learned_feedback, learn_from_balloon
 
 logger = logging.getLogger("balloon_app.app")
 
 STATUS_FILTER_OPTIONS = ["All", "Pending", "Accepted", "Edited", "Rejected", "Manual", "Auto"]
 SORT_OPTIONS = ["Page", "Number", "Confidence", "Status"]
+
+# Characteristic types a "font mangled a real symbol into an unrelated
+# letter" fallback can guess (see ocr_parser._resolve_learned_marker) --
+# correcting one of these to a different type is what triggers offering to
+# teach AppSettings.learn_symbol what the marker letter actually means.
+_LEARNABLE_SYMBOL_TYPES = {
+    CharacteristicType.DIAMETER.value,
+    CharacteristicType.DEPTH.value,
+    CharacteristicType.COUNTERSINK.value,
+    CharacteristicType.COUNTERBORE.value,
+    CharacteristicType.SQUARE.value,
+}
 
 
 def _sanitize_filename(name: str) -> str:
@@ -119,6 +137,161 @@ def _balloon_number_badge(number: int, source: str, status: str) -> QIcon:
     return QIcon(pixmap)
 
 
+_TOOLBAR_ICON_SIZE = 20
+
+
+def _toolbar_icon(kind: str, color: QColor, size: int = _TOOLBAR_ICON_SIZE) -> QIcon:
+    """A small line-drawn glyph for a view-control toolbar action (zoom
+    in/out, fit page, rotate) -- kept as code rather than bundled image
+    assets so it always matches the current theme's ink color exactly and
+    needs no PyInstaller resource wiring. Style: thin round-capped strokes,
+    no fill, matching the app's flat/hairline visual language.
+    """
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(color, 1.6)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    if kind in ("zoom-in", "zoom-out"):
+        # Magnifying glass: a circle in the upper-left, handle trailing to
+        # the lower-right corner, +/- mark centered in the lens.
+        cx, cy, r = size * 0.42, size * 0.42, size * 0.30
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+        angle = math.radians(45)
+        handle_start = QPointF(cx + r * math.cos(angle), cy + r * math.sin(angle))
+        handle_end = QPointF(size - size * 0.08, size - size * 0.08)
+        painter.drawLine(handle_start, handle_end)
+        mark_half = r * 0.5
+        painter.drawLine(QPointF(cx - mark_half, cy), QPointF(cx + mark_half, cy))
+        if kind == "zoom-in":
+            painter.drawLine(QPointF(cx, cy - mark_half), QPointF(cx, cy + mark_half))
+
+    elif kind == "fit":
+        # Four corner brackets, pointing inward -- "fit to view".
+        m = size * 0.14
+        arm = size * 0.26
+        for sx, sy in ((1, 1), (-1, 1), (-1, -1), (1, -1)):
+            x = size / 2 + sx * (size / 2 - m)
+            y = size / 2 + sy * (size / 2 - m)
+            painter.drawLine(QPointF(x, y), QPointF(x - sx * arm, y))
+            painter.drawLine(QPointF(x, y), QPointF(x, y - sy * arm))
+
+    elif kind == "rotate":
+        # A ~290-degree arc with an arrowhead at its leading end.
+        margin = size * 0.16
+        rect = QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
+        start_angle, span_angle = -40, 290  # Qt angles: 0=3 o'clock, CCW positive
+        painter.drawArc(rect, start_angle * 16, span_angle * 16)
+        tip_angle = math.radians(-(start_angle + span_angle))
+        cx, cy = rect.center().x(), rect.center().y()
+        rx, ry = rect.width() / 2, rect.height() / 2
+        tip = QPointF(cx + rx * math.cos(tip_angle), cy + ry * math.sin(tip_angle))
+        tangent = tip_angle - math.pi / 2  # direction of travel along the arc at the tip
+        head_len = size * 0.16
+        left = tip + QPointF(head_len * math.cos(tangent + 2.5), head_len * math.sin(tangent + 2.5))
+        right = tip + QPointF(head_len * math.cos(tangent - 2.5), head_len * math.sin(tangent - 2.5))
+        arrow = QPainterPath()
+        arrow.moveTo(left)
+        arrow.lineTo(tip)
+        arrow.lineTo(right)
+        painter.drawPath(arrow)
+
+    elif kind in ("new", "add-pdf"):
+        # A page outline with a folded top-right corner ("new document").
+        # "add-pdf" is the same page with a small "+" badge at its foot,
+        # since attaching a PDF is conceptually "add a document here".
+        left, right = size * 0.28, size * 0.74
+        top, bottom = size * 0.10, size * 0.90
+        fold = size * 0.16
+        page = QPainterPath()
+        page.moveTo(left, top)
+        page.lineTo(right - fold, top)
+        page.lineTo(right, top + fold)
+        page.lineTo(right, bottom)
+        page.lineTo(left, bottom)
+        page.closeSubpath()
+        painter.drawPath(page)
+        painter.drawLine(QPointF(right - fold, top), QPointF(right - fold, top + fold))
+        painter.drawLine(QPointF(right - fold, top + fold), QPointF(right, top + fold))
+        if kind == "add-pdf":
+            badge_r = size * 0.19
+            bx, by = size * 0.80, size * 0.80
+            painter.drawEllipse(QPointF(bx, by), badge_r, badge_r)
+            half = badge_r * 0.5
+            painter.drawLine(QPointF(bx - half, by), QPointF(bx + half, by))
+            painter.drawLine(QPointF(bx, by - half), QPointF(bx, by + half))
+
+    elif kind == "open":
+        # A folder silhouette: tab at top-left, body below, drawn as one
+        # continuous outline.
+        x0, y0 = size * 0.12, size * 0.30
+        x1, y1 = size * 0.44, size * 0.42
+        x2, y2 = size * 0.88, size * 0.82
+        path = QPainterPath()
+        path.moveTo(x0, y2)
+        path.lineTo(x0, y0)
+        path.lineTo(x1, y0)
+        path.lineTo(x1 + size * 0.06, y1)
+        path.lineTo(x2, y1)
+        path.lineTo(x2, y2)
+        path.closeSubpath()
+        painter.drawPath(path)
+
+    elif kind == "save":
+        # A floppy disk: outline with a notched corner, metal slider on
+        # top, and a label line near the bottom.
+        left, top = size * 0.16, size * 0.16
+        right, bottom = size * 0.84, size * 0.84
+        cut = size * 0.16
+        body = QPainterPath()
+        body.moveTo(left, top)
+        body.lineTo(right - cut, top)
+        body.lineTo(right, top + cut)
+        body.lineTo(right, bottom)
+        body.lineTo(left, bottom)
+        body.closeSubpath()
+        painter.drawPath(body)
+        painter.drawRect(QRectF(left + size * 0.12, top, size * 0.42, size * 0.22))
+        painter.drawLine(QPointF(left + size * 0.12, bottom - size * 0.16), QPointF(right - size * 0.12, bottom - size * 0.16))
+
+    elif kind == "add-balloon":
+        # A map-pin / balloon-drop marker: a ring with a small filled
+        # center dot, tapering to a point.
+        cx, cy, r = size * 0.5, size * 0.36, size * 0.22
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+        tip = QPointF(cx, size * 0.88)
+        left = QPointF(cx - r * 0.55, cy + r * 0.75)
+        right = QPointF(cx + r * 0.55, cy + r * 0.75)
+        point = QPainterPath()
+        point.moveTo(left)
+        point.lineTo(tip)
+        point.lineTo(right)
+        painter.drawPath(point)
+        painter.setBrush(QBrush(color))
+        painter.drawEllipse(QPointF(cx, cy), r * 0.32, r * 0.32)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+    elif kind == "export":
+        # A downward arrow dropping into an open tray -- "export/download".
+        cx = size * 0.5
+        painter.drawLine(QPointF(cx, size * 0.10), QPointF(cx, size * 0.56))
+        head = size * 0.15
+        painter.drawLine(QPointF(cx - head, size * 0.56 - head), QPointF(cx, size * 0.56))
+        painter.drawLine(QPointF(cx + head, size * 0.56 - head), QPointF(cx, size * 0.56))
+        tray_top, tray_bottom = size * 0.78, size * 0.86
+        painter.drawLine(QPointF(size * 0.16, tray_top), QPointF(size * 0.16, tray_bottom))
+        painter.drawLine(QPointF(size * 0.16, tray_bottom), QPointF(size * 0.84, tray_bottom))
+        painter.drawLine(QPointF(size * 0.84, tray_bottom), QPointF(size * 0.84, tray_top))
+
+    painter.end()
+    return QIcon(pixmap)
+
+
 def _status_chip_colors(source: str, status: str) -> tuple[QColor, QColor]:
     """A pastel background + a matching dark foreground for the Status
     column, blended from the same status_color used for the on-canvas
@@ -143,6 +316,7 @@ def _auto_balloon_page_task(
     source_path: Path, drawing_id: str, page_number: int, existing: list[Balloon],
     start_number: int, dpi: float, tesseract_path: Optional[str],
     default_tolerances: Optional[DefaultTolerances] = None,
+    learned_symbols: Optional[dict[str, str]] = None,
 ) -> AutoBalloonResult:
     doc = PdfDocument(source_path)
     doc.open()
@@ -150,6 +324,7 @@ def _auto_balloon_page_task(
         return auto_balloon_page(
             doc, drawing_id, page_number, existing, start_number, dpi=dpi,
             tesseract_path=tesseract_path, default_tolerances=default_tolerances,
+            learned_symbols=learned_symbols,
         )
     finally:
         doc.close()
@@ -159,6 +334,7 @@ def _auto_balloon_drawing_task(
     source_path: Path, drawing_id: str, page_count: int, existing: list[Balloon],
     start_number: int, dpi: float, tesseract_path: Optional[str],
     default_tolerances: Optional[DefaultTolerances] = None,
+    learned_symbols: Optional[dict[str, str]] = None,
 ) -> list[AutoBalloonResult]:
     doc = PdfDocument(source_path)
     doc.open()
@@ -170,6 +346,7 @@ def _auto_balloon_drawing_task(
             result = auto_balloon_page(
                 doc, drawing_id, page_number, running_existing, number, dpi=dpi,
                 tesseract_path=tesseract_path, default_tolerances=default_tolerances,
+                learned_symbols=learned_symbols,
             )
             results.append(result)
             running_existing = running_existing + result.balloons
@@ -438,8 +615,10 @@ class MainWindow(QMainWindow):
         panel.setObjectName("reviewPanel")
         panel.setMinimumWidth(560)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(18, 16, 18, 12)
-        layout.setSpacing(12)
+        # Keep the review panel vertically compact while preserving its
+        # existing horizontal alignment.
+        layout.setContentsMargins(18, 7, 18, 5)
+        layout.setSpacing(5)
 
         heading = QHBoxLayout()
         title = QLabel("CHARACTERISTICS")
@@ -464,17 +643,23 @@ class MainWindow(QMainWindow):
         filter_row = QHBoxLayout()
         filter_row.setSpacing(8)
         self.search_edit = QLineEdit()
+        self.search_edit.setFixedHeight(24)
+        self.search_edit.setStyleSheet("padding-top: 2px; padding-bottom: 2px;")
         self.search_edit.setPlaceholderText("Search balloon #, text, or nominal")
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._refresh_review_table)
         filter_row.addWidget(self.search_edit, 1)
         filter_row.addWidget(QLabel("Filter:"))
         self.filter_combo = QComboBox()
+        self.filter_combo.setFixedHeight(24)
+        self.filter_combo.setStyleSheet("padding-top: 2px; padding-bottom: 2px;")
         self.filter_combo.addItems(STATUS_FILTER_OPTIONS)
         self.filter_combo.currentIndexChanged.connect(self._refresh_review_table)
         filter_row.addWidget(self.filter_combo)
         filter_row.addWidget(QLabel("Sort:"))
         self.sort_combo = QComboBox()
+        self.sort_combo.setFixedHeight(24)
+        self.sort_combo.setStyleSheet("padding-top: 2px; padding-bottom: 2px;")
         self.sort_combo.addItems(SORT_OPTIONS)
         self.sort_combo.currentIndexChanged.connect(self._refresh_review_table)
         filter_row.addWidget(self.sort_combo)
@@ -484,6 +669,8 @@ class MainWindow(QMainWindow):
         self.review_table.setHorizontalHeaderLabels(
             ["No.", "Page", "Type", "Raw text", "Nominal", "Tol.", "Method", "Status"]
         )
+        self.review_table.horizontalHeader().setFixedHeight(24)
+        self.review_table.horizontalHeader().setStyleSheet("QHeaderView::section { padding: 2px 6px; }")
         self.review_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.review_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -509,7 +696,8 @@ class MainWindow(QMainWindow):
         row.setSpacing(8)
         for label, callback in (("Accept", self._accept_selected),
                                 ("Reject", self._reject_selected),
-                                ("Edit", self._edit_selected_balloon)):
+                                ("Edit", self._edit_selected_balloon),
+                                ("Delete", self._delete_selected_balloons)):
             button = QPushButton(label)
             button.setMinimumHeight(34)
             if label == "Accept":
@@ -529,7 +717,6 @@ class MainWindow(QMainWindow):
             ("Split Balloon", self._split_selected_balloon),
             (None, None),
             ("Renumber...", self._show_renumber_dialog),
-            ("Delete", self._delete_selected_balloons),
         ):
             if label is None:
                 menu.addSeparator()
@@ -546,13 +733,13 @@ class MainWindow(QMainWindow):
 
         # File menu
         file_menu = menu_bar.addMenu("&File")
-        new_project_act = QAction("New Project...", self)
-        new_project_act.triggered.connect(self._new_project)
-        file_menu.addAction(new_project_act)
+        self.new_project_act = QAction("New Project...", self)
+        self.new_project_act.triggered.connect(self._new_project)
+        file_menu.addAction(self.new_project_act)
 
-        open_project_act = QAction("Open Project...", self)
-        open_project_act.triggered.connect(self._open_project)
-        file_menu.addAction(open_project_act)
+        self.open_project_act = QAction("Open Project...", self)
+        self.open_project_act.triggered.connect(self._open_project)
+        file_menu.addAction(self.open_project_act)
 
         self.recent_menu = file_menu.addMenu("Recent Projects")
 
@@ -561,10 +748,10 @@ class MainWindow(QMainWindow):
         file_menu.addAction(close_project_act)
 
         file_menu.addSeparator()
-        save_project_act = QAction("Save Project", self)
-        save_project_act.setShortcut(QKeySequence("Ctrl+S"))
-        save_project_act.triggered.connect(self._save_project)
-        file_menu.addAction(save_project_act)
+        self.save_project_act = QAction("Save Project", self)
+        self.save_project_act.setShortcut(QKeySequence("Ctrl+S"))
+        self.save_project_act.triggered.connect(self._save_project)
+        file_menu.addAction(self.save_project_act)
 
         save_as_act = QAction("Save Project As...", self)
         save_as_act.setShortcut(QKeySequence("Ctrl+Shift+S"))
@@ -576,24 +763,24 @@ class MainWindow(QMainWindow):
         file_menu.addAction(project_props_act)
 
         file_menu.addSeparator()
-        add_pdf_act = QAction("Add/Open PDF Drawing...", self)
-        add_pdf_act.setShortcut(QKeySequence("Ctrl+O"))
-        add_pdf_act.triggered.connect(self._add_pdf_drawing)
-        file_menu.addAction(add_pdf_act)
+        self.add_pdf_act = QAction("Add/Open PDF Drawing...", self)
+        self.add_pdf_act.setShortcut(QKeySequence("Ctrl+O"))
+        self.add_pdf_act.triggered.connect(self._add_pdf_drawing)
+        file_menu.addAction(self.add_pdf_act)
 
         relink_act = QAction("Relink Current Drawing...", self)
         relink_act.triggered.connect(self._relink_drawing)
         file_menu.addAction(relink_act)
 
         file_menu.addSeparator()
-        export_pdf_act = QAction("Export Ballooned PDF...", self)
-        export_pdf_act.triggered.connect(self._export_ballooned_pdf)
-        file_menu.addAction(export_pdf_act)
+        self.export_pdf_act = QAction("Export Ballooned PDF...", self)
+        self.export_pdf_act.triggered.connect(self._export_ballooned_pdf)
+        file_menu.addAction(self.export_pdf_act)
 
-        export_excel_act = QAction("Export Excel Inspection Sheet...", self)
-        export_excel_act.setShortcut(QKeySequence("Ctrl+E"))
-        export_excel_act.triggered.connect(self._export_excel)
-        file_menu.addAction(export_excel_act)
+        self.export_excel_act = QAction("Export Excel Inspection Sheet...", self)
+        self.export_excel_act.setShortcut(QKeySequence("Ctrl+E"))
+        self.export_excel_act.triggered.connect(self._export_excel)
+        file_menu.addAction(self.export_excel_act)
 
         file_menu.addSeparator()
         exit_act = QAction("Exit", self)
@@ -649,30 +836,30 @@ class MainWindow(QMainWindow):
             self.theme_actions.addAction(action)
             action.triggered.connect(lambda checked, choice=theme: self._change_theme(choice))
         view_menu.addSeparator()
-        zoom_in_act = QAction("Zoom In", self)
-        zoom_in_act.setShortcut(QKeySequence("Ctrl+="))
-        zoom_in_act.triggered.connect(self.pdf_view.zoom_in)
-        view_menu.addAction(zoom_in_act)
+        self.zoom_in_act = QAction("Zoom In", self)
+        self.zoom_in_act.setShortcut(QKeySequence("Ctrl+="))
+        self.zoom_in_act.triggered.connect(self.pdf_view.zoom_in)
+        view_menu.addAction(self.zoom_in_act)
 
-        zoom_out_act = QAction("Zoom Out", self)
-        zoom_out_act.setShortcut(QKeySequence("Ctrl+-"))
-        zoom_out_act.triggered.connect(self.pdf_view.zoom_out)
-        view_menu.addAction(zoom_out_act)
+        self.zoom_out_act = QAction("Zoom Out", self)
+        self.zoom_out_act.setShortcut(QKeySequence("Ctrl+-"))
+        self.zoom_out_act.triggered.connect(self.pdf_view.zoom_out)
+        view_menu.addAction(self.zoom_out_act)
 
-        fit_page_act = QAction("Fit Page", self)
-        fit_page_act.setShortcut(QKeySequence("Ctrl+0"))
-        fit_page_act.triggered.connect(self.pdf_view.fit_page)
-        view_menu.addAction(fit_page_act)
+        self.fit_page_act = QAction("Fit Page", self)
+        self.fit_page_act.setShortcut(QKeySequence("Ctrl+0"))
+        self.fit_page_act.triggered.connect(self.pdf_view.fit_page)
+        view_menu.addAction(self.fit_page_act)
 
         actual_size_act = QAction("Actual Size (100%)", self)
         actual_size_act.triggered.connect(self.pdf_view.actual_size)
         view_menu.addAction(actual_size_act)
 
         view_menu.addSeparator()
-        rotate_cw_act = QAction("Rotate View Clockwise", self)
-        rotate_cw_act.setShortcut(QKeySequence("Ctrl+R"))
-        rotate_cw_act.triggered.connect(self.pdf_view.rotate_view_cw)
-        view_menu.addAction(rotate_cw_act)
+        self.rotate_cw_act = QAction("Rotate View Clockwise", self)
+        self.rotate_cw_act.setShortcut(QKeySequence("Ctrl+R"))
+        self.rotate_cw_act.triggered.connect(self.pdf_view.rotate_view_cw)
+        view_menu.addAction(self.rotate_cw_act)
 
         rotate_ccw_act = QAction("Rotate View Counterclockwise", self)
         rotate_ccw_act.setShortcut(QKeySequence("Ctrl+Shift+R"))
@@ -692,17 +879,21 @@ class MainWindow(QMainWindow):
 
         # Tools menu
         tools_menu = menu_bar.addMenu("&Tools")
-        auto_page_act = QAction("Auto-Balloon Current Page", self)
-        auto_page_act.triggered.connect(self._auto_balloon_current_page)
-        tools_menu.addAction(auto_page_act)
+        self.auto_page_act = QAction("Auto-Balloon Current Page", self)
+        self.auto_page_act.triggered.connect(self._auto_balloon_current_page)
+        tools_menu.addAction(self.auto_page_act)
 
-        auto_drawing_act = QAction("Auto-Balloon Entire Drawing", self)
-        auto_drawing_act.triggered.connect(self._auto_balloon_entire_drawing)
-        tools_menu.addAction(auto_drawing_act)
+        self.auto_drawing_act = QAction("Auto-Balloon Entire Drawing", self)
+        self.auto_drawing_act.triggered.connect(self._auto_balloon_entire_drawing)
+        tools_menu.addAction(self.auto_drawing_act)
 
         default_tol_act = QAction("Default Tolerances...", self)
         default_tol_act.triggered.connect(self._edit_default_tolerances)
         tools_menu.addAction(default_tol_act)
+
+        learned_symbols_act = QAction("Learned Symbols...", self)
+        learned_symbols_act.triggered.connect(self._show_learned_symbols_dialog)
+        tools_menu.addAction(learned_symbols_act)
 
         tools_menu.addSeparator()
         review_act = QAction("Review", self)
@@ -724,21 +915,23 @@ class MainWindow(QMainWindow):
         about_act.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_act)
 
-        for action, label in ((new_project_act, "New"), (open_project_act, "Open"),
-                              (save_project_act, "Save"), (add_pdf_act, "Add PDF"),
-                              (self.prev_page_action, "\u2039"), (self.next_page_action, "\u203a"),
-                              (zoom_in_act, "+"), (zoom_out_act, "\u2212"),
-                              (fit_page_act, "Fit"), (rotate_cw_act, "Rotate"),
-                              (auto_page_act, "Auto: Page"), (auto_drawing_act, "Auto: Drawing"),
-                              (export_pdf_act, "PDF"), (export_excel_act, "Excel")):
+        for action, label in ((self.new_project_act, "New"), (self.open_project_act, "Open"),
+                              (self.save_project_act, "Save"), (self.add_pdf_act, "Add PDF"),
+                              (self.prev_page_action, "\u2039"), (self.next_page_action, "\u203a")):
             action.setIconText(label)
 
         # Toolbar (subset of the most common actions)
         toolbar = QToolBar("Main")
+        toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
+        # Keep the primary command bar compact (36 px versus the previous
+        # 48 px), while leaving controls elsewhere in the app unchanged.
+        toolbar.setFixedHeight(36)
+        toolbar.setIconSize(QSize(16, 16))
         self.addToolBar(toolbar)
-        for act in (new_project_act, open_project_act, save_project_act, add_pdf_act):
+        for act in (self.new_project_act, self.open_project_act, self.save_project_act, self.add_pdf_act):
             toolbar.addAction(act)
+            toolbar.widgetForAction(act).setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         toolbar.addSeparator()
         toolbar.addAction(self.prev_page_action)
 
@@ -751,17 +944,35 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self.next_page_action)
 
         toolbar.addSeparator()
-        toolbar.addAction(zoom_in_act)
-        toolbar.addAction(zoom_out_act)
-        toolbar.addAction(fit_page_act)
-        toolbar.addAction(rotate_cw_act)
+        toolbar.addAction(self.zoom_out_act)
+        self.zoom_percent_label = QLabel("100%")
+        self.zoom_percent_label.setObjectName("zoomPercentLabel")
+        self.zoom_percent_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.zoom_percent_label.setMinimumWidth(44)
+        self.zoom_percent_label.setStyleSheet("border: 1px solid palette(mid); padding: 0px 6px;")
+        toolbar.addWidget(self.zoom_percent_label)
+        toolbar.addAction(self.zoom_in_act)
+        toolbar.addAction(self.fit_page_act)
+        toolbar.addAction(self.rotate_cw_act)
+        self.pdf_view.renderFinished.connect(self._update_zoom_percent_label)
         toolbar.addSeparator()
         toolbar.addAction(self.add_balloon_act)
-        toolbar.addAction(auto_page_act)
-        toolbar.addAction(auto_drawing_act)
+        toolbar.widgetForAction(self.add_balloon_act).setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+
+        self.auto_balloon_btn = QPushButton("Auto-Balloon")
+        auto_menu = QMenu(self.auto_balloon_btn)
+        auto_menu.addAction(self.auto_page_act)
+        auto_menu.addAction(self.auto_drawing_act)
+        self.auto_balloon_btn.setMenu(auto_menu)
+        toolbar.addWidget(self.auto_balloon_btn)
+
         toolbar.addSeparator()
-        toolbar.addAction(export_pdf_act)
-        toolbar.addAction(export_excel_act)
+        self.export_btn = QPushButton("Export")
+        export_menu = QMenu(self.export_btn)
+        export_menu.addAction(self.export_pdf_act)
+        export_menu.addAction(self.export_excel_act)
+        self.export_btn.setMenu(export_menu)
+        toolbar.addWidget(self.export_btn)
 
         toolbar.addSeparator()
         toolbar.addWidget(QLabel(" Drawing: "))
@@ -783,6 +994,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.balloon_size_spin)
         self.pdf_view.stamp_size_percent = self.settings.stamp_size_percent
 
+        self._apply_toolbar_icons()
+
     def _change_balloon_size(self, percent: int) -> None:
         self.settings.balloon_size_percent = percent
         self.settings.save()
@@ -794,6 +1007,28 @@ class MainWindow(QMainWindow):
         apply_theme(QApplication.instance(), theme)
         self.settings.theme = theme
         self.settings.save()
+        self._apply_toolbar_icons()
+
+    def _apply_toolbar_icons(self) -> None:
+        """(Re)draw the toolbar's code-drawn icons in the current theme's
+        ink color -- called once at startup and again on every theme
+        switch, since these are drawn in code (see _toolbar_icon) rather
+        than loaded from a themeable image asset.
+        """
+        color = QColor("#edf0f4" if self.settings.theme == "dark" else "#002049")
+        self.zoom_in_act.setIcon(_toolbar_icon("zoom-in", color))
+        self.zoom_out_act.setIcon(_toolbar_icon("zoom-out", color))
+        self.fit_page_act.setIcon(_toolbar_icon("fit", color))
+        self.rotate_cw_act.setIcon(_toolbar_icon("rotate", color))
+        self.new_project_act.setIcon(_toolbar_icon("new", color))
+        self.open_project_act.setIcon(_toolbar_icon("open", color))
+        self.save_project_act.setIcon(_toolbar_icon("save", color))
+        self.add_pdf_act.setIcon(_toolbar_icon("add-pdf", color))
+        self.add_balloon_act.setIcon(_toolbar_icon("add-balloon", color))
+        self.export_btn.setIcon(_toolbar_icon("export", color))
+
+    def _update_zoom_percent_label(self) -> None:
+        self.zoom_percent_label.setText(f"{round(self.pdf_view.zoom_level * 100)}%")
 
     # ------------------------------------------------------------------
     # Busy / progress
@@ -1408,7 +1643,10 @@ class MainWindow(QMainWindow):
                 b.status.capitalize(),
             ]
             for col, value in enumerate(values):
-                item = QTableWidgetItem(value)
+                # Column 6 is rendered by an editable QComboBox below. Keep
+                # its backing item text empty because the transparent combo
+                # otherwise paints over the same Method text and looks blurry.
+                item = QTableWidgetItem("" if col == 6 else value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, b.id)
@@ -1467,6 +1705,10 @@ class MainWindow(QMainWindow):
         if after:
             cmd = BalloonFieldChangeCommand(self.project, list(after.keys()), before, after, self._refresh_all, text=text)
             self.undo_stack.push(cmd)
+            for bid in after:
+                balloon = self._find_balloon(bid)
+                if balloon is not None:
+                    learn_from_balloon(balloon)
         self._refresh_all()
 
     def _accept_selected(self) -> None:
@@ -1520,10 +1762,51 @@ class MainWindow(QMainWindow):
         ):
             if not balloon.is_unchanged_from_prediction():
                 balloon.status = ReviewStatus.EDITED.value
+        if balloon.status in (ReviewStatus.ACCEPTED.value, ReviewStatus.EDITED.value):
+            learn_from_balloon(balloon)
+        self._maybe_learn_symbol_correction(balloon, before)
         after = balloon.to_dict()
         cmd = BalloonFieldChangeCommand(self.project, [balloon.id], {balloon.id: before}, {balloon.id: after}, self._refresh_all, text="Edit Balloon")
         self.undo_stack.push(cmd)
         self._refresh_all()
+
+    def _maybe_learn_symbol_correction(self, balloon: Balloon, before: dict) -> None:
+        """If this edit corrected a "font mangled a real symbol into an
+        unrelated letter" guess (see ocr_parser._resolve_learned_marker) to
+        a different characteristic type, offer to remember what that
+        marker letter actually means -- global, across every project --
+        so the same wrong guess isn't repeated on every other balloon that
+        uses this drawing's font, or the next drawing from the same source.
+        """
+        marker = balloon.guessed_symbol_marker
+        if not marker:
+            return
+        old_type = before.get("char_type")
+        new_type = balloon.char_type
+        if new_type == old_type or new_type not in _LEARNABLE_SYMBOL_TYPES:
+            return
+        if self.settings.learned_symbols.get(marker) == new_type:
+            return  # already knows this
+        reply = QMessageBox.question(
+            self, "Remember This Correction?",
+            f"You changed this balloon from \"{CharacteristicType.display_name(old_type)}\" to "
+            f"\"{CharacteristicType.display_name(new_type)}\".\n\n"
+            f"This looks like the drawing's font is substituting the real symbol with the letter "
+            f"\"{marker}\". Should BalloonIQ remember that \"{marker}\" means "
+            f"{CharacteristicType.display_name(new_type)} from now on, across all your projects?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.settings.learn_symbol(marker, new_type)
+            self.statusBar().showMessage(
+                f'Learned: "{marker}" means {CharacteristicType.display_name(new_type)} from now on.', 6000
+            )
+
+    def _show_learned_symbols_dialog(self) -> None:
+        dialog = LearnedSymbolsDialog(dict(self.settings.learned_symbols), parent=self)
+        dialog.exec()
+        for marker in dialog.forgotten_markers():
+            self.settings.forget_symbol(marker)
 
     def _add_manual_balloon(self) -> None:
         if self.project is None or self.drawing is None:
@@ -1787,14 +2070,18 @@ class MainWindow(QMainWindow):
             _auto_balloon_page_task, self._on_auto_balloon_page_done, "Auto-ballooning current page...",
             source_path, self.drawing.id, self.current_page, existing, start_number,
             self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(), default_tolerances,
+            self.settings.learned_symbols,
         )
 
     def _on_auto_balloon_page_done(self, result: AutoBalloonResult) -> None:
+        result.balloons, corrected, suppressed = apply_learned_feedback(result.balloons)
         if result.balloons and self.project is not None:
             cmd = AddBalloonsCommand(self.project, result.balloons, self._refresh_all, text="Auto-Balloon Page")
             self.undo_stack.push(cmd)
         self._refresh_all()
         message = result.message or f"Auto-balloon complete: {len(result.balloons)} proposal(s)."
+        if corrected or suppressed:
+            message += f" Learning applied {corrected} correction(s) and suppressed {suppressed} repeated false positive(s)."
         self.statusBar().showMessage(message, 8000)
         if not result.ocr_available:
             QMessageBox.information(self, "OCR Unavailable", message)
@@ -1821,9 +2108,15 @@ class MainWindow(QMainWindow):
             _auto_balloon_drawing_task, self._on_auto_balloon_drawing_done, "Auto-ballooning entire drawing...",
             source_path, self.drawing.id, self.drawing.page_count, existing, start_number,
             self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(), default_tolerances,
+            self.settings.learned_symbols,
         )
 
     def _on_auto_balloon_drawing_done(self, results: list[AutoBalloonResult]) -> None:
+        learned_corrected = learned_suppressed = 0
+        for result in results:
+            result.balloons, corrected, suppressed = apply_learned_feedback(result.balloons)
+            learned_corrected += corrected
+            learned_suppressed += suppressed
         all_balloons = [b for r in results for b in r.balloons]
         if all_balloons and self.project is not None:
             cmd = AddBalloonsCommand(self.project, all_balloons, self._refresh_all, text="Auto-Balloon Entire Drawing")
@@ -1833,6 +2126,8 @@ class MainWindow(QMainWindow):
         message = f"Auto-balloon complete: {len(all_balloons)} proposal(s) across {len(results)} page(s)."
         if pages_without_ocr:
             message += f" {pages_without_ocr} page(s) had no selectable text and OCR was unavailable."
+        if learned_corrected or learned_suppressed:
+            message += f" Learning applied {learned_corrected} correction(s) and suppressed {learned_suppressed} false positive(s)."
         self.statusBar().showMessage(message, 10000)
 
     # ------------------------------------------------------------------

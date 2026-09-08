@@ -12,6 +12,7 @@ from typing import Callable, Optional
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QDoubleValidator, QPixmap
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -28,6 +30,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -296,6 +300,80 @@ class DefaultTolerancesDialog(QDialog):
             "tol_by_decimal_places": by_places,
             "tol_angular": _parse_optional_float(self.angular_edit),
         }
+
+
+class LearnedSymbolsDialog(QDialog):
+    """Review/manage the marker-letter -> characteristic-type mappings
+    BalloonIQ has learned from confirmed corrections (see
+    AppSettings.learn_symbol).
+
+    When a drawing's font substitutes a real dimensioning symbol (Ø, ▼, ⌵,
+    ⌴, □) with an unrelated letter and that guess gets corrected, BalloonIQ
+    can remember what the letter actually means -- global across every
+    project, since the same CAD export tool/font produces the same
+    mangling everywhere. This dialog is purely for transparency and
+    cleanup: forgetting an entry here doesn't undo anything already
+    ballooned, it just stops that marker from being auto-resolved that way
+    on future drawings.
+    """
+
+    def __init__(self, learned_symbols: dict[str, str], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Learned Symbols")
+        self.setMinimumWidth(420)
+        self._forgotten: set[str] = set()
+
+        intro = QLabel(
+            "Symbols BalloonIQ has learned from your corrections, applied automatically across "
+            "every project from now on. Select one and click \"Forget Selected\" to stop applying it."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: gray;")
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["Marker", "Means"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        for marker, char_type in sorted(learned_symbols.items()):
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(marker))
+            self.table.setItem(row, 1, QTableWidgetItem(CharacteristicType.display_name(char_type)))
+
+        if learned_symbols:
+            empty_label = None
+        else:
+            empty_label = QLabel("Nothing learned yet -- correct a balloon's type when you spot a "
+                                  "mangled symbol and BalloonIQ will offer to remember it.")
+            empty_label.setWordWrap(True)
+            empty_label.setStyleSheet("color: gray;")
+
+        forget_btn = QPushButton("Forget Selected")
+        forget_btn.clicked.connect(self._forget_selected)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.accept)
+        buttons.accepted.connect(self.accept)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro)
+        if empty_label is not None:
+            layout.addWidget(empty_label)
+        layout.addWidget(self.table)
+        layout.addWidget(forget_btn)
+        layout.addWidget(buttons)
+
+    def _forget_selected(self) -> None:
+        rows = sorted({idx.row() for idx in self.table.selectionModel().selectedRows()}, reverse=True)
+        for row in rows:
+            marker_item = self.table.item(row, 0)
+            if marker_item:
+                self._forgotten.add(marker_item.text())
+            self.table.removeRow(row)
+
+    def forgotten_markers(self) -> set[str]:
+        return self._forgotten
 
 
 class BalloonEditDialog(QDialog):
@@ -568,6 +646,8 @@ class TeachTrainingDialog(QDialog):
             ("Manual Additions", stats.manual_additions),
             ("Labeled Pages Available for Export", stats.labeled_pages),
             ("Detector/Model Version(s) Used", ", ".join(stats.model_versions) or "none yet"),
+            ("Learned Corrections", stats.learned_corrections),
+            ("Repeated False Positives Suppressed", stats.suppressed_patterns),
         ]
 
         group = QGroupBox("Current Project Feedback Summary")
@@ -580,7 +660,9 @@ class TeachTrainingDialog(QDialog):
             "Exporting builds a YOLO-style dataset (images, .txt labels, class map, crops, "
             "and a manifest) from your reviewed balloons. Rejected proposals are recorded in "
             "the manifest for reference but are never exported as positive training labels.\n\n"
-            "This does not train a model -- see the README for the separate training workflow."
+            "Reviewed corrections are also saved to local learning memory and reused on matching "
+            "callouts. Two consistent rejections suppress that exact callout in future scans. "
+            "Neural-model training remains a separate, explicitly controlled workflow."
         )
         explanation.setWordWrap(True)
         explanation.setStyleSheet("color: gray;")

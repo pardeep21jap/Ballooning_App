@@ -15,6 +15,7 @@ Coordinate convention
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,28 @@ from typing import Optional
 import pymupdf as fitz  # PyMuPDF (import name predates the "pymupdf" package rename)
 
 logger = logging.getLogger("balloon_app.pdf_engine")
+
+# Creo / Pro/ENGINEER and some other CAD exporters wrap characters from
+# their legacy symbol font in SOH/STX control bytes.  Without a ToUnicode
+# map PyMuPDF faithfully returns the wrapper and its internal key (for
+# example ``\x01n\x02``) instead of the engineering symbol painted on the
+# page.  Normalize the well-known keys before the auto-balloon merger and
+# parser see them.
+_CAD_SYMBOL_KEYS = {
+    "n": "Ø",   # diameter
+    "x": "↧",   # depth
+    "$": "°",   # degree
+    "|": "|",   # feature-control-frame divider
+}
+_CAD_SYMBOL_ESCAPE_RE = re.compile(r"\x01(.)\x02", re.DOTALL)
+
+
+def normalize_cad_text(text: str) -> str:
+    """Translate legacy CAD symbol-font escapes into Unicode symbols."""
+    return _CAD_SYMBOL_ESCAPE_RE.sub(
+        lambda match: _CAD_SYMBOL_KEYS.get(match.group(1), match.group(1)),
+        text,
+    )
 
 POINTS_PER_INCH = 72.0
 
@@ -252,7 +275,7 @@ class PdfDocument:
         for block in raw.get("blocks", []):
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
-                    text = span.get("text", "").strip()
+                    text = normalize_cad_text(span.get("text", "")).strip()
                     if len(text) < min_chars:
                         continue
                     rect = fitz.Rect(span.get("bbox", (0, 0, 0, 0))) * rotation_matrix

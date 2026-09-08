@@ -65,6 +65,11 @@ _PIPE_DATUM_HINT_RE = re.compile(r"\d\s*\|\s*[A-Z]")
 # A short, bare integer with nothing else attached: "1", "2", "23", "(4)".
 # These are almost always zone/sheet/revision markers, not dimensions.
 _BARE_SHORT_INTEGER_RE = re.compile(r"^\(?\d{1,2}\)?$")
+# Whole-number dimensions in metric drawings are commonly three digits
+# (124, 135, 140, ...). Keep the narrower expression above for detecting
+# circled BOM item numbers, but allow these as dimension candidates when
+# page geometry proves they are not in the zone margin/title block.
+_BARE_DIMENSION_INTEGER_RE = re.compile(r"^\(?\d{1,3}\)?$")
 
 # Boilerplate phrases that appear only inside a drawing's title block, never
 # as an inspection characteristic in their own right. The title-block note
@@ -101,15 +106,80 @@ def _in_zone_margin(
     margin_fraction: float = 0.04,
 ) -> bool:
     """True if ``bbox`` sits within the thin zone/grid-reference margin
-    strip just inside a sheet edge (top, left, or right -- the bottom is
-    handled separately by the title-block cutoff), where ANSI/ISO Y14.1
+    strip just inside any sheet edge, where ANSI/ISO Y14.1
     zone letters/numbers ("1 2 3 4", "A B C D") are printed. A real
     dimension is never drawn in that margin.
     """
     x0, y0, x1, y1 = bbox
     margin_x = page_width * margin_fraction
     margin_y = page_height * margin_fraction
-    return y0 <= margin_y or x0 <= margin_x or x1 >= page_width - margin_x
+    return (
+        y0 <= margin_y
+        or y1 >= page_height - margin_y
+        or x0 <= margin_x
+        or x1 >= page_width - margin_x
+    )
+
+
+_TITLE_BLOCK_ANCHOR_RE = re.compile(
+    r"TOLERANCES UNLESS OTHERWISE (?:NOTED|SPECIFIED)|UNLESS OTHERWISE SPECIFIED|"
+    r"\bDRAWN(?: BY)?\b|\bCHECKED(?: BY)?\b|\bDESIGNED(?: BY)?\b|"
+    r"\bAPPROVED(?: BY)?\b|\bMODEL FILE NAME\b|\bPART NUMBER\b|"
+    r"\bPARTS? LIST\b|\bBILL OF MATERIALS?\b|\bBOM\b|^\s*TITLE\s*$",
+    re.IGNORECASE,
+)
+
+
+def _title_block_regions(
+    blocks: list[TextBlock], page_width: float, page_height: float
+) -> list[tuple[float, float, float, float]]:
+    """Infer spatial title-block/BOM regions without discarding a full band.
+
+    Many large CAD sheets place the title block in the lower-right while
+    legitimate drawing views continue at the same y coordinates on the
+    left.  The former single horizontal cutoff erased those dimensions.
+    An anchor in the left quarter still denotes a conventional full-width
+    bottom strip; a right-side anchor excludes only the area to its right.
+    """
+    anchors = [
+        block for block in blocks
+        if block.bbox[1] > page_height * 0.5 and _TITLE_BLOCK_ANCHOR_RE.search(block.text)
+    ]
+    regions: list[tuple[float, float, float, float]] = []
+    left_anchors = [block for block in anchors if block.bbox[0] <= page_width * 0.25]
+    if left_anchors:
+        # Conventional full-width title strip.
+        regions.append((0.0, min(block.bbox[1] for block in left_anchors) - 4.0, page_width, page_height))
+
+    right_anchors = [block for block in anchors if block.bbox[0] > page_width * 0.25]
+    if right_anchors:
+        # The anchor text generally sits inside the grid, not at its top-left
+        # corner. Expand up and left to cover the full bordered title block.
+        # A fixed page-width fraction here badly undershoots on smaller
+        # sheets: an A4 title block commonly starts around 35-40% of the
+        # page width even though its "UNLESS OTHERWISE SPECIFIED"-style
+        # anchor text sits further right, inside the box, around 55-60%.
+        # Scaling the left edge off the anchor's own x-position (rather
+        # than a page-wide constant) tracks that relationship regardless
+        # of sheet size.
+        anchor_left = min(block.bbox[0] for block in right_anchors)
+        region_left = max(page_width * 0.25, anchor_left * 0.65)
+        regions.append((
+            region_left,
+            max(page_height * 0.5, min(block.bbox[1] for block in right_anchors) - page_height * 0.10),
+            page_width,
+            page_height,
+        ))
+    return regions
+
+
+def _bbox_in_regions(
+    bbox: tuple[float, float, float, float],
+    regions: list[tuple[float, float, float, float]],
+) -> bool:
+    cx = (bbox[0] + bbox[2]) / 2.0
+    cy = (bbox[1] + bbox[3]) / 2.0
+    return any(x0 <= cx <= x1 and y0 <= cy <= y1 for x0, y0, x1, y1 in regions)
 
 
 def _title_block_cutoff_y(blocks: list[TextBlock], page_height: float) -> Optional[float]:
@@ -128,10 +198,7 @@ def _title_block_cutoff_y(blocks: list[TextBlock], page_height: float) -> Option
     covered the same way, as long as its heading sits no lower than the
     title block's own topmost boilerplate line.
     """
-    matches = [
-        b for b in blocks
-        if b.bbox[1] > page_height * 0.5 and _TITLE_BLOCK_KEYWORDS_RE.search(b.text)
-    ]
+    matches = [b for b in blocks if b.bbox[1] > page_height * 0.5 and _TITLE_BLOCK_ANCHOR_RE.search(b.text)]
     if not matches:
         return None
     return min(b.bbox[1] for b in matches) - 4.0  # small padding above the topmost match
@@ -159,7 +226,7 @@ def _looks_like_characteristic(
     text = text.strip()
     if not text or len(text) > 120:
         return False
-    if _BARE_SHORT_INTEGER_RE.match(text):
+    if _BARE_DIMENSION_INTEGER_RE.match(text):
         if bbox is not None and page_size is not None and not _in_zone_margin(bbox, *page_size):
             return True
         return False
@@ -446,6 +513,7 @@ def _merge_nearby_text_blocks(blocks: list[TextBlock], y_tol: float = 3.0, x_gap
 
 
 _BARE_SIGNED_NUM_RE = re.compile(rf"^\s*([+-])\s*({NUM})\s*$")
+_BARE_UNSIGNED_ZERO_RE = re.compile(r"^\s*((?:0?\.0+)|0)\s*$")
 # A +/- value embedded *within* a larger block's text, e.g. the "-0.010" in
 # an already same-line-merged "Ø6.38 -0.010" -- used to pull out and
 # reorder a sign that's already part of the anchor block, so it isn't
@@ -537,7 +605,18 @@ def _merge_stacked_tolerance_fragments(
     asymmetric-tolerance parser (which requires + before -) then fails to
     recognize as a tolerance at all.
     """
-    is_sign_fragment = [bool(_BARE_SIGNED_NUM_RE.match(b.text)) for b in blocks]
+    is_signed_fragment = [bool(_BARE_SIGNED_NUM_RE.match(b.text)) for b in blocks]
+    # A zero upper deviation is sometimes written without an explicit plus
+    # sign. It is tolerance only when a signed sibling is nearby, so an
+    # independent 0.000 ordinate dimension remains independent.
+    is_unsigned_zero = [bool(_BARE_UNSIGNED_ZERO_RE.match(b.text)) for b in blocks]
+    is_sign_fragment = [
+        signed or (is_unsigned_zero[i] and any(
+            is_signed_fragment[j] and _bboxes_are_near(b.bbox, blocks[j].bbox, y_gap * 2, x_slack)
+            for j in range(len(blocks)) if j != i
+        ))
+        for i, (b, signed) in enumerate(zip(blocks, is_signed_fragment))
+    ]
     has_digit = [bool(re.search(r"\d", b.text)) for b in blocks]
 
     # Each fragment picks its single closest eligible anchor, rather than
@@ -573,8 +652,17 @@ def _merge_stacked_tolerance_fragments(
         # rather than silently dropped, which previously left it behind as
         # its own stray candidate/balloon.
         extra_idx = extra_sign = None
+
+        def fragment_parts(j: int) -> tuple[str, str]:
+            match = _BARE_SIGNED_NUM_RE.match(blocks[j].text)
+            if match:
+                return match.group(1), match.group(2)
+            frag_y = (blocks[j].bbox[1] + blocks[j].bbox[3]) / 2.0
+            nominal_y = (nominal.bbox[1] + nominal.bbox[3]) / 2.0
+            return ("+" if frag_y < nominal_y else "-"), blocks[j].text.strip()
+
         for j in assigned:
-            sign = _BARE_SIGNED_NUM_RE.match(blocks[j].text).group(1)
+            sign, _value = fragment_parts(j)
             if sign == "+" and plus_idx is None:
                 plus_idx = j
             elif sign == "-" and minus_idx is None:
@@ -599,16 +687,16 @@ def _merge_stacked_tolerance_fragments(
 
         combined_bbox = nominal.bbox
         if plus_idx is not None:
-            plus_val = _BARE_SIGNED_NUM_RE.match(blocks[plus_idx].text).group(2)
+            _sign, plus_val = fragment_parts(plus_idx)
             combined_bbox = _union_bbox(combined_bbox, blocks[plus_idx].bbox)
             used.add(plus_idx)
         if minus_idx is not None:
-            minus_val = _BARE_SIGNED_NUM_RE.match(blocks[minus_idx].text).group(2)
+            _sign, minus_val = fragment_parts(minus_idx)
             combined_bbox = _union_bbox(combined_bbox, blocks[minus_idx].bbox)
             used.add(minus_idx)
         extra_val = None
         if extra_idx is not None:
-            extra_val = _BARE_SIGNED_NUM_RE.match(blocks[extra_idx].text).group(2)
+            _sign, extra_val = fragment_parts(extra_idx)
             combined_bbox = _union_bbox(combined_bbox, blocks[extra_idx].bbox)
             used.add(extra_idx)
 
@@ -718,6 +806,7 @@ def auto_balloon_page(
     tesseract_path: Optional[str] = None,
     detector: Optional[BaseDetector] = None,
     default_tolerances: Optional[DefaultTolerances] = None,
+    learned_symbols: Optional[dict[str, str]] = None,
 ) -> AutoBalloonResult:
     """Run the full auto-balloon pipeline for a single page.
 
@@ -732,6 +821,10 @@ def auto_balloon_page(
     the resulting limits) on any detected dimension that has a nominal but
     no explicit tolerance of its own -- e.g. "9X Ø0.250 THRU" relying on the
     drawing's general "X.XXX: ±0.005" title-block note.
+
+    ``learned_symbols``, when given, is passed straight through to
+    parse_characteristics for the "font mangled a real symbol into an
+    unrelated letter" fallbacks -- see AppSettings.learn_symbol.
 
     Returns proposed balloons (status=pending, source=auto) plus a status
     message suitable for display in the UI status bar. Never raises for
@@ -762,8 +855,9 @@ def auto_balloon_page(
     except Exception:
         page_width = page_height = None
     page_size = (page_width, page_height) if page_width and page_height else None
-    title_block_cutoff_y = (
-        _title_block_cutoff_y(native_blocks, page_height) if page_height else None
+    title_block_regions = (
+        _title_block_regions(native_blocks, page_width, page_height)
+        if page_width and page_height else []
     )
 
     # Some CAD PDF exports draw the diameter (Ø) glyph as vector line art
@@ -789,7 +883,7 @@ def auto_balloon_page(
     # geometry check is comparatively expensive to run on every block.
     item_balloon_hint_bboxes: list[tuple[float, float, float, float]] = []
     for block in native_blocks:
-        if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
+        if _bbox_in_regions(block.bbox, title_block_regions):
             continue
         if pdf_doc.find_vector_diameter_symbol(page_number, block.bbox):
             diameter_hint_bboxes.append(block.bbox)
@@ -805,7 +899,7 @@ def auto_balloon_page(
     merged_native_blocks = _merge_stacked_tolerance_fragments(_merge_nearby_text_blocks(native_blocks))
 
     for block in merged_native_blocks:
-        if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
+        if _bbox_in_regions(block.bbox, title_block_regions):
             continue  # inside the title block -- never a real characteristic
         if any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in item_balloon_hint_bboxes):
             continue  # circled item-reference number, not a dimension
@@ -851,7 +945,7 @@ def auto_balloon_page(
                 # OCR boxes are inherently ink-backed (Tesseract only reports
                 # boxes where it found glyphs), so no extra ink check needed.
                 bbox_pdf = rect_pixel_to_pdf(det.bbox, dpi)
-                if title_block_cutoff_y is not None and bbox_pdf[1] >= title_block_cutoff_y:
+                if _bbox_in_regions(bbox_pdf, title_block_regions):
                     continue  # inside the title block -- never a real characteristic
                 candidates.append(
                     Detection(bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text)
@@ -869,7 +963,7 @@ def auto_balloon_page(
             frame_used_ocr = False
             cell_texts = []
             cell_boxes = [rect_pixel_to_pdf(cell, dpi) for cell in frame.cells]
-            if title_block_cutoff_y is not None and cell_boxes[0][1] >= title_block_cutoff_y:
+            if _bbox_in_regions(cell_boxes[0], title_block_regions):
                 continue
             for cell, box in zip(frame.cells, cell_boxes):
                 spans = [b for b in native_blocks if _bbox_center_within(b.bbox, box)]
@@ -936,7 +1030,8 @@ def auto_balloon_page(
         parsed_list = (
             parse_characteristics((SYMBOLS[det.gdt_symbol_hint] + " " if det.gdt_symbol_hint
                                    else "⏥ " if det.flatness_hint else "") + raw_text,
-                                  diameter_hint=det.diameter_hint, gdt_frame_hint=det.gdt_frame_hint)
+                                  diameter_hint=det.diameter_hint, gdt_frame_hint=det.gdt_frame_hint,
+                                  learned_symbols=learned_symbols)
             if raw_text
             else [None]
         )
@@ -980,6 +1075,7 @@ def auto_balloon_page(
                 datums=parsed.datums if parsed else None,
                 surface_finish=parsed.surface_finish if parsed else None,
                 thread_callout=parsed.thread_callout if parsed else None,
+                guessed_symbol_marker=parsed.guessed_symbol_marker if parsed else None,
                 note=(parsed.note if parsed else "") or ("Detected by ML model; please fill in details." if not raw_text else ""),
                 source=BalloonSource.AUTO.value,
                 model_version=RULES_OCR_MODEL_VERSION,

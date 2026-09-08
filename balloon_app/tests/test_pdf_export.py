@@ -330,10 +330,10 @@ def _stamp_texts(output_path) -> list[str]:
     return [s["text"].strip() for s in spans if s["text"].strip() == STAMP_TEXT]
 
 
-def test_stamp_hidden_unless_every_balloon_is_accepted(tmp_path):
+def test_stamp_hidden_until_every_balloon_is_reviewed(tmp_path):
     """The "Ballooned Drawing" stamp certifies the drawing as fully
     reviewed, so it must not appear on the export -- not on any page --
-    while any balloon isn't Accepted, including right after adding a PDF
+    while any balloon is Pending or Rejected, including right after adding a PDF
     drawing before anything has been ballooned at all (no balloons yet).
     """
     source_path = tmp_path / "source.pdf"
@@ -347,7 +347,7 @@ def test_stamp_hidden_unless_every_balloon_is_accepted(tmp_path):
     export_ballooned_pdf(drawing, [], no_balloons_out)
     assert not _stamp_texts(no_balloons_out), "stamp must not appear with no balloons at all"
 
-    for status in (ReviewStatus.PENDING.value, ReviewStatus.EDITED.value, ReviewStatus.REJECTED.value):
+    for status in (ReviewStatus.PENDING.value, ReviewStatus.REJECTED.value):
         mixed_out = tmp_path / f"mixed_{status}.pdf"
         balloons = [
             Balloon(drawing_id=drawing.id, page_number=0, status=ReviewStatus.ACCEPTED.value),
@@ -363,6 +363,11 @@ def test_stamp_hidden_unless_every_balloon_is_accepted(tmp_path):
     ]
     export_ballooned_pdf(drawing, balloons, all_accepted_out)
     assert _stamp_texts(all_accepted_out), "stamp must appear once every balloon is Accepted"
+
+    edited_out = tmp_path / "edited.pdf"
+    balloons[1].status = ReviewStatus.EDITED.value
+    export_ballooned_pdf(drawing, balloons, edited_out)
+    assert _stamp_texts(edited_out), "an edited/reviewed balloon must allow the stamp"
 
 
 def test_stamp_is_rendered_in_top_left_corner(tmp_path):

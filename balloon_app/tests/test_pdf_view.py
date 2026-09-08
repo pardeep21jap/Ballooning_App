@@ -90,12 +90,12 @@ def test_stamp_item_appears_top_left_and_scales_with_stamp_size():
         app.processEvents()
 
 
-def test_stamp_hidden_unless_every_balloon_is_accepted():
+def test_stamp_hidden_until_every_balloon_is_reviewed():
     """The "Ballooned Drawing" badge certifies the drawing as fully
-    reviewed, so it must stay hidden while any balloon isn't Accepted --
+    reviewed, so it must stay hidden while any balloon is Pending or Rejected --
     including while there are no balloons at all, e.g. right after adding a
     PDF drawing, before anything has been ballooned or reviewed -- and
-    appear only once every balloon's status is exactly Accepted.
+    and appear when every balloon is Accepted or Edited.
     """
     app = QApplication.instance() or QApplication([])
     view = PdfGraphicsView()
@@ -104,7 +104,7 @@ def test_stamp_hidden_unless_every_balloon_is_accepted():
         view._on_rendered(view._request_counter, pixels, 200, 200, 96)
         assert view._stamp_item is None, "stamp must not appear with no balloons at all"
 
-        for status in (ReviewStatus.PENDING.value, ReviewStatus.EDITED.value, ReviewStatus.REJECTED.value):
+        for status in (ReviewStatus.PENDING.value, ReviewStatus.REJECTED.value):
             view.refresh_balloons([
                 Balloon(status=ReviewStatus.ACCEPTED.value),
                 Balloon(status=status),
@@ -116,6 +116,12 @@ def test_stamp_hidden_unless_every_balloon_is_accepted():
             Balloon(status=ReviewStatus.ACCEPTED.value),
         ])
         assert view._stamp_item is not None, "stamp must appear once every balloon is Accepted"
+
+        view.refresh_balloons([
+            Balloon(status=ReviewStatus.ACCEPTED.value),
+            Balloon(status=ReviewStatus.EDITED.value),
+        ])
+        assert view._stamp_item is not None, "an edited/reviewed balloon must allow the stamp"
 
         # Regressing a single balloon back to pending must hide it again.
         view.refresh_balloons([

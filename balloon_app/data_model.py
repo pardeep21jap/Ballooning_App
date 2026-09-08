@@ -113,6 +113,14 @@ class Balloon:
     surface_finish: Optional[str] = None
     thread_callout: Optional[str] = None
 
+    # The mangled letter a "font substituted the real symbol" guess (see
+    # ocr_parser._resolve_learned_marker) read this balloon's char_type
+    # from, preserved even though raw_text shows the resolved canonical
+    # symbol -- so correcting the guess can teach AppSettings.learn_symbol
+    # what that marker actually means, instead of repeating the same wrong
+    # guess on every future drawing that uses this font. None otherwise.
+    guessed_symbol_marker: Optional[str] = None
+
     note: str = ""
     inspection_method: str = ""
     critical: bool = False

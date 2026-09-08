@@ -611,7 +611,8 @@ class PdfGraphicsView(QGraphicsView):
             return
 
         all_accepted = bool(self._current_balloons) and all(
-            b.status == ReviewStatus.ACCEPTED.value for b in self._current_balloons
+            b.status in (ReviewStatus.ACCEPTED.value, ReviewStatus.EDITED.value)
+            for b in self._current_balloons
         )
         if not all_accepted:
             if self._stamp_item is not None:
