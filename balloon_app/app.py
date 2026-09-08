@@ -10,8 +10,20 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QUndoCommand, QUndoStack
+from PyQt6.QtCore import QSize, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QActionGroup,
+    QBrush,
+    QColor,
+    QFont,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QUndoCommand,
+    QUndoStack,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -24,6 +36,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QMenu,
     QProgressBar,
     QPushButton,
     QSpinBox,
@@ -36,7 +49,7 @@ from PyQt6.QtWidgets import (
 )
 
 from balloon_app.auto_balloon import AutoBalloonResult, auto_balloon_page
-from balloon_app.config import AppSettings, PROJECTS_DIR, setup_logging
+from balloon_app.config import AppSettings, PROJECTS_DIR, setup_logging, status_color
 from balloon_app.data_model import (
     Balloon,
     BalloonSource,
@@ -77,6 +90,49 @@ SORT_OPTIONS = ["Page", "Number", "Confidence", "Status"]
 def _sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"[^\w\-. ]", "_", name).strip().strip(".")
     return cleaned.replace(" ", "_") or "project"
+
+
+_BADGE_ICON_SIZE = 22
+
+
+def _balloon_number_badge(number: int, source: str, status: str) -> QIcon:
+    """A small filled circle with the balloon's number, in the same color
+    as its on-canvas marker (see config.status_color) -- so the review
+    table reads as an index into the drawing rather than a bare row count.
+    """
+    r, g, b, a = status_color(source, status)
+    size = _BADGE_ICON_SIZE
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QBrush(QColor(r, g, b, a)))
+    painter.drawEllipse(1, 1, size - 2, size - 2)
+    painter.setPen(QColor("#ffffff"))
+    font = QFont()
+    font.setBold(True)
+    font.setPointSizeF(8.5 if number < 100 else 7.0)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), str(number))
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _status_chip_colors(source: str, status: str) -> tuple[QColor, QColor]:
+    """A pastel background + a matching dark foreground for the Status
+    column, blended from the same status_color used for the on-canvas
+    marker -- a lighter reading of the exact same semantic color, not a
+    separate palette to keep in sync."""
+    r, g, b, _a = status_color(source, status)
+    tint = 0.72
+    background = QColor(
+        round(r + (255 - r) * tint),
+        round(g + (255 - g) * tint),
+        round(b + (255 - b) * tint),
+    )
+    foreground = QColor(r, g, b).darker(135)
+    return background, foreground
 
 
 # ---------------------------------------------------------------------------
@@ -367,9 +423,9 @@ class MainWindow(QMainWindow):
         # empty canvas has a tiny hint while the review controls have a
         # large one, so explicitly seed the intended starting widths.
         splitter.setChildrenCollapsible(False)
-        splitter.setSizes([900, 540])
+        splitter.setSizes([720, 720])
         splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(1, 0)
         self.setCentralWidget(splitter)
 
         self.progress_bar = QProgressBar()
@@ -379,15 +435,44 @@ class MainWindow(QMainWindow):
 
     def _build_review_panel(self) -> QWidget:
         panel = QWidget()
+        panel.setObjectName("reviewPanel")
+        panel.setMinimumWidth(560)
         layout = QVBoxLayout(panel)
+        layout.setContentsMargins(18, 16, 18, 12)
+        layout.setSpacing(12)
+
+        heading = QHBoxLayout()
+        title = QLabel("CHARACTERISTICS")
+        title.setObjectName("panelTitle")
+        heading.addWidget(title)
+        heading.addStretch()
+        self.review_count = QLabel("0 of 0 reviewed")
+        self.review_count.setObjectName("mutedLabel")
+        heading.addWidget(self.review_count)
+        layout.addLayout(heading)
+        self.review_progress = QProgressBar()
+        self.review_progress.setObjectName("reviewProgress")
+        self.review_progress.setRange(0, 100)
+        self.review_progress.setValue(0)
+        self.review_progress.setTextVisible(False)
+        self.review_progress.setFixedHeight(6)
+        layout.addWidget(self.review_progress)
+        self.review_legend = QLabel("0 accepted   \u00b7   0 edited   \u00b7   0 rejected   \u00b7   0 pending")
+        self.review_legend.setObjectName("mutedLabel")
+        layout.addWidget(self.review_legend)
 
         filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search balloon #, text, or nominal")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._refresh_review_table)
+        filter_row.addWidget(self.search_edit, 1)
         filter_row.addWidget(QLabel("Filter:"))
         self.filter_combo = QComboBox()
         self.filter_combo.addItems(STATUS_FILTER_OPTIONS)
         self.filter_combo.currentIndexChanged.connect(self._refresh_review_table)
         filter_row.addWidget(self.filter_combo)
-
         filter_row.addWidget(QLabel("Sort:"))
         self.sort_combo = QComboBox()
         self.sort_combo.addItems(SORT_OPTIONS)
@@ -395,72 +480,64 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(self.sort_combo)
         layout.addLayout(filter_row)
 
-        search_row = QHBoxLayout()
-        search_row.addWidget(QLabel("Search:"))
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Balloon #, text, or nominal...")
-        self.search_edit.textChanged.connect(self._refresh_review_table)
-        search_row.addWidget(self.search_edit)
-        layout.addLayout(search_row)
-
         self.review_table = ReviewTable(0, 8, self._on_review_rows_dropped)
         self.review_table.setHorizontalHeaderLabels(
-            ["Balloon #", "Page", "Type", "Raw Text", "Nominal", "Tolerance", "Inspection Method", "Status"]
+            ["No.", "Page", "Type", "Raw text", "Nominal", "Tol.", "Method", "Status"]
         )
         self.review_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.review_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.review_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.review_table.setAlternatingRowColors(False)
+        self.review_table.setShowGrid(False)
+        self.review_table.verticalHeader().hide()
+        self.review_table.verticalHeader().setDefaultSectionSize(38)
+        self.review_table.setWordWrap(False)
+        self.review_table.setObjectName("reviewTable")
+        self.review_table.setIconSize(QSize(_BADGE_ICON_SIZE, _BADGE_ICON_SIZE))
         self.review_table.itemSelectionChanged.connect(self._on_table_selection_changed)
         self.review_table.doubleClicked.connect(lambda _i: self._edit_selected_balloon())
         layout.addWidget(self.review_table, stretch=1)
 
         reorder_hint = QLabel("Drag a row to renumber balloons to match (Filter must be \"All\").")
-        reorder_hint.setStyleSheet("color: gray; font-size: 10px;")
+        reorder_hint.setObjectName("mutedLabel")
         layout.addWidget(reorder_hint)
 
-        row1 = QHBoxLayout()
-        accept_btn = QPushButton("Accept")
-        accept_btn.clicked.connect(self._accept_selected)
-        edit_btn = QPushButton("Edit")
-        edit_btn.clicked.connect(self._edit_selected_balloon)
-        reject_btn = QPushButton("Reject")
-        reject_btn.clicked.connect(self._reject_selected)
-        add_btn = QPushButton("Add Manual")
-        add_btn.clicked.connect(self._add_manual_balloon)
-        row1.addWidget(accept_btn)
-        row1.addWidget(edit_btn)
-        row1.addWidget(reject_btn)
-        row1.addWidget(add_btn)
-        layout.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        accept_all_btn = QPushButton("Accept All Above Threshold...")
-        accept_all_btn.clicked.connect(self._accept_all_above_threshold)
-        reject_all_btn = QPushButton("Reject Selected/Pending")
-        reject_all_btn.clicked.connect(self._reject_all_selected_or_pending)
-        row2.addWidget(accept_all_btn)
-        row2.addWidget(reject_all_btn)
-        layout.addLayout(row2)
-
-        row3 = QHBoxLayout()
-        duplicate_btn = QPushButton("Duplicate")
-        duplicate_btn.clicked.connect(self._duplicate_selected_balloon)
-        split_btn = QPushButton("Split Balloon")
-        split_btn.setToolTip(
-            "Re-run automatic detection on this balloon's raw drawing text and, if it now "
-            "recognizes more than one characteristic (e.g. a hole's diameter and its depth), "
-            "replace this balloon with one properly-typed balloon per characteristic."
-        )
-        split_btn.clicked.connect(self._split_selected_balloon)
-        delete_btn = QPushButton("Delete")
-        delete_btn.clicked.connect(self._delete_selected_balloons)
-        renumber_btn = QPushButton("Renumber...")
-        renumber_btn.clicked.connect(self._show_renumber_dialog)
-        row3.addWidget(duplicate_btn)
-        row3.addWidget(split_btn)
-        row3.addWidget(delete_btn)
-        row3.addWidget(renumber_btn)
-        layout.addLayout(row3)
+        action_bar = QWidget()
+        action_bar.setObjectName("reviewActions")
+        row = QHBoxLayout(action_bar)
+        row.setContentsMargins(0, 12, 0, 0)
+        row.setSpacing(8)
+        for label, callback in (("Accept", self._accept_selected),
+                                ("Reject", self._reject_selected),
+                                ("Edit", self._edit_selected_balloon)):
+            button = QPushButton(label)
+            button.setMinimumHeight(34)
+            if label == "Accept":
+                button.setObjectName("primaryButton")
+            button.clicked.connect(callback)
+            row.addWidget(button)
+        row.addStretch()
+        more = QPushButton("More")
+        more.setMinimumHeight(34)
+        menu = QMenu(more)
+        for label, callback in (
+            ("Accept All Above Threshold...", self._accept_all_above_threshold),
+            ("Reject Selected/Pending", self._reject_all_selected_or_pending),
+            (None, None),
+            ("Add Manual", self._add_manual_balloon),
+            ("Duplicate", self._duplicate_selected_balloon),
+            ("Split Balloon", self._split_selected_balloon),
+            (None, None),
+            ("Renumber...", self._show_renumber_dialog),
+            ("Delete", self._delete_selected_balloons),
+        ):
+            if label is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(label).triggered.connect(callback)
+        more.setMenu(menu)
+        row.addWidget(more)
+        layout.addWidget(action_bar)
 
         return panel
 
@@ -646,6 +723,15 @@ class MainWindow(QMainWindow):
         about_act = QAction("About BalloonIQ", self)
         about_act.triggered.connect(self._show_about_dialog)
         help_menu.addAction(about_act)
+
+        for action, label in ((new_project_act, "New"), (open_project_act, "Open"),
+                              (save_project_act, "Save"), (add_pdf_act, "Add PDF"),
+                              (self.prev_page_action, "\u2039"), (self.next_page_action, "\u203a"),
+                              (zoom_in_act, "+"), (zoom_out_act, "\u2212"),
+                              (fit_page_act, "Fit"), (rotate_cw_act, "Rotate"),
+                              (auto_page_act, "Auto: Page"), (auto_drawing_act, "Auto: Drawing"),
+                              (export_pdf_act, "PDF"), (export_excel_act, "Excel")):
+            action.setIconText(label)
 
         # Toolbar (subset of the most common actions)
         toolbar = QToolBar("Main")
@@ -1299,7 +1385,16 @@ class MainWindow(QMainWindow):
 
     def _refresh_review_table(self) -> None:
         balloons = self._filtered_sorted_balloons()
+        all_balloons = self.project.balloons_for(self.drawing.id) if self.project and self.drawing else []
+        counts = {status.value: sum(b.status == status.value for b in all_balloons) for status in ReviewStatus}
+        total = len(all_balloons)
+        pending = counts.get("pending", 0)
+        reviewed = total - pending
+        self.review_count.setText(f"{reviewed} of {total} reviewed")
+        self.review_progress.setValue(round(100 * reviewed / total) if total else 0)
+        self.review_legend.setText("   \u00b7   ".join(f"{counts.get(status, 0)} {status}" for status in ("accepted", "edited", "rejected", "pending")))
         table = self.review_table
+        table.setColumnHidden(1, not self.drawing or self.drawing.page_count <= 1)
         table.setRowCount(len(balloons))
         for row, b in enumerate(balloons):
             values = [
@@ -1317,6 +1412,19 @@ class MainWindow(QMainWindow):
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, b.id)
+                    item.setIcon(_balloon_number_badge(b.number, b.source, b.status))
+                    item.setText("")
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                elif col == 7:
+                    background, foreground = _status_chip_colors(b.source, b.status)
+                    item.setBackground(background)
+                    item.setForeground(foreground)
+                    chip_font = item.font()
+                    chip_font.setBold(True)
+                    item.setFont(chip_font)
+                item.setToolTip(str(value))
+                if col in (4, 5):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 table.setItem(row, col, item)
             method_combo = QComboBox(table)
             method_combo.addItems(COMMON_INSPECTION_METHODS)
@@ -1328,7 +1436,8 @@ class MainWindow(QMainWindow):
                 lambda method, balloon_id=b.id: self._set_inspection_method(balloon_id, method)
             )
             table.setCellWidget(row, 6, method_combo)
-        table.resizeColumnsToContents()
+        for column, width in ((0, 48), (1, 48), (2, 108), (4, 76), (5, 76), (6, 124), (7, 88)):
+            table.setColumnWidth(column, width)
 
     def _set_inspection_method(self, balloon_id: str, method: str) -> None:
         balloon = self._find_balloon(balloon_id)

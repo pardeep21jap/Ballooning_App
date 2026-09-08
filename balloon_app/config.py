@@ -140,7 +140,7 @@ class AppSettings:
     max_recent_projects: int = 10
     balloon_size_percent: int = 100
     stamp_size_percent: int = 100
-    theme: str = "dark"
+    theme: str = "light"
 
     @classmethod
     def load(cls) -> "AppSettings":
@@ -161,7 +161,7 @@ class AppSettings:
             recent_projects=recent,
             balloon_size_percent=max(50, min(200, int(qs.value("balloon_size_percent", 100, type=int)))),
             stamp_size_percent=max(50, min(200, int(qs.value("stamp_size_percent", 100, type=int)))),
-            theme="light" if qs.value("theme", "dark", type=str) == "light" else "dark",
+            theme="dark" if qs.value("theme", "light", type=str) == "dark" else "light",
         )
 
     def save(self) -> None:

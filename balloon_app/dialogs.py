@@ -189,6 +189,8 @@ class _ToleranceRow(QWidget):
 
         remove_btn = QPushButton("✕")
         remove_btn.setFixedWidth(28)
+        remove_btn.setStyleSheet("QPushButton { padding: 0px; font-size: 16px; }")
+        remove_btn.setAccessibleName("Remove tolerance row")
         remove_btn.setToolTip("Remove this row")
         remove_btn.clicked.connect(lambda: self.removed.emit(self))
         layout.addWidget(remove_btn)
