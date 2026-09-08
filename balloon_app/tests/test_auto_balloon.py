@@ -4,10 +4,17 @@ auto-balloon pipeline's ability to reject stray/invisible text artifacts.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
-from balloon_app.auto_balloon import _bbox_has_ink, _merge_stacked_tolerance_fragments, auto_balloon_page
+from balloon_app.auto_balloon import (
+    _bbox_has_ink,
+    _merge_nearby_text_blocks,
+    _merge_stacked_tolerance_fragments,
+    auto_balloon_page,
+)
 from balloon_app.data_model import CharacteristicType
 from balloon_app.ocr_parser import DefaultTolerances
 from balloon_app.pdf_engine import PdfDocument, TextBlock
@@ -290,6 +297,38 @@ class TestTitleBlockExclusion:
         assert any("0.750" in t for t in raw_texts)
         assert not any("TOLERANCES" in t or "FRACTIONAL" in t or "A2048" in t for t in raw_texts)
 
+    def test_parts_list_table_is_not_ballooned(self, tmp_path):
+        """A Parts List / Bill of Materials table's ITEM/QTY/PART NUMBER
+        columns are bare numbers and codes that otherwise look exactly like
+        real dimensions -- they must never be auto-ballooned, matching the
+        title block itself. The table is typically its own box stacked
+        directly above the title block rather than part of it.
+        """
+        pdf_path = tmp_path / "with_parts_list.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=800)
+        # A real dimension, well above the parts list / title block.
+        page.insert_text((50, 200), "0.750 ±0.005", fontsize=12)
+        # The parts list table, above the title block strip.
+        page.insert_text((400, 580), "Parts List", fontsize=10)
+        page.insert_text((400, 595), "ITEM  QTY  PART NUMBER  DESCRIPTION", fontsize=9)
+        page.insert_text((400, 610), "1  2  A1151  BASE TUBE 1", fontsize=9)
+        page.insert_text((400, 625), "2  3  A1153  BASE TUBE 3", fontsize=9)
+        # The title block: bottom strip of the sheet, ANSI-style.
+        page.insert_text((50, 700), "TOLERANCES UNLESS OTHERWISE NOTED", fontsize=10)
+        page.insert_text((50, 745), "DRAWN: vernon  DATE: 2/20/2004", fontsize=10)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = [b.raw_text for b in result.balloons]
+        assert any("0.750" in t for t in raw_texts)
+        assert not any("BASE TUBE" in t or "A1151" in t or "A1153" in t for t in raw_texts)
+
     def test_no_title_block_keywords_leaves_page_unaffected(self, tmp_path):
         pdf_path = tmp_path / "no_title_block.pdf"
         doc = fitz.open()
@@ -307,6 +346,120 @@ class TestTitleBlockExclusion:
         raw_texts = [b.raw_text for b in result.balloons]
         assert any("0.750" in t for t in raw_texts)
         assert any("0.500" in t for t in raw_texts)
+
+
+class TestSameLineTextMergingDoesNotAbsorbIndependentValues:
+    """_merge_nearby_text_blocks joins a nominal split from its tolerance
+    across two font runs (e.g. "50.00" + "±0.05"). But a row of ordinate/
+    chain dimensions -- several independent values, each with its own
+    extension line, packed tightly along one baseline -- looks
+    geometrically identical: proximity alone can't tell them apart, so a
+    further block only joins an already-merged one when it actually looks
+    like a continuation, not just another complete value nearby.
+    """
+
+    def test_tolerance_fragments_still_merge(self):
+        blocks = [
+            TextBlock(text="50.00", bbox=(50, 300, 80, 313)),
+            TextBlock(text="±0.05", bbox=(85, 300, 110, 313)),
+        ]
+        merged = _merge_nearby_text_blocks(blocks)
+        assert [b.text for b in merged] == ["50.00 ±0.05"]
+
+    def test_bare_unsigned_zero_tolerance_still_merges(self):
+        blocks = [
+            TextBlock(text="Ø8", bbox=(50, 300, 65, 313)),
+            TextBlock(text="0", bbox=(68, 300, 73, 313)),
+        ]
+        merged = _merge_nearby_text_blocks(blocks)
+        assert [b.text for b in merged] == ["Ø8 0"]
+
+    def test_chain_of_independent_values_does_not_merge(self):
+        # Seven ordinate dimensions on one baseline, evenly and tightly
+        # spaced (well within the same-line merge gap) -- each is its own
+        # complete value, not a continuation of the one before it.
+        values = ["0.550", "0.250", "0.000", "0.283", "1.307", "2.250", "2.500"]
+        blocks = []
+        x = 50.0
+        for v in values:
+            w = 6.0 * len(v)
+            blocks.append(TextBlock(text=v, bbox=(x, 300, x + w, 313)))
+            x += w + 10.0  # comfortably inside the merge gap threshold
+        merged = _merge_nearby_text_blocks(blocks)
+        assert [b.text for b in merged] == values
+
+    def test_full_pipeline_balloons_every_chain_dimension_separately(self, tmp_path):
+        pdf_path = tmp_path / "ordinate_chain.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=300)
+        values = ["0.550", "0.250", "0.000", "0.283", "1.307", "2.250", "2.500"]
+        x = 50.0
+        for v in values:
+            page.insert_text((x, 150), v, fontsize=10)
+            x += 45.0  # tight, real-world ordinate spacing
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = {b.raw_text for b in result.balloons}
+        for v in values:
+            assert v in raw_texts, f"{v} was not ballooned on its own (found: {raw_texts})"
+
+    def test_qty_prefix_still_merges_with_its_own_mangled_diameter_value(self):
+        # A quantity prefix ("9X") split from its value across a separate
+        # font run, the value's own Ø glyph mangled into "n" by the CAD
+        # export's font -- the same shape a two-block tolerance split
+        # takes, but here "9X" has no established value of its own yet, so
+        # the next number is the value it's missing, not a competing one.
+        blocks = [
+            TextBlock(text="9X", bbox=(50, 300, 62, 313)),
+            TextBlock(text="n0.250", bbox=(65, 300, 95, 313)),
+            TextBlock(text="THRU", bbox=(98, 300, 120, 313)),
+        ]
+        merged = _merge_nearby_text_blocks(blocks)
+        assert [b.text for b in merged] == ["9X n0.250 THRU"]
+
+    def test_qty_prefix_merges_across_a_separate_mangled_letter_block_too(self):
+        # Same as above, but the mangled letter itself is a fourth,
+        # separate block from both the quantity prefix and the value.
+        blocks = [
+            TextBlock(text="8X", bbox=(50, 300, 62, 313)),
+            TextBlock(text="n", bbox=(65, 300, 70, 313)),
+            TextBlock(text="0.157", bbox=(73, 300, 100, 313)),
+            TextBlock(text="THRU", bbox=(103, 300, 125, 313)),
+        ]
+        merged = _merge_nearby_text_blocks(blocks)
+        assert [b.text for b in merged] == ["8X n 0.157 THRU"]
+
+    def test_full_pipeline_balloons_qty_prefixed_diameter_as_diameter(self, tmp_path):
+        """Regression test: "9X n0.250 THRU" split across separate font
+        runs for the quantity prefix, the value (with its Ø glyph mangled
+        into "n"), and the trailing note must still merge into one block
+        and resolve to a Diameter -- not silently lose the quantity prefix
+        and fall back to a bare Linear Dimension.
+        """
+        pdf_path = tmp_path / "qty_diameter.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((50, 150), "9X", fontsize=10)
+        page.insert_text((70, 150), "n0.250", fontsize=10)
+        page.insert_text((115, 150), "THRU", fontsize=10)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        assert len(result.balloons) == 1
+        balloon = result.balloons[0]
+        assert balloon.char_type == CharacteristicType.DIAMETER.value
+        assert balloon.nominal == pytest.approx(0.25)
 
 
 class TestStackedToleranceFragments:
@@ -550,6 +703,50 @@ class TestZoneMarginWholeNumberDimensions:
         assert "75" in raw_texts
         assert "19" in raw_texts
         assert not ({"1", "2", "3", "4"} & raw_texts)
+
+
+class TestAssemblyItemBalloonExclusion:
+    def test_circled_item_reference_numbers_are_not_ballooned(self, tmp_path):
+        """An assembly drawing's own item-reference "balloons" (a bare 1-2
+        digit number circled and leader-lined to a part, matching its
+        Parts List row) must not be re-ballooned as whole-number
+        dimensions -- only the circle drawn around them tells them apart
+        from a real one, textually they're identical (see
+        TestZoneMarginWholeNumberDimensions for the zone-margin case).
+        """
+        pdf_path = tmp_path / "item_balloons.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=1000, height=800)
+
+        def draw_item_balloon(x, y, number):
+            page.insert_text((x, y), str(number), fontsize=10)
+            last_block = page.get_text("dict")["blocks"][-1]
+            bbox = last_block["lines"][0]["spans"][0]["bbox"]
+            x0, y0, x1, y1 = bbox
+            center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            radius = math.hypot((x1 - x0) / 2.0, (y1 - y0) / 2.0) + 2.0
+            page.draw_circle(center, radius, color=(0, 0, 0), width=0.75)
+            # Leader line running well away from the balloon toward the part.
+            edge = (center[0] + radius * 0.7, center[1] + radius * 0.7)
+            page.draw_line(edge, (edge[0] + 100, edge[1] + 100), color=(0, 0, 0), width=0.5)
+
+        draw_item_balloon(150, 200, 1)
+        draw_item_balloon(150, 300, 2)
+        # Real whole-number dimensions elsewhere on the same page.
+        page.insert_text((600, 200), "75", fontsize=12)
+        page.insert_text((600, 300), "19", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = {b.raw_text for b in result.balloons}
+        assert "75" in raw_texts
+        assert "19" in raw_texts
+        assert not ({"1", "2"} & raw_texts)
 
 
 class TestRerunSkipsAlreadyBalloonedRegions:

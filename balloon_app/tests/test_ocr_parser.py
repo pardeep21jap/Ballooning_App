@@ -87,6 +87,38 @@ class TestDiameterAndRadius:
         result = parse_characteristic("Ra 1.6")
         assert result.char_type == CharacteristicType.SURFACE_FINISH.value
 
+    def test_bare_mangled_diameter_letter(self):
+        # A CAD PDF export's custom font had no ToUnicode mapping for the
+        # Ø glyph, so text extraction substituted an unrelated letter
+        # ("n") -- with no other structure around the value (contrast the
+        # compound cases in TestHoleFeatureModifiers that split into two
+        # characteristics), a lone letter glued to a decimal value is read
+        # as a mangled diameter symbol and rewritten to its canonical form.
+        result = parse_characteristic("n 0.551")
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert _close(result.nominal, 0.551)
+        assert result.raw_text == "⌀0.551"
+
+    def test_bare_mangled_diameter_letter_no_space(self):
+        result = parse_characteristic("n0.551")
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert _close(result.nominal, 0.551)
+
+    def test_mangled_diameter_fallback_never_shadows_radius(self):
+        # "R" is never a mangled substitute -- it's already an
+        # unambiguous, real radius symbol in its own right.
+        result = parse_characteristic("R0.551")
+        assert result.char_type == CharacteristicType.RADIUS.value
+        assert _close(result.nominal, 0.551)
+
+    def test_mangled_diameter_fallback_requires_a_decimal_value(self):
+        # A bare whole number glued to a letter (e.g. a drawing/revision
+        # code like "A2048") must never be mistaken for a diameter -- a
+        # real diameter is essentially always given to several decimal
+        # places, an alphanumeric code never is.
+        result = parse_characteristic("A2048")
+        assert result.char_type != CharacteristicType.DIAMETER.value
+
 
 class TestHoleFeatureModifiers:
     def test_depth_symbol(self):
@@ -291,8 +323,25 @@ class TestHoleFeatureModifiers:
     def test_qty_prefix_does_not_contaminate_single_value_nominal(self):
         # "9X n0.250 THRU" -- diameter symbol mangled and no second numeric
         # value, so no split, but the "9" instance count must still not be
-        # picked up as the nominal.
+        # picked up as the nominal. The mangled letter must still resolve
+        # to a Diameter, not fall through to a plain linear dimension --
+        # "THRU" is a note, not a second dimension to split on.
         result = parse_characteristic("9X n0.250 THRU")
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert _close(result.nominal, 0.25)
+        assert result.raw_text == "9X ⌀0.250 THRU"
+
+    def test_qty_prefix_mangled_diameter_with_space_before_value(self):
+        result = parse_characteristic("8X n 0.157 THRU")
+        assert result.char_type == CharacteristicType.DIAMETER.value
+        assert _close(result.nominal, 0.157)
+        assert result.raw_text == "8X ⌀0.157 THRU"
+
+    def test_qty_prefix_mangled_diameter_fallback_never_shadows_radius(self):
+        # "R" is never a mangled substitute -- it's already an
+        # unambiguous, real radius symbol in its own right.
+        result = parse_characteristic("9X R0.250 TYP")
+        assert result.char_type == CharacteristicType.RADIUS.value
         assert _close(result.nominal, 0.25)
 
     def test_qty_prefix_with_real_tolerance_is_not_mistaken_for_two_values(self):

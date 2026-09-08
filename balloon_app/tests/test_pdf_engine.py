@@ -295,3 +295,95 @@ class TestFindVectorGdtFrame:
         pdf_doc.open()
         assert pdf_doc.find_vector_gdt_frame(0, bbox) is False
         pdf_doc.close()
+
+
+class TestFindVectorCircleAroundText:
+    """An assembly drawing's item-reference "balloon" (a bare 1-2 digit
+    number matching a Parts List row, with a leader line to the part it
+    identifies) is textually indistinguishable from a real whole-number
+    dimension -- only the circle drawn around it, again vector line art,
+    tells them apart. find_vector_circle_around_text looks for that circle.
+    """
+
+    @staticmethod
+    def _enclosing_radius(bbox, margin: float = 2.0) -> float:
+        # Circumscribe the (possibly narrow, e.g. a "1") text bbox's
+        # diagonal with a comfortable margin, so the circle clears it on
+        # every side regardless of the glyph's own aspect ratio.
+        x0, y0, x1, y1 = bbox
+        return math.hypot((x1 - x0) / 2.0, (y1 - y0) / 2.0) + margin
+
+    def test_detects_circle_enclosing_text(self, tmp_path):
+        pdf_path = tmp_path / "item_balloon.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "1", fontsize=10)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        x0, y0, x1, y1 = bbox
+        center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        page.draw_circle(center, self._enclosing_radius(bbox), color=(0, 0, 0), width=0.75)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_circle_around_text(0, bbox) is True
+        pdf_doc.close()
+
+    def test_no_nearby_circle_returns_false(self, tmp_path):
+        pdf_path = tmp_path / "plain.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "1", fontsize=10)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_circle_around_text(0, bbox) is False
+        pdf_doc.close()
+
+    def test_distant_large_circle_is_not_mistaken_for_a_balloon(self, tmp_path):
+        """A circle far larger than the text (e.g. the part's own hole or
+        shaft geometry happening to sit near a dimension) must not count."""
+        pdf_path = tmp_path / "big_circle.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "1", fontsize=10)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        x0, y0, x1, y1 = bbox
+        center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        page.draw_circle(center, (x1 - x0) * 12.0, color=(0, 0, 0), width=0.75)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_circle_around_text(0, bbox) is False
+        pdf_doc.close()
+
+    def test_long_attached_leader_line_does_not_spoil_detection(self, tmp_path):
+        """A leader line touching the circle at one end and running far
+        away must not drag the cluster's bounding box out with it and
+        spoil the aspect-ratio/size checks -- each candidate segment is
+        pre-filtered to a short span before clustering for exactly this.
+        """
+        pdf_path = tmp_path / "with_leader.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((100, 200), "1", fontsize=10)
+        bbox = tuple(page.get_text("dict")["blocks"][0]["lines"][0]["spans"][0]["bbox"])
+        x0, y0, x1, y1 = bbox
+        center = ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+        radius = self._enclosing_radius(bbox)
+        page.draw_circle(center, radius, color=(0, 0, 0), width=0.75)
+        edge = (center[0] + radius * 0.7, center[1] + radius * 0.7)
+        page.draw_line(edge, (edge[0] + 150, edge[1] + 150), color=(0, 0, 0), width=0.5)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_circle_around_text(0, bbox) is True
+        pdf_doc.close()

@@ -145,6 +145,16 @@ _QTY_TWO_VALUE_RE = re.compile(
     rf"^\s*(\d+)\s*[Xx]\s+[A-Za-z]{{0,3}}\s*({NUM})\s+[A-Za-z]{{0,3}}\s*({NUM})\b"
 )
 
+# The same font-substitution problem as above, but with only *one* value --
+# e.g. "9X n0.250 THRU" (a hole's diameter, no depth given, just a "THRU"
+# note that isn't a second dimension at all). Tried only after
+# _QTY_TWO_VALUE_RE fails to match, so a real second value still takes
+# priority. "R" is excluded from the mangled-letter class since it's never
+# mangled -- it's already an unambiguous, real radius symbol on its own.
+_QTY_SINGLE_MANGLED_DIAMETER_RE = re.compile(
+    rf"^\s*(\d+)\s*[Xx]\s+(?![Rr])[A-Za-z]\s*({NUM})\b"
+)
+
 # A number immediately followed by the degree sign, e.g. "82°" in
 # "⌵⌀0.507 X 82°" (a countersink's included angle, following its
 # diameter). Unlike the diameter/depth glyphs, ° (U+00B0) is a plain
@@ -160,6 +170,22 @@ _TRAILING_ANGLE_RE = re.compile(rf"({NUM})\s*°")
 # anything at all before the value -- the "X ...°" shape alone is signal
 # enough, since it isn't produced by any other tolerance/dimension format.
 _VALUE_THEN_ANGLE_RE = re.compile(rf"({NUM})\s*[Xx]\s*({NUM})\s*°")
+
+# Structural fallback for a lone diameter (Ø) glyph mangled into an
+# unrelated letter with no other structure around it at all, e.g. "n
+# 0.551" -- the simplest form the same font-substitution problem takes
+# (compare the compound cases above, "n" in "2X n 0.089 x 0.500" and "w n
+# 0.507 X 82°", where a second value or trailing angle gives the mangled
+# letter away). Thread classes and shape keywords have already been ruled
+# out by earlier, more specific checks by the time this runs, so a single
+# leftover letter immediately glued to a value has no other explanation on
+# a mechanical drawing -- except "R", which is never mangled: it's already
+# an unambiguous, real radius symbol in its own right, so it's excluded
+# here rather than mistaken for a diameter. Also restricted to a *decimal*
+# value -- never a bare whole number -- so a drawing/revision code like
+# "A2048" is never mistaken for one; a diameter is essentially always
+# given to several decimal places, an alphanumeric code never is.
+_BARE_MANGLED_DIAMETER_RE = re.compile(r"^(?![Rr])[A-Za-z]\s*(\d+\.\d+|\.\d+)$")
 
 # Numeric tolerance extraction patterns, tried in priority order.
 _ASYM_SLASH_RE = re.compile(rf"({NUM})\s*\+\s*({NUM})\s*/\s*-\s*({NUM})")
@@ -546,6 +572,36 @@ def _try_qty_prefixed_two_values(text: str) -> Optional[list[ParsedCharacteristi
     ]
 
 
+def _try_qty_prefixed_mangled_diameter(text: str) -> Optional[ParsedCharacteristic]:
+    """Structural fallback for a quantity-prefixed diameter whose glyph was
+    mangled into an unrelated letter with no second value to split on (see
+    _try_qty_prefixed_two_values for when there is one) -- e.g. "9X
+    n0.250 THRU", where "THRU" is a note, not a second dimension. Without
+    this, such text falls all the way through to a plain linear dimension
+    since "n" isn't a recognized diameter symbol and there's no vector
+    circle to fall back on either (the glyph *is* a font character here,
+    just the wrong one -- see PdfDocument.find_vector_diameter_symbol,
+    which only helps when the glyph is missing from the text entirely).
+
+    ``raw_text`` is rewritten to replace the mangled letter with the
+    canonical Ø, keeping the quantity prefix and any trailing note (e.g.
+    "9X ⌀0.250 THRU") since those are real content, unlike the single
+    mangled letter itself.
+    """
+    m = _QTY_SINGLE_MANGLED_DIAMETER_RE.match(text)
+    if not m:
+        return None
+    qty, value = m.group(1), m.group(2)
+    cleaned_text = f"{qty}X ⌀{value}{text[m.end():]}"
+    return ParsedCharacteristic(
+        char_type=CharacteristicType.DIAMETER.value,
+        raw_text=cleaned_text,
+        nominal=_round(float(value)),
+        nominal_text=value,
+        confidence=0.55,
+    )
+
+
 def _try_bare_value_with_angle(text: str) -> Optional[list[ParsedCharacteristic]]:
     """Structural fallback for "<value> X <angle>°" when no shape symbol at
     all is recognizable (see _VALUE_THEN_ANGLE_RE above). "A diameter times
@@ -581,6 +637,30 @@ def _try_bare_value_with_angle(text: str) -> Optional[list[ParsedCharacteristic]
             confidence=0.6,
         ),
     ]
+
+
+def _try_bare_mangled_diameter(text: str) -> Optional[ParsedCharacteristic]:
+    """Structural fallback for a lone diameter glyph mangled into an
+    unrelated letter with nothing else around it, e.g. "n 0.551" (see
+    _BARE_MANGLED_DIAMETER_RE above).
+
+    ``raw_text`` is rewritten from the mangled source ("n 0.551") to its
+    canonical symbol form ("⌀0.551") -- the original letter carries no
+    information (it's an artifact of the drawing's font, not real
+    content), so showing it verbatim would only confuse review, not aid
+    traceability.
+    """
+    m = _BARE_MANGLED_DIAMETER_RE.match(text.strip())
+    if not m:
+        return None
+    value = m.group(1)
+    return ParsedCharacteristic(
+        char_type=CharacteristicType.DIAMETER.value,
+        raw_text=f"⌀{value}",
+        nominal=_round(float(value)),
+        nominal_text=value,
+        confidence=0.55,
+    )
 
 
 def _try_surface_finish(text: str) -> Optional[ParsedCharacteristic]:
@@ -858,9 +938,17 @@ def parse_characteristics(
     if qty_two_values is not None:
         return qty_two_values
 
+    qty_mangled_diameter = _try_qty_prefixed_mangled_diameter(text)
+    if qty_mangled_diameter is not None:
+        return [qty_mangled_diameter]
+
     value_and_angle = _try_bare_value_with_angle(text)
     if value_and_angle is not None:
         return value_and_angle
+
+    mangled_diameter = _try_bare_mangled_diameter(text)
+    if mangled_diameter is not None:
+        return [mangled_diameter]
 
     is_depth = bool(_DEPTH_HINT_RE.search(text))
     is_counterbore = bool(_COUNTERBORE_HINT_RE.search(text))

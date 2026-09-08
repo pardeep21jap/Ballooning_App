@@ -51,6 +51,23 @@ _GDT_FRAME_DIVIDER_MIN_HEIGHT_RATIO = 0.6
 _GDT_FRAME_DIVIDER_MAX_GAP_PT = 2.5
 _GDT_FRAME_TOUCH_EPS = 1.0
 
+# Heuristic thresholds for find_vector_circle_around_text (see its
+# docstring): an assembly item-reference balloon's circle is drawn snugly
+# but not tightly around its 1-2 digit number -- roughly as wide as it is
+# tall, and modestly larger than the digit -- unlike a part's own much
+# larger circular geometry (a hole, a shaft) that a dimension might merely
+# sit near. Each item pre-filtered to a short span before clustering so a
+# long leader/dimension/extension line touching the circle at one end
+# can't drag the cluster's bounding box out with it.
+_ITEM_BALLOON_SEARCH_MARGIN_RATIO = 2.0
+_ITEM_BALLOON_MAX_ITEM_SPAN_PT_RATIO = 3.0
+_ITEM_BALLOON_MIN_SEGMENTS = 3
+_ITEM_BALLOON_MIN_ASPECT = 0.6
+_ITEM_BALLOON_MAX_ASPECT = 1.6
+_ITEM_BALLOON_MAX_SIZE_RATIO = 4.5
+_ITEM_BALLOON_MIN_PADDING_RATIO = 0.12
+_ITEM_BALLOON_TOUCH_EPS = 1.0
+
 
 def dpi_to_zoom(dpi: float) -> float:
     """Convert a target DPI to the zoom factor PyMuPDF's Matrix expects."""
@@ -452,6 +469,71 @@ class PdfDocument:
                 for r in cluster
             )
             if has_divider:
+                return True
+        return False
+
+    def find_vector_circle_around_text(
+        self, page_number: int, bbox: tuple[float, float, float, float]
+    ) -> bool:
+        """Best-effort detection of a small vector-drawn circle tightly
+        enclosing ``bbox``.
+
+        A bare 1-2 digit number is textually indistinguishable from a real
+        whole-number dimension (see ``_looks_like_characteristic`` /
+        ``_BARE_SHORT_INTEGER_RE`` in auto_balloon.py) -- but on an assembly
+        drawing it's just as often an item-reference "balloon" matching a
+        Parts List row, with a leader line pointing at the part it
+        identifies. The only thing that tells the two apart is the circle
+        drawn around it, which -- like the GD&T/diameter symbols above --
+        is vector line art contributing no character to the extracted text.
+
+        Looks for a cluster of vector-path segments (curves for a
+        round-drawn circle, or several short line segments approximating
+        one) whose combined bounding box surrounds ``bbox`` on all four
+        sides with a comfortable margin and is itself roughly circular
+        (near-square aspect ratio) and modestly sized relative to the text.
+        Each candidate segment is required to be short relative to the text
+        height *before* clustering, so a long leader/dimension/extension
+        line that happens to touch the circle at one end can't drag the
+        cluster's bounding box out along with it and spoil the aspect-ratio
+        and size checks. Returns ``False`` (never raises) if the page has
+        no usable vector-drawing data.
+        """
+        x0, y0, x1, y1 = bbox
+        height = y1 - y0
+        if height <= 0:
+            return False
+        margin = height * _ITEM_BALLOON_SEARCH_MARGIN_RATIO
+        search = (x0 - margin, y0 - margin, x1 + margin, y1 + margin)
+        max_item_span = height * _ITEM_BALLOON_MAX_ITEM_SPAN_PT_RATIO
+
+        try:
+            nearby = [
+                r for r in self._drawing_item_bboxes(page_number)
+                if _rects_touch(search, r, 0.0)
+                and (r[2] - r[0]) <= max_item_span
+                and (r[3] - r[1]) <= max_item_span
+            ]
+        except Exception:
+            logger.exception("Failed item-balloon geometry check on page %d of %s", page_number, self.path)
+            return False
+
+        for cluster in _cluster_touching_rects(nearby, _ITEM_BALLOON_TOUCH_EPS):
+            if len(cluster) < _ITEM_BALLOON_MIN_SEGMENTS:
+                continue
+            cx0 = min(r[0] for r in cluster)
+            cx1 = max(r[2] for r in cluster)
+            cy0 = min(r[1] for r in cluster)
+            cy1 = max(r[3] for r in cluster)
+            width, cheight = cx1 - cx0, cy1 - cy0
+            if cheight <= 0 or width <= 0:
+                continue
+            if not (_ITEM_BALLOON_MIN_ASPECT <= width / cheight <= _ITEM_BALLOON_MAX_ASPECT):
+                continue
+            if width > height * _ITEM_BALLOON_MAX_SIZE_RATIO or cheight > height * _ITEM_BALLOON_MAX_SIZE_RATIO:
+                continue
+            pad = height * _ITEM_BALLOON_MIN_PADDING_RATIO
+            if cx0 <= x0 - pad and cx1 >= x1 + pad and cy0 <= y0 - pad and cy1 >= y1 + pad:
                 return True
         return False
 

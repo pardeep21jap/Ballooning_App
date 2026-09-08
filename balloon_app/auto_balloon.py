@@ -73,13 +73,23 @@ _BARE_SHORT_INTEGER_RE = re.compile(r"^\(?\d{1,2}\)?$")
 # otherwise pass _looks_like_characteristic and get ballooned individually
 # -- see _title_block_cutoff_y below, which uses these to exclude the whole
 # title block region rather than trying to keyword-match every field in it.
+#
+# A Parts List / Bill of Materials table is drawn the same way -- its ITEM,
+# QTY, and PART NUMBER columns are all bare numbers/codes that otherwise
+# pass _looks_like_characteristic just as easily as a real dimension would
+# -- and, being assembly-level bookkeeping rather than a feature of the
+# part itself, belongs excluded for the same reason. It's usually a
+# separate table stacked directly above the title block rather than part
+# of it, so its own heading is included here too: the topmost match of
+# either sets the cutoff high enough to cover both tables in one strip.
 _TITLE_BLOCK_KEYWORDS_RE = re.compile(
     r"TOLERANCES UNLESS OTHERWISE (NOTED|SPECIFIED)|UNLESS OTHERWISE SPECIFIED|"
     r"\bDRAWN\b|\bCHECKED\b|\bDESIGNED\b|\bENGINEER(ED)?\b|\bAPPROVED\b|"
     r"\bTITLE\b|\bSCALE\b|\bSHEET\b|\bQTY\.?\s*:|\bMATERIAL\b|\bFINISH\b|"
     r"\bPROJECT CODE\b|\bDWG\.?\s*NO\.?\b|\bNEXT ASSY\b|\bDO NOT SCALE\b|"
     r"\bPROPRIETARY\b|\bCONFIDENTIAL\b|\bINTERPRET (DRAWING|PER)\b|"
-    r"\bBREAK ALL SHARP EDGES\b|\bFRACTIONAL\b",
+    r"\bBREAK ALL SHARP EDGES\b|\bFRACTIONAL\b|"
+    r"\bPARTS? LIST\b|\bBILL OF MATERIALS?\b|\bBOM\b",
     re.IGNORECASE,
 )
 
@@ -104,7 +114,8 @@ def _in_zone_margin(
 
 def _title_block_cutoff_y(blocks: list[TextBlock], page_height: float) -> Optional[float]:
     """Return a page-y cutoff below which everything is treated as inside
-    the title block, or ``None`` if no title-block boilerplate was found.
+    the title block (or an adjoining Parts List / Bill of Materials table),
+    or ``None`` if no boilerplate was found.
 
     Rather than keyword-matching every individual title-block field (drawing
     number, revision, company name/logo, dates -- an open-ended list that
@@ -112,7 +123,10 @@ def _title_block_cutoff_y(blocks: list[TextBlock], page_height: float) -> Option
     bottom half of the page and excludes that whole horizontal strip down
     to the bottom edge. Matches ANSI/ISO title blocks, which run the full
     sheet width along the bottom; a title block running the full height
-    along one side instead would need a different heuristic.
+    along one side instead would need a different heuristic. A Parts List
+    table stacked above the title block (see _TITLE_BLOCK_KEYWORDS_RE) is
+    covered the same way, as long as its heading sits no lower than the
+    title block's own topmost boilerplate line.
     """
     matches = [
         b for b in blocks
@@ -343,12 +357,72 @@ class YoloDetector(BaseDetector):
         return detections
 
 
+_BARE_SHORT_ZERO_RE = re.compile(r"^0(\.0{1,2})?$")
+_BARE_NUMBER_ONLY_RE = re.compile(rf"^{NUM}$")
+# A leading quantity-count prefix ("9X") and/or a short mangled-symbol
+# letter (a Ø/⌵/etc. glyph substituted by a CAD font with no ToUnicode
+# mapping for it, e.g. the "n" in "9X n0.250") -- neither is a dimension
+# value in its own right, so _established_value_count strips at most one
+# of each off the front before counting what's left.
+_LEADING_MARKER_RE = re.compile(r"^\s*(?:\d+\s*[Xx]\s*)?[A-Za-z]{0,3}\s*")
+
+
+def _established_value_count(text: str) -> int:
+    """How many real dimension-value numbers ``text`` already has, ignoring
+    a leading quantity-count prefix and/or mangled-symbol letter (see
+    ``_LEADING_MARKER_RE``)."""
+    return len(re.findall(NUM, _LEADING_MARKER_RE.sub("", text, count=1)))
+
+
+def _merge_gap_is_safe(current_text: str, next_text: str) -> bool:
+    """Decide whether ``next_text`` may join ``current_text`` across a
+    same-line gap, rather than staying its own independent value.
+
+    Always safe: a tolerance continuation (starts with a sign, or is the
+    short bare "0"/"0.0" unilateral-tolerance convention -- see
+    ``_TRAILING_BARE_ZERO_RE`` in ocr_parser.py), or trailing non-numeric
+    text (a note like "THRU"/"TYP" can never be mistaken for its own
+    ordinate/chain dimension, since it has no digits at all).
+
+    Otherwise ``next_text`` is a complete standalone number -- exactly the
+    shape both a legitimate second value (the actual value following a
+    quantity prefix and/or mangled symbol, e.g. "9X" + "0.250") and an
+    independent ordinate/chain dimension ("0.550" next to "0.250", each
+    with its own extension line) take. The two are told apart by what
+    ``current_text`` has accumulated so far: if it doesn't have an
+    established value of its own yet (still just a quantity-count and/or a
+    mangled-symbol letter), the next number is the value it's missing, not
+    a competing dimension -- but once it already has one, a further plain
+    number is always read as independent.
+    """
+    stripped_next = next_text.strip()
+    if not stripped_next:
+        return False
+    if stripped_next[0] in "±+-":
+        return True
+    if _BARE_SHORT_ZERO_RE.match(stripped_next):
+        return True
+    if not _BARE_NUMBER_ONLY_RE.match(stripped_next):
+        return True  # non-numeric trailing note ("THRU", "TYP", ...)
+    return _established_value_count(current_text) == 0
+
+
 def _merge_nearby_text_blocks(blocks: list[TextBlock], y_tol: float = 3.0, x_gap: float = 18.0) -> list[TextBlock]:
     """Merge text spans that sit on the same line and are close together.
 
     PDF text is often split into several spans (e.g. ``"50.00"`` and
-    ``"±0.05"`` as separate runs with different fonts). Merging them lets
-    the parser see the full callout.
+    ``"±0.05"`` as separate runs with different fonts, or "9X" and a
+    mangled-symbol value in a different sub-style). Merging them lets the
+    parser see the full callout.
+
+    Proximity alone isn't enough of a signal, though: a row of ordinate/
+    chain dimensions (several independent whole values -- "0.550 0.250
+    0.000 0.283 ...", each with its own extension line -- packed tightly
+    along one baseline) looks geometrically identical to a nominal split
+    from its tolerance or quantity prefix across two font runs. Merging
+    every one of them into a single block would silently keep only the
+    first value and drop the rest as one balloon instead of several -- see
+    _merge_gap_is_safe for how the two are told apart.
     """
     if not blocks:
         return []
@@ -358,7 +432,7 @@ def _merge_nearby_text_blocks(blocks: list[TextBlock], y_tol: float = 3.0, x_gap
         current = merged[-1]
         same_line = abs(nxt.bbox[1] - current.bbox[1]) <= y_tol and abs(nxt.bbox[3] - current.bbox[3]) <= y_tol * 3
         gap = nxt.bbox[0] - current.bbox[2]
-        if same_line and -2.0 <= gap <= x_gap:
+        if same_line and -2.0 <= gap <= x_gap and _merge_gap_is_safe(current.text, nxt.text):
             new_bbox = (
                 min(current.bbox[0], nxt.bbox[0]),
                 min(current.bbox[1], nxt.bbox[1]),
@@ -706,6 +780,14 @@ def auto_balloon_page(
     # pre-merge blocks and for the same reason.
     gdt_frame_hint_bboxes: list[tuple[float, float, float, float]] = []
     flatness_hint_bboxes: list[tuple[float, float, float, float]] = []
+    # A bare 1-2 digit number circled on an assembly drawing is an
+    # item-reference "balloon" pointing at a Parts List row, not a
+    # dimension -- textually identical to a real whole-number dimension, so
+    # only the enclosing circle (again vector line art, see
+    # PdfDocument.find_vector_circle_around_text) tells them apart. Only
+    # checked for blocks that could plausibly be such a number, since the
+    # geometry check is comparatively expensive to run on every block.
+    item_balloon_hint_bboxes: list[tuple[float, float, float, float]] = []
     for block in native_blocks:
         if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
             continue
@@ -715,12 +797,18 @@ def auto_balloon_page(
             gdt_frame_hint_bboxes.append(block.bbox)
             if pdf_doc.find_vector_flatness_symbol(page_number, block.bbox):
                 flatness_hint_bboxes.append(block.bbox)
+        if _BARE_SHORT_INTEGER_RE.match(block.text.strip()) and pdf_doc.find_vector_circle_around_text(
+            page_number, block.bbox
+        ):
+            item_balloon_hint_bboxes.append(block.bbox)
 
     merged_native_blocks = _merge_stacked_tolerance_fragments(_merge_nearby_text_blocks(native_blocks))
 
     for block in merged_native_blocks:
         if title_block_cutoff_y is not None and block.bbox[1] >= title_block_cutoff_y:
             continue  # inside the title block -- never a real characteristic
+        if any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in item_balloon_hint_bboxes):
+            continue  # circled item-reference number, not a dimension
         if not _looks_like_characteristic(block.text, bbox=block.bbox, page_size=page_size):
             continue
         if gray_image is not None:
