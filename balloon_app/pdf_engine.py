@@ -722,6 +722,47 @@ class PdfDocument:
                 return True
         return False
 
+    def find_horizontal_rule(
+        self,
+        page_number: int,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        min_span_fraction: float = 0.5,
+        y_tolerance: float = 1.0,
+    ) -> Optional[float]:
+        """Topmost y of a horizontal vector line spanning at least
+        ``min_span_fraction`` of ``x_range``, with its y inside ``y_range``
+        (inclusive), or ``None`` if no such line is drawn.
+
+        Some CAD exporters split one visually continuous rule into several
+        short collinear segments, so segments within ``y_tolerance`` of
+        each other are grouped and their combined x-extent (not any single
+        segment's own length) is checked against ``min_span_fraction``.
+        Used to find a title block's own bordered top edge precisely
+        instead of guessing how far above its anchor text the box extends
+        -- title blocks vary too much in height for a fixed margin to fit
+        them all (see ``_title_block_regions`` in auto_balloon.py).
+        """
+        x0, x1 = x_range
+        y_lo, y_hi = y_range
+        if y_hi <= y_lo or x1 <= x0:
+            return None
+        min_span = (x1 - x0) * min_span_fraction
+        groups: dict[float, list[float]] = {}
+        for ax0, ay0, ax1, ay1 in self._line_segment_endpoints(page_number):
+            if abs(ay0 - ay1) > 0.5:
+                continue  # not horizontal
+            y = (ay0 + ay1) / 2.0
+            if not (y_lo <= y <= y_hi):
+                continue
+            seg_x0, seg_x1 = max(min(ax0, ax1), x0), min(max(ax0, ax1), x1)
+            if seg_x1 <= seg_x0:
+                continue
+            key = round(y / y_tolerance) * y_tolerance
+            groups.setdefault(key, []).extend((seg_x0, seg_x1))
+        covering_ys = [y for y, xs in groups.items() if max(xs) - min(xs) >= min_span]
+        return min(covering_ys) if covering_ys else None
+
     def page_has_images_only(self, page_number: int) -> bool:
         """Heuristic: page has no usable text layer but does have image content."""
         if self.has_native_text(page_number):

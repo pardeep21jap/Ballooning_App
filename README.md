@@ -412,3 +412,63 @@ BalloonApp/
   renamed. Use **File -> Relink Current Drawing...** to point at its new
   location.
 - Check `logs/balloon_app.log` for detailed error messages.
+
+## Avoiding regressions ("the same bug keeps coming back")
+
+This is common in "vibe-coded" apps. The original error returns because
+later changes unintentionally break an earlier behavior — a regression.
+Git commits preserve history, but they do not automatically preserve
+correctness.
+
+**Common causes:**
+- A later change overwrites or bypasses the original fix.
+- The same logic exists in several files, but you fixed only one copy.
+- Components share state, CSS, configuration, or APIs in unexpected ways.
+- AI-generated changes rewrite too much code around the requested feature.
+- The original fix handled the symptom, not the underlying cause.
+- There is no automated test protecting the corrected behavior.
+
+The best mitigation is: every bug fix should leave behind a test that
+fails before the fix and passes afterward. Then, before each commit, run
+the entire test suite — not only tests for the newest change.
+
+**A practical workflow:**
+1. Reproduce the bug consistently.
+2. Identify the root cause.
+3. Add a regression test that demonstrates the bug.
+4. Make the smallest possible fix.
+5. Run all tests, linting, and a production build.
+6. Review `git diff` before committing.
+7. Commit the test and fix together.
+8. Ask AI tools to avoid unrelated refactoring.
+
+A good prompt for future changes is:
+
+> Make only the smallest change needed for this issue. Preserve all
+> existing behavior. First add a regression test for the reported bug,
+> then implement the fix. Run the complete test suite, lint, and build.
+> Do not modify unrelated files.
+
+**Manual smoke-test checklist** for critical journeys:
+- App loads without console errors
+- User can complete the main ballooning workflow
+- Saved information survives refresh
+- Navigation and back buttons work
+- Mobile layout still works
+- API errors display correctly
+
+For an existing recurrence, Git can locate the exact commit that
+reintroduced it:
+
+```
+git log --oneline
+git show <commit>
+git diff <known-good-commit>..HEAD
+```
+
+For harder cases, use `git bisect`: mark a known-good commit and the
+current bad commit, and Git walks you toward the first breaking commit.
+
+The key principle is simple: a fix without a regression test is easy to
+lose; a fix with a test becomes a permanent rule for the application.
+

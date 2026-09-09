@@ -584,6 +584,40 @@ class TestTitleBlockExclusion:
         assert any("0.750" in t for t in raw_texts)
         assert any("0.500" in t for t in raw_texts)
 
+    def test_title_block_top_border_line_overrides_generic_margin(self, tmp_path):
+        """Real-world case: a right-anchored title block's own bordered top
+        edge can sit much closer to its anchor text than the generic
+        10%-of-page-height margin assumes. On a dense sheet, a legitimate
+        dimension (part of an ordinate/chain-dimension row, in the
+        production drawing that surfaced this) can fall just above the
+        box's real border but still within that generic margin's reach --
+        wrongly swallowed by it. When the border is actually drawn as a
+        vector line, it must be trusted over the generic guess.
+        """
+        pdf_path = tmp_path / "title_block_top_border.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=1224, height=792)
+        # A real ordinate dimension, just above the title block's real
+        # (drawn) top border -- within the old fixed-margin's reach, but
+        # not actually part of the box.
+        page.insert_text((600, 603), "0.283", fontsize=10)
+        # The title block's own drawn top border.
+        page.draw_line(fitz.Point(600, 630.0), fitz.Point(1200, 630.0))
+        # Content genuinely inside the box, below the border.
+        page.insert_text((880, 665), "DRAWN", fontsize=8)
+        page.insert_text((900, 700), "126427", fontsize=10)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = [b.raw_text for b in result.balloons]
+        assert any("0.283" in t for t in raw_texts)
+        assert not any("126427" in t for t in raw_texts)
+
 
 class TestSameLineTextMergingDoesNotAbsorbIndependentValues:
     """_merge_nearby_text_blocks joins a nominal split from its tolerance
@@ -717,6 +751,57 @@ class TestSameLineTextMergingDoesNotAbsorbIndependentValues:
         balloon = result.balloons[0]
         assert balloon.char_type == CharacteristicType.DIAMETER.value
         assert balloon.nominal == pytest.approx(0.25)
+
+    def test_qty_prefixed_diameter_still_merges_with_a_trailing_mangled_depth_value(self):
+        """Real-world case: "2X n 0.089 x 0.500" (a hole's diameter and its
+        depth, both shape symbols mangled by the CAD font -- see
+        ocr_parser's mangled-symbol fallbacks). By the time the merge
+        reaches "0.500", "current_text" already has an established value
+        (the diameter, 0.089), so the ordinary chain-dimension guard would
+        read "0.500" as an independent value and refuse to merge it -- but
+        the "x" immediately before it is a fresh marker with no value of
+        its own yet, not evidence of a competing dimension.
+        """
+        blocks = [
+            TextBlock(text="2X", bbox=(50, 300, 62, 313)),
+            TextBlock(text="n", bbox=(65, 300, 70, 313)),
+            TextBlock(text="0.089", bbox=(73, 300, 100, 313)),
+            TextBlock(text="x", bbox=(103, 300, 108, 313)),
+            TextBlock(text="0.500", bbox=(111, 300, 138, 313)),
+        ]
+        merged = _merge_nearby_text_blocks(blocks)
+        assert [b.text for b in merged] == ["2X n 0.089 x 0.500"]
+
+    def test_full_pipeline_balloons_mangled_diameter_and_depth_pair_separately(self, tmp_path):
+        """Regression test: "2X n 0.089 x 0.500" split across separate font
+        runs must still merge into one block and resolve to two
+        balloons -- a Diameter and a Depth -- not lose the depth value
+        (and the stray "x" with it) to a bare Linear Dimension balloon.
+        """
+        pdf_path = tmp_path / "mangled_diameter_and_depth.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((50, 150), "2X", fontsize=10)
+        page.insert_text((70, 150), "n", fontsize=10)
+        page.insert_text((78, 150), "0.089", fontsize=10)
+        page.insert_text((108, 150), "x", fontsize=10)
+        page.insert_text((116, 150), "0.500", fontsize=10)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        char_types = [b.char_type for b in result.balloons]
+        assert char_types.count(CharacteristicType.DIAMETER.value) == 1
+        assert char_types.count(CharacteristicType.DEPTH.value) == 1
+        assert CharacteristicType.LINEAR_DIMENSION.value not in char_types
+        depth_balloon = next(b for b in result.balloons if b.char_type == CharacteristicType.DEPTH.value)
+        assert depth_balloon.nominal == pytest.approx(0.5)
+        diameter_balloon = next(b for b in result.balloons if b.char_type == CharacteristicType.DIAMETER.value)
+        assert diameter_balloon.nominal == pytest.approx(0.089)
 
 
 class TestStackedToleranceFragments:

@@ -148,7 +148,11 @@ _TITLE_BLOCK_ANCHOR_RE = re.compile(
 
 
 def _title_block_regions(
-    blocks: list[TextBlock], page_width: float, page_height: float
+    blocks: list[TextBlock],
+    page_width: float,
+    page_height: float,
+    pdf_doc: Optional[PdfDocument] = None,
+    page_number: int = 0,
 ) -> list[tuple[float, float, float, float]]:
     """Infer spatial title-block/BOM regions without discarding a full band.
 
@@ -181,12 +185,22 @@ def _title_block_regions(
         # of sheet size.
         anchor_left = min(block.bbox[0] for block in right_anchors)
         region_left = max(page_width * 0.25, anchor_left * 0.65)
-        regions.append((
-            region_left,
-            max(page_height * 0.5, min(block.bbox[1] for block in right_anchors) - page_height * 0.10),
-            page_width,
-            page_height,
-        ))
+        anchor_top = min(block.bbox[1] for block in right_anchors)
+        region_top = max(page_height * 0.5, anchor_top - page_height * 0.10)
+        # Title blocks vary too much in height for that fixed 10%-of-page
+        # margin to fit them all -- on a dense sheet, a legitimate
+        # dimension can sit just above the box's real top border but still
+        # within that margin's reach. When the border is actually drawn as
+        # a vector line, trust its real position over the generic guess
+        # (this can only shrink the excluded band, never grow it, since the
+        # search is bounded by the margin's own top).
+        if pdf_doc is not None:
+            border_y = pdf_doc.find_horizontal_rule(
+                page_number, x_range=(region_left, page_width), y_range=(region_top, anchor_top)
+            )
+            if border_y is not None:
+                region_top = border_y
+        regions.append((region_left, region_top, page_width, page_height))
     return regions
 
 
@@ -551,6 +565,12 @@ _BARE_NUMBER_ONLY_RE = re.compile(rf"^{NUM}$")
 # value in its own right, so _established_value_count strips at most one
 # of each off the front before counting what's left.
 _LEADING_MARKER_RE = re.compile(r"^\s*(?:\d+\s*[Xx]\s*)?[A-Za-z]{0,3}\s*")
+# A lone, standalone letter (not "R", which is never mangled -- see
+# _BARE_MANGLED_DIAMETER_RE) at the very end of what's merged so far, e.g.
+# the "x" (mangled depth glyph) in "2X n 0.089 x". It hasn't been given its
+# own value yet, even though an earlier value (the diameter) already
+# exists further back in the text -- see _merge_gap_is_safe below.
+_TRAILING_UNRESOLVED_MARKER_RE = re.compile(r"(?:^|\s)(?![Rr]$)[A-Za-z]$")
 
 
 def _established_value_count(text: str) -> int:
@@ -566,9 +586,14 @@ def _merge_gap_is_safe(current_text: str, next_text: str) -> bool:
 
     Always safe: a tolerance continuation (starts with a sign, or is the
     short bare "0"/"0.0" unilateral-tolerance convention -- see
-    ``_TRAILING_BARE_ZERO_RE`` in ocr_parser.py), or trailing non-numeric
-    text (a note like "THRU"/"TYP" can never be mistaken for its own
-    ordinate/chain dimension, since it has no digits at all).
+    ``_TRAILING_BARE_ZERO_RE`` in ocr_parser.py), trailing non-numeric text
+    (a note like "THRU"/"TYP" can never be mistaken for its own
+    ordinate/chain dimension, since it has no digits at all), or a fresh
+    mangled/shape marker with no value of its own yet (see
+    ``_TRAILING_UNRESOLVED_MARKER_RE`` -- e.g. a hole's depth glyph
+    trailing its own diameter value, as in "2X n 0.089 x 0.500": the
+    diameter's value is already established, but the "x" right before
+    ``next_text`` is still waiting on its own).
 
     Otherwise ``next_text`` is a complete standalone number -- exactly the
     shape both a legitimate second value (the actual value following a
@@ -590,6 +615,8 @@ def _merge_gap_is_safe(current_text: str, next_text: str) -> bool:
         return True
     if not _BARE_NUMBER_ONLY_RE.match(stripped_next):
         return True  # non-numeric trailing note ("THRU", "TYP", ...)
+    if _TRAILING_UNRESOLVED_MARKER_RE.search(current_text):
+        return True  # a fresh marker just joined with no value of its own yet
     return _established_value_count(current_text) == 0
 
 
@@ -1059,7 +1086,10 @@ def auto_balloon_page(
     # restricted to the bottom half of the page, since it's conventionally
     # drawn at the *top* of the sheet instead.
     excluded_regions = (
-        (_title_block_regions(native_blocks, page_width, page_height) if page_width and page_height else [])
+        (
+            _title_block_regions(native_blocks, page_width, page_height, pdf_doc, page_number)
+            if page_width and page_height else []
+        )
         + _revision_table_regions(native_blocks)
     )
 
