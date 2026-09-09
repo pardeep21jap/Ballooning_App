@@ -60,6 +60,26 @@ _DIAMETER_SYMBOL_MIN_SIZE_PT = 2.0
 _DIAMETER_SYMBOL_MAX_SIZE_PT = 14.0
 _DIAMETER_SYMBOL_TOUCH_EPS = 0.8
 
+# Heuristic thresholds for find_vector_depth_symbol (see its docstring): the
+# ASME "depth" glyph (a vertical stem with a downward chevron/arrowhead at
+# its foot) traced as vector line art, sized like a text character. Unlike
+# the diameter circle, this shape is only 2-3 segments -- the same count a
+# plain dimension-line arrowhead has -- so segment count alone can't tell
+# them apart; the stem+chevron structural check in the method itself is
+# what actually distinguishes it (a bare arrowhead has no third, long,
+# roughly-vertical stem segment attached to its point).
+_DEPTH_SYMBOL_MIN_SIZE_PT = 2.0
+_DEPTH_SYMBOL_MAX_SIZE_PT = 20.0
+_DEPTH_SYMBOL_MAX_ASPECT = 1.1  # width / height -- taller than wide, unlike a circle
+_DEPTH_SYMBOL_TOUCH_EPS = 0.8
+# A segment counts as the "stem" if near-vertical (horizontal run small
+# relative to its vertical run) and at least half the cluster's total height.
+_DEPTH_SYMBOL_STEM_MAX_SLOPE = 0.35
+_DEPTH_SYMBOL_STEM_MIN_HEIGHT_RATIO = 0.5
+# The two chevron legs must meet the stem's foot within this many points,
+# and run away from it in opposite horizontal directions.
+_DEPTH_SYMBOL_JOIN_EPS = 1.5
+
 # Heuristic thresholds for find_vector_gdt_frame (see its docstring): a GD&T
 # feature control frame's compartment divider is a snug-height, hairline
 # vertical stroke -- unlike an extension/dimension/leader line, which is
@@ -200,6 +220,7 @@ class PdfDocument:
         self.path = Path(path)
         self._doc: Optional[fitz.Document] = None
         self._drawing_items_cache: dict[int, list[tuple[float, float, float, float]]] = {}
+        self._line_segments_cache: dict[int, list[tuple[float, float, float, float]]] = {}
 
     def open(self) -> None:
         if not self.path.exists():
@@ -322,6 +343,36 @@ class PdfDocument:
         self._drawing_items_cache[page_number] = bboxes
         return bboxes
 
+    def _line_segment_endpoints(self, page_number: int) -> list[tuple[float, float, float, float]]:
+        """Every straight-line vector-path item's own two endpoints (as
+        drawn, not just its bbox) -- (x0, y0, x1, y1), rotation-corrected.
+        Unlike :meth:`_drawing_item_bboxes`, this preserves which end is
+        which, which :meth:`find_vector_depth_symbol` needs to tell a
+        vertical "stem" from the diagonal "legs" branching off its foot.
+        Cached per page for the same reason as ``_drawing_item_bboxes``.
+        """
+        cached = self._line_segments_cache.get(page_number)
+        if cached is not None:
+            return cached
+
+        page = self.doc[page_number]
+        rotation_matrix = page.rotation_matrix
+        segments: list[tuple[float, float, float, float]] = []
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            logger.exception("Failed extracting vector drawings on page %d of %s", page_number, self.path)
+            drawings = []
+        for path in drawings:
+            for item in path.get("items", []):
+                if item[0] != "l":
+                    continue
+                a, b = item[1] * rotation_matrix, item[2] * rotation_matrix
+                segments.append((a.x, a.y, b.x, b.y))
+
+        self._line_segments_cache[page_number] = segments
+        return segments
+
     def find_vector_diameter_symbol(
         self, page_number: int, bbox: tuple[float, float, float, float]
     ) -> bool:
@@ -368,6 +419,117 @@ class PdfDocument:
                 and _DIAMETER_SYMBOL_MIN_SIZE_PT <= cheight <= _DIAMETER_SYMBOL_MAX_SIZE_PT
             ):
                 return True
+        return False
+
+    def find_vector_depth_symbol(
+        self, page_number: int, bbox: tuple[float, float, float, float]
+    ) -> bool:
+        """Best-effort detection of a "depth" glyph (a vertical stem with a
+        downward chevron/arrowhead at its foot -- ASME's ↧) drawn as vector
+        line art immediately to the left of ``bbox``.
+
+        Some CAD PDF exporters draw this symbol as 2-3 traced line segments
+        rather than a font character, so it never appears in
+        :meth:`extract_text_blocks`' output at all -- not even as a mangled
+        substitute character (unlike the ▼/▽/⌵ cases ocr_parser already
+        handles). A plain dimension-line arrowhead is the same segment
+        count and a similar size, so segment count/size alone (as
+        :meth:`find_vector_diameter_symbol` uses for the diameter circle)
+        can't tell them apart here; what actually distinguishes this shape
+        is structural -- a long, roughly vertical "stem" segment, with two
+        other segments meeting its lower end and running away from it in
+        opposite horizontal directions (the chevron) -- which a bare
+        arrowhead (just the chevron, no stem) doesn't have. Returns
+        ``False`` (never raises) if the page has no usable vector-drawing
+        data.
+        """
+        x0, y0, x1, y1 = bbox
+        height = y1 - y0
+        if height <= 0:
+            return False
+        search_rect = (
+            x0 - height * 1.8, y0 - height * 0.8, x0 + height * 0.15, y1 + height * 0.8
+        )
+
+        try:
+            all_segments = self._line_segment_endpoints(page_number)
+        except Exception:
+            logger.exception("Failed depth-symbol geometry check on page %d of %s", page_number, self.path)
+            return False
+
+        def _seg_rect(s: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+            return (min(s[0], s[2]), min(s[1], s[3]), max(s[0], s[2]), max(s[1], s[3]))
+
+        # This glyph's own stem/bar segments are perfectly axis-aligned and
+        # so have zero-area bboxes (zero width or height) -- fitz.Rect.intersects()
+        # only reports a positive-*area* overlap and silently misses those, so
+        # the coordinate-bound check below (already used for clustering) is used
+        # here too rather than fitz.Rect.intersects().
+        nearby = [s for s in all_segments if _rects_touch(search_rect, _seg_rect(s), 0.0)]
+
+        # Union-find over segment *indices* (not the rects directly) so each
+        # cluster keeps its original endpoint-pair data alongside its bbox --
+        # the structural stem/chevron check below needs the real endpoints,
+        # not just the bbox _cluster_touching_rects alone would give back.
+        parent = list(range(len(nearby)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        for i in range(len(nearby)):
+            for j in range(i + 1, len(nearby)):
+                if _rects_touch(_seg_rect(nearby[i]), _seg_rect(nearby[j]), _DEPTH_SYMBOL_TOUCH_EPS):
+                    ri, rj = find(i), find(j)
+                    if ri != rj:
+                        parent[ri] = rj
+
+        groups: dict[int, list[int]] = {}
+        for i in range(len(nearby)):
+            groups.setdefault(find(i), []).append(i)
+
+        for indices in groups.values():
+            segments = [nearby[i] for i in indices]
+            if len(segments) < 2:
+                continue
+            rects = [_seg_rect(s) for s in segments]
+            cx0 = min(r[0] for r in rects)
+            cx1 = max(r[2] for r in rects)
+            cy0 = min(r[1] for r in rects)
+            cy1 = max(r[3] for r in rects)
+            width, cheight = cx1 - cx0, cy1 - cy0
+            if cheight <= 0 or width / cheight > _DEPTH_SYMBOL_MAX_ASPECT:
+                continue
+            if not (_DEPTH_SYMBOL_MIN_SIZE_PT <= width <= _DEPTH_SYMBOL_MAX_SIZE_PT
+                    and _DEPTH_SYMBOL_MIN_SIZE_PT <= cheight <= _DEPTH_SYMBOL_MAX_SIZE_PT):
+                continue
+
+            for stem in segments:
+                sx0, sy0, sx1, sy1 = stem
+                dx, dy = sx1 - sx0, sy1 - sy0
+                length = (dx * dx + dy * dy) ** 0.5
+                if length <= 0 or abs(dy) <= 0 or abs(dx) / abs(dy) > _DEPTH_SYMBOL_STEM_MAX_SLOPE:
+                    continue
+                if length < cheight * _DEPTH_SYMBOL_STEM_MIN_HEIGHT_RATIO:
+                    continue
+                foot = (sx0, sy0) if sy0 > sy1 else (sx1, sy1)  # larger y = lower on the page
+
+                legs = [seg for seg in segments if seg is not stem]
+                joined_left = joined_right = False
+                for leg in legs:
+                    for (lx, ly), (ox, oy) in ((leg[0:2], leg[2:4]), (leg[2:4], leg[0:2])):
+                        if abs(lx - foot[0]) > _DEPTH_SYMBOL_JOIN_EPS or abs(ly - foot[1]) > _DEPTH_SYMBOL_JOIN_EPS:
+                            continue
+                        if oy >= foot[1]:  # the leg's far end must run upward from the foot
+                            continue
+                        if ox < foot[0]:
+                            joined_left = True
+                        elif ox > foot[0]:
+                            joined_right = True
+                if joined_left and joined_right:
+                    return True
         return False
 
     def find_vector_flatness_symbol(

@@ -104,6 +104,38 @@ class TestDiameterAndRadius:
         assert result.char_type == CharacteristicType.DIAMETER.value
         assert _close(result.nominal, 0.551)
 
+    def test_mangled_diameter_with_mangled_depth_splits_into_two(self):
+        # Real-world case: both the diameter and depth glyphs were mangled
+        # by the same CAD PDF export's custom font ("n" for Ø, "x" for
+        # ▽) -- "n.130 x.50 MAX" (Ø.130 ▽.50 MAX). Unlike the bare
+        # single-value fallback (which requires nothing else in the text),
+        # a genuine trailing depth here must still split into two
+        # characteristics rather than losing the depth value entirely.
+        results = parse_characteristics("n .130 x .50 MAX")
+        assert len(results) == 2
+        diameter, depth = results
+        assert diameter.char_type == CharacteristicType.DIAMETER.value
+        assert _close(diameter.nominal, 0.130)
+        assert diameter.raw_text == "⌀.130"
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 0.50)
+
+    def test_double_mangled_shape_symbol_with_tolerance_is_typed_from_first_marker(self):
+        # Real-world case: a counterbore whose diameter symbol is *also*
+        # mangled separately from the counterbore symbol itself -- "v
+        # n.159 +.002 -.000" (⌴Ø.159 +.002/-.000). No depth trails this
+        # one, so the secondary-value fallback declines it, but the
+        # generic classification path still resolves the type from the
+        # *first* (more specific) marker rather than defaulting to a bare
+        # linear dimension, and keeps the tolerance the value already
+        # carried.
+        result = parse_characteristic("v n .159 +.002 -.000")
+        assert _close(result.nominal, 0.159)
+        assert _close(result.tol_plus, 0.002)
+        assert _close(result.tol_minus, 0.0)
+        assert result.guessed_symbol_marker == "v"
+        assert result.raw_text == "⌀.159 +.002 -.000"
+
     def test_mangled_diameter_fallback_never_shadows_radius(self):
         # "R" is never a mangled substitute -- it's already an
         # unambiguous, real radius symbol in its own right.
@@ -163,6 +195,36 @@ class TestHoleFeatureModifiers:
         result = parse_characteristic("▼0.500")
         assert result.char_type == CharacteristicType.DEPTH.value
         assert _close(result.nominal, 0.5)
+
+    def test_hollow_triangle_depth_symbol(self):
+        # "▽" -- some CAD tools/fonts render the depth glyph unfilled
+        # rather than solid ("▼"); must be recognized the same way.
+        result = parse_characteristic("▽0.500")
+        assert result.char_type == CharacteristicType.DEPTH.value
+        assert _close(result.nominal, 0.5)
+
+    def test_depth_hint_classifies_bare_number_as_depth(self):
+        # depth_hint mirrors diameter_hint: the caller found a depth glyph
+        # drawn as vector line art (no character at all in the text, see
+        # PdfDocument.find_vector_depth_symbol) immediately before a bare
+        # number that would otherwise default to a plain linear dimension.
+        result = parse_characteristic("12.0", depth_hint=True)
+        assert result.char_type == CharacteristicType.DEPTH.value
+        assert _close(result.nominal, 12.0)
+        assert result.raw_text == "▼12.0"
+
+    def test_depth_hint_is_redundant_but_harmless_when_symbol_already_present(self):
+        result = parse_characteristic("▼0.500", depth_hint=True)
+        assert result.char_type == CharacteristicType.DEPTH.value
+        assert result.raw_text == "▼0.500"  # not double-prefixed
+
+    def test_depth_hint_does_not_apply_once_a_more_specific_pattern_already_matched(self):
+        # depth_hint only affects the generic bare-value fallback -- a
+        # callout that already matches a more specific earlier pattern
+        # (here, a thread) must be classified as that, not read as a depth
+        # just because the caller also passed depth_hint=True.
+        result = parse_characteristic("M4-6H", depth_hint=True)
+        assert result.char_type == CharacteristicType.THREAD.value
 
     def test_counterbore_symbol_with_diameter(self):
         result = parse_characteristic("⌴⌀0.750")
@@ -485,12 +547,38 @@ class TestThread:
         assert thread.thread_callout == "M4-6H"
         assert _close(depth.nominal, 8.0)
 
+    def test_metric_thread_class_with_en_dash_separator(self):
+        # "M4 – 6H" -- word-processing "smart typography" (and CAD
+        # annotation editors built on it) silently converts a spaced hyphen
+        # into an en dash as it's typed, so a drawing authored as "M4 - 6H"
+        # can end up with this character in its extracted PDF text. Must
+        # still be recognized as a thread, not fall through to being
+        # misread as a bogus linear dimension ("4").
+        results = parse_characteristics("M4 – 6H ▽ 8.0")
+        assert len(results) == 2
+        thread, depth = results
+        assert thread.char_type == CharacteristicType.THREAD.value
+        assert thread.thread_callout == "M4-6H"
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 8.0)
+
     def test_pipe_thread_with_class_and_depth_splits_into_two(self):
         # "G1/2\" - 6H" -- an ISO 228 parallel pipe thread (BSPP), common on
         # hydraulic/pneumatic fittings. Previously unmatched by any thread
         # pattern (no "M" prefix, no UNC/UNF suffix), so the leading "1" in
         # the "1/2" fraction was misread as a bogus depth/nominal value.
         results = parse_characteristics('G1/2" - 6H ↧ 18.0')
+        assert len(results) == 2
+        thread, depth = results
+        assert thread.char_type == CharacteristicType.THREAD.value
+        assert thread.thread_callout == 'G1/2"-6H'
+        assert depth.char_type == CharacteristicType.DEPTH.value
+        assert _close(depth.nominal, 18.0)
+
+    def test_pipe_thread_with_en_dash_class_separator(self):
+        # Same en-dash substitution as the metric-class case above, on a
+        # pipe thread's class separator.
+        results = parse_characteristics('G1/2" – 6H ▽ 18.0')
         assert len(results) == 2
         thread, depth = results
         assert thread.char_type == CharacteristicType.THREAD.value

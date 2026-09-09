@@ -167,11 +167,8 @@ def apply_light_theme(app: QApplication) -> None:
             width: 20px; border: none; border-left: 1px solid {_LINE};
         }}
         QComboBox::down-arrow {{
-            width: 0; height: 0;
-            border-left: 4px solid transparent; border-right: 4px solid transparent;
-            border-top: 5px solid {_INK_SOFT};
+            image: url("{_SPIN_DOWN_LIGHT}"); width: 7px; height: 4px;
         }}
-        QComboBox::down-arrow:disabled {{ border-top-color: {_DISABLED}; }}
         QComboBox QAbstractItemView {{
             background: #ffffff; border: 1px solid {_BORDER_STRONG};
             selection-background-color: {_ACCENT_TINT}; selection-color: {_INK}; outline: none;

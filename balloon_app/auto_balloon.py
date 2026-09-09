@@ -36,6 +36,7 @@ from balloon_app.data_model import Balloon, BalloonSource, CharacteristicType, R
 from balloon_app.gdt_vision import SYMBOLS, find_gdt_frames
 from balloon_app.ocr_parser import (
     NUM,
+    THREAD_DASH_CHARS,
     DefaultTolerances,
     apply_default_tolerance,
     parse_characteristic,
@@ -53,14 +54,30 @@ _DECIMAL_NUMBER_RE = re.compile(r"\d+\.\d+|\.\d+")
 _SYMBOL_HINT_RE = re.compile(
     r"[⌀ØΦ∅]|±|°|\bRa\b|\bDIA\b|"
     r"⏤|⏥|○|⌭|⌒|⌓|⟂|∠|∥|⌯|⌖|◎|↗|⌰|⌇|"
-    r"[▼↓⌴⌵□]",
+    r"[▼▽↓⌴⌵□]",
     re.IGNORECASE,
 )
 _RADIUS_HINT_RE = re.compile(r"(?<![A-Za-z])R(?![a-zA-Z])\s*\d")
 _METRIC_THREAD_HINT_RE = re.compile(r"\bM\d+\.?\d*\s*[xX×]\s*\d")
-_UNIFIED_THREAD_HINT_RE = re.compile(
-    r"\b\d+(?:/\d+)?\s*-\s*\d+\s*(UNC|UNF|UNEF|UN|NPT|NPTF)\b", re.IGNORECASE
+# A metric thread's tolerance-class form with no pitch given ("M4-6H") has
+# no "x"/decimal for _METRIC_THREAD_HINT_RE to key off, and no UNC/UNF-style
+# keyword either -- without this, such a callout has nothing recognizable
+# to a pre-filter that only knows to look for a decimal number or a known
+# symbol, so it's discarded here before ever reaching the actual parser
+# (see ocr_parser._THREAD_METRIC_CLASS_RE, which this mirrors).
+_METRIC_THREAD_CLASS_HINT_RE = re.compile(
+    rf"\bM\s?\d+\.?\d*\s*(?:[xX×]\s*{NUM}\s*)?[{THREAD_DASH_CHARS}]\s*\d{{1,2}}[A-Za-z]\b"
 )
+_UNIFIED_THREAD_HINT_RE = re.compile(
+    rf"\b\d+(?:/\d+)?\s*[{THREAD_DASH_CHARS}]\s*\d+\s*(UNC|UNF|UNEF|UN|NPT|NPTF)\b", re.IGNORECASE
+)
+# An ISO 228 parallel pipe thread ("G1/2\" - 6H") has the same problem as the
+# metric class-only form above -- no decimal, no UNC/UNF keyword -- plus its
+# own prefix ("G") isn't covered by any other hint. Restricted to a
+# fractional size for the same reason ocr_parser._THREAD_PIPE_RE is: a bare
+# "G" + whole number ("G10", "G11") is a common fiberglass-laminate material
+# code, not a thread.
+_PIPE_THREAD_HINT_RE = re.compile(rf"\bG\d+/\d+\b")
 _PIPE_DATUM_HINT_RE = re.compile(r"\d\s*\|\s*[A-Z]")
 # A short, bare integer with nothing else attached: "1", "2", "23", "(4)".
 # These are almost always zone/sheet/revision markers, not dimensions.
@@ -173,6 +190,105 @@ def _title_block_regions(
     return regions
 
 
+_REVISION_TABLE_ANCHOR_RE = re.compile(r"\bREVISION\s+HISTORY\b", re.IGNORECASE)
+_REVISION_TABLE_HEADER_RE = re.compile(
+    r"^(ZONE|REV|VER|VERSION|DESCRIPTION|DATE|APPROVED(?:\s+BY)?|BY)$", re.IGNORECASE
+)
+_REVISION_TABLE_ROW_MARKER_RE = re.compile(r"^(REV|ZONE|VER|VERSION)$", re.IGNORECASE)
+# How far below the "REVISION HISTORY" heading its own column-header row
+# (ZONE/REV/VER/...) can plausibly start.
+_REVISION_TABLE_HEADER_SEARCH_HEIGHT_PDF_POINTS = 40.0
+# A gap this large between successive rows in the narrow marker column (see
+# below) marks the end of the table's populated rows.
+_REVISION_TABLE_ROW_GAP_PDF_POINTS = 20.0
+_REVISION_TABLE_COLUMN_MARGIN_PDF_POINTS = 6.0
+
+
+def _revision_table_regions(
+    blocks: list[TextBlock],
+) -> list[tuple[float, float, float, float]]:
+    """Infer a revision-history table's bounding region from its own
+    "REVISION HISTORY" heading, wherever it sits on the page.
+
+    Unlike the title block (which conventionally runs to a sheet edge, so
+    "everything from this anchor to the page edge" is a safe cutoff), a
+    revision table is commonly drawn at the *top* of the sheet with real
+    drawing content close below and around it, so its extent can't be
+    assumed to reach any edge, and a generously wide "grow until a gap"
+    search across the table's full (wide) column span is a real hazard: a
+    dimension callout sitting just a bit closer below the table than the
+    table's own row spacing can get silently folded in, and everything
+    below that dimension along with it, snowballing the excluded region
+    far past the actual table.
+
+    Instead the table's width comes from its own column-header cells
+    (ZONE/REV/VER/DESCRIPTION/DATE/APPROVED[ BY]), found within a small
+    window below the heading, and its height is measured only through the
+    REV or ZONE column specifically -- a narrow strip holding nothing but
+    a short per-row code, so unrelated drawing content essentially never
+    coincidentally lands in that exact x-slice the way it can across the
+    table's much wider DESCRIPTION column. Without this, every row's
+    REV/VER code is a bare 1-3 character value textually indistinguishable
+    from a real whole-number dimension.
+    """
+    anchors = [b for b in blocks if _REVISION_TABLE_ANCHOR_RE.search(b.text)]
+    regions: list[tuple[float, float, float, float]] = []
+    for anchor in anchors:
+        ax0, ay0, ax1, ay1 = anchor.bbox
+        headers = [
+            b for b in blocks
+            if b is not anchor and _REVISION_TABLE_HEADER_RE.match(b.text.strip())
+            and ay1 <= b.bbox[1] <= ay1 + _REVISION_TABLE_HEADER_SEARCH_HEIGHT_PDF_POINTS
+        ]
+        if not headers:
+            continue
+        table_left = min(min(b.bbox[0] for b in headers), ax0)
+        table_right = max(max(b.bbox[2] for b in headers), ax1)
+        header_bottom = max(b.bbox[3] for b in headers)
+
+        row_markers = [b for b in headers if _REVISION_TABLE_ROW_MARKER_RE.match(b.text.strip())]
+        bottom = header_bottom
+        for row_marker in row_markers:
+            # A table's ZONE column, in particular, is commonly left blank
+            # on every row (no zone applies) -- try each candidate narrow
+            # column in turn and keep whichever actually has row data
+            # below it, rather than committing to the first one found.
+            col_left = row_marker.bbox[0] - _REVISION_TABLE_COLUMN_MARGIN_PDF_POINTS
+            col_right = row_marker.bbox[2] + _REVISION_TABLE_COLUMN_MARGIN_PDF_POINTS
+            column_cells = sorted(
+                (b for b in blocks if b is not anchor and b not in headers
+                 and b.bbox[1] >= header_bottom and col_left <= b.bbox[0] and b.bbox[2] <= col_right),
+                key=lambda b: b.bbox[1],
+            )
+            if not column_cells or column_cells[0].bbox[1] - header_bottom > _REVISION_TABLE_ROW_GAP_PDF_POINTS:
+                continue
+            candidate_bottom, last_bottom = header_bottom, header_bottom
+            # The gap tolerance tightens as real rows are found: the very
+            # first gap (header row to the first data row) can legitimately
+            # be as large as the fixed ceiling, but a mangled dimensioning-
+            # symbol character (see ocr_parser's mangled-symbol fallbacks)
+            # is just as narrow as a REV/VER code and can coincidentally
+            # land in this same column further down the page -- once the
+            # table's own row-to-row rhythm is established (consistently
+            # much smaller), a gap blowing well past that rhythm is no
+            # longer read as "just a slightly tall row".
+            max_row_gap = None
+            for block in column_cells:
+                gap = block.bbox[1] - last_bottom
+                limit = _REVISION_TABLE_ROW_GAP_PDF_POINTS if max_row_gap is None else max(max_row_gap * 1.8, 6.0)
+                if gap > limit:
+                    break
+                max_row_gap = gap if max_row_gap is None else max(max_row_gap, gap)
+                candidate_bottom = max(candidate_bottom, block.bbox[3])
+                last_bottom = block.bbox[3]
+            bottom = max(bottom, candidate_bottom)
+        # No narrow, reliable column had any data below it -- fall back to
+        # just the header row's own extent rather than risk an open-ended
+        # guess (bottom already defaults to header_bottom in that case).
+        regions.append((table_left - 4.0, ay0 - 4.0, table_right + 4.0, bottom + 4.0))
+    return regions
+
+
 def _bbox_in_regions(
     bbox: tuple[float, float, float, float],
     regions: list[tuple[float, float, float, float]],
@@ -235,7 +351,9 @@ def _looks_like_characteristic(
         or _SYMBOL_HINT_RE.search(text)
         or _RADIUS_HINT_RE.search(text)
         or _METRIC_THREAD_HINT_RE.search(text)
+        or _METRIC_THREAD_CLASS_HINT_RE.search(text)
         or _UNIFIED_THREAD_HINT_RE.search(text)
+        or _PIPE_THREAD_HINT_RE.search(text)
         or _PIPE_DATUM_HINT_RE.search(text)
     )
 
@@ -256,6 +374,7 @@ class Detection:
     diameter_hint: bool = False
     gdt_frame_hint: bool = False
     flatness_hint: bool = False
+    depth_hint: bool = False
     gdt_symbol_hint: Optional[str] = None
 
 
@@ -490,10 +609,45 @@ def _merge_nearby_text_blocks(blocks: list[TextBlock], y_tol: float = 3.0, x_gap
     every one of them into a single block would silently keep only the
     first value and drop the rest as one balloon instead of several -- see
     _merge_gap_is_safe for how the two are told apart.
+
+    Rows are found by chaining blocks whose vertical centers lie within
+    ``y_tol`` of a neighbor (transitively, like _cluster_touching_rects in
+    pdf_engine.py), not by independently rounding each block's position
+    into a bucket. A mangled dimensioning-symbol glyph (see ocr_parser's
+    mangled-symbol fallbacks) is often drawn from a different, taller
+    custom symbol font than the digits beside it, so its box can start a
+    couple of points higher even though it's meant to sit on the very same
+    visual line -- rounding each block's position independently can then
+    put two blocks whose raw centers differ by less than y_tol on opposite
+    sides of a rounding boundary, splitting them into different buckets by
+    pure chance. Chaining sidesteps that: a diameter's "n" and its own
+    value end up in the same row regardless of exactly where either one's
+    center rounds to.
     """
     if not blocks:
         return []
-    ordered = sorted(blocks, key=lambda b: (round(b.bbox[1] / max(y_tol, 0.1)), b.bbox[0]))
+    centers = [(b.bbox[1] + b.bbox[3]) / 2.0 for b in blocks]
+    by_center = sorted(range(len(blocks)), key=lambda i: centers[i])
+    parent = list(range(len(blocks)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a, b in zip(by_center, by_center[1:]):
+        if centers[b] - centers[a] <= y_tol:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+
+    rows: dict[int, list[int]] = {}
+    for i in by_center:
+        rows.setdefault(find(i), []).append(i)
+    row_order = sorted(rows.values(), key=lambda idxs: sum(centers[i] for i in idxs) / len(idxs))
+    ordered = [blocks[i] for idxs in row_order for i in sorted(idxs, key=lambda i: blocks[i].bbox[0])]
+
     merged: list[TextBlock] = [ordered[0]]
     for nxt in ordered[1:]:
         current = merged[-1]
@@ -551,10 +705,21 @@ def _union_bbox(
     return (min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3]))
 
 
-def _bbox_center_distance(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
-    ax, ay = (a[0] + a[2]) / 2.0, (a[1] + a[3]) / 2.0
-    bx, by = (b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0
-    return ((ax - bx) ** 2 + (ay - by) ** 2) ** 0.5
+def _bbox_gap_distance(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    """Distance between two bboxes' nearest edges (0 if they overlap on an
+    axis), not their centers. A wide anchor block's center can sit far from
+    a fragment even when the anchor's own edge is right next to it --
+    e.g. a long merged thread+depth line whose center happens to fall
+    closer to an unrelated tolerance fragment stacked on the line below
+    than the fragment's own true anchor (a short value immediately beside
+    it) does. Comparing edges instead of centers isn't fooled by an
+    anchor's width/height this way.
+    """
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    dx = max(ax0 - bx1, bx0 - ax1, 0.0)
+    dy = max(ay0 - by1, by0 - ay1, 0.0)
+    return (dx * dx + dy * dy) ** 0.5
 
 
 def _bbox_center_within(
@@ -619,21 +784,55 @@ def _merge_stacked_tolerance_fragments(
     ]
     has_digit = [bool(re.search(r"\d", b.text)) for b in blocks]
 
-    # Each fragment picks its single closest eligible anchor, rather than
-    # anchors greedily claiming whatever fragment they encounter first.
+    # Two sign fragments that are each other's mutually-nearest sign
+    # fragment are read as one stacked +/- pair (e.g. "+.002" over
+    # "-.000") and must resolve to the *same* anchor -- otherwise, decided
+    # purely individually, one can end up a hair's-width closer to some
+    # other nearby value than to the value its sibling already resolved
+    # to, splitting a single tolerance across two different balloons.
+    def _nearest_sign_fragment(idx: int) -> Optional[int]:
+        best_j, best_d = None, None
+        for j2 in range(len(blocks)):
+            if j2 == idx or not is_sign_fragment[j2]:
+                continue
+            if not _bboxes_are_near(blocks[idx].bbox, blocks[j2].bbox, y_gap, x_slack):
+                continue
+            d = _bbox_gap_distance(blocks[idx].bbox, blocks[j2].bbox)
+            if best_d is None or d < best_d:
+                best_j, best_d = j2, d
+        return best_j
+
+    # Each fragment (or fragment pair) picks its single closest eligible
+    # anchor, rather than anchors greedily claiming whatever fragment they
+    # encounter first.
     fragment_anchor: dict[int, int] = {}
     for j, frag in enumerate(blocks):
         if not is_sign_fragment[j]:
             continue
-        best_i, best_dist = None, None
+        sibling = _nearest_sign_fragment(j)
+        query_bbox = frag.bbox
+        if sibling is not None and _nearest_sign_fragment(sibling) == j:
+            query_bbox = _union_bbox(frag.bbox, blocks[sibling].bbox)
+        best_i, best_key = None, None
         for i, cand in enumerate(blocks):
             if i == j or is_sign_fragment[i] or not has_digit[i]:
                 continue
-            if not _bboxes_are_near(cand.bbox, frag.bbox, y_gap, x_slack):
+            if not _bboxes_are_near(cand.bbox, query_bbox, y_gap, x_slack):
                 continue
-            dist = _bbox_center_distance(cand.bbox, frag.bbox)
-            if best_dist is None or dist < best_dist:
-                best_i, best_dist = i, dist
+            dist = _bbox_gap_distance(cand.bbox, query_bbox)
+            overlaps_row = min(cand.bbox[3], query_bbox[3]) > max(cand.bbox[1], query_bbox[1])
+            # A +/- fragment (or pair) almost always shares some vertical
+            # extent with its own value's line -- it's written stacked
+            # immediately above/below/beside that value, not offset to a
+            # whole other row. Rank an anchor whose row it actually
+            # overlaps ahead of one it's merely a hair's-width closer to on
+            # a pure gap-distance basis (e.g. a fragment sitting almost
+            # exactly between two dimensions can end up fractionally
+            # nearer the unrelated one below it than the value it actually
+            # belongs to).
+            key = (0 if overlaps_row else 1, dist)
+            if best_key is None or key < best_key:
+                best_i, best_key = i, key
         if best_i is not None:
             fragment_anchor[j] = best_i
 
@@ -855,9 +1054,13 @@ def auto_balloon_page(
     except Exception:
         page_width = page_height = None
     page_size = (page_width, page_height) if page_width and page_height else None
-    title_block_regions = (
-        _title_block_regions(native_blocks, page_width, page_height)
-        if page_width and page_height else []
+    # A revision-history table is excluded the same way as the title
+    # block/parts list below -- never a real characteristic -- but isn't
+    # restricted to the bottom half of the page, since it's conventionally
+    # drawn at the *top* of the sheet instead.
+    excluded_regions = (
+        (_title_block_regions(native_blocks, page_width, page_height) if page_width and page_height else [])
+        + _revision_table_regions(native_blocks)
     )
 
     # Some CAD PDF exports draw the diameter (Ø) glyph as vector line art
@@ -874,6 +1077,12 @@ def auto_balloon_page(
     # pre-merge blocks and for the same reason.
     gdt_frame_hint_bboxes: list[tuple[float, float, float, float]] = []
     flatness_hint_bboxes: list[tuple[float, float, float, float]] = []
+    # Likewise, the "depth" glyph is often drawn as vector line art rather
+    # than a font character (see PdfDocument.find_vector_depth_symbol) --
+    # without this, a hole/thread's depth value is textually indistinguishable
+    # from an unrelated bare linear dimension, since nothing in the text
+    # itself says "depth" at all.
+    depth_hint_bboxes: list[tuple[float, float, float, float]] = []
     # A bare 1-2 digit number circled on an assembly drawing is an
     # item-reference "balloon" pointing at a Parts List row, not a
     # dimension -- textually identical to a real whole-number dimension, so
@@ -883,7 +1092,7 @@ def auto_balloon_page(
     # geometry check is comparatively expensive to run on every block.
     item_balloon_hint_bboxes: list[tuple[float, float, float, float]] = []
     for block in native_blocks:
-        if _bbox_in_regions(block.bbox, title_block_regions):
+        if _bbox_in_regions(block.bbox, excluded_regions):
             continue
         if pdf_doc.find_vector_diameter_symbol(page_number, block.bbox):
             diameter_hint_bboxes.append(block.bbox)
@@ -891,6 +1100,8 @@ def auto_balloon_page(
             gdt_frame_hint_bboxes.append(block.bbox)
             if pdf_doc.find_vector_flatness_symbol(page_number, block.bbox):
                 flatness_hint_bboxes.append(block.bbox)
+        if pdf_doc.find_vector_depth_symbol(page_number, block.bbox):
+            depth_hint_bboxes.append(block.bbox)
         if _BARE_SHORT_INTEGER_RE.match(block.text.strip()) and pdf_doc.find_vector_circle_around_text(
             page_number, block.bbox
         ):
@@ -899,7 +1110,7 @@ def auto_balloon_page(
     merged_native_blocks = _merge_stacked_tolerance_fragments(_merge_nearby_text_blocks(native_blocks))
 
     for block in merged_native_blocks:
-        if _bbox_in_regions(block.bbox, title_block_regions):
+        if _bbox_in_regions(block.bbox, excluded_regions):
             continue  # inside the title block -- never a real characteristic
         if any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in item_balloon_hint_bboxes):
             continue  # circled item-reference number, not a dimension
@@ -921,6 +1132,7 @@ def auto_balloon_page(
                 diameter_hint=diameter_hint,
                 gdt_frame_hint=gdt_frame_hint,
                 flatness_hint=any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in flatness_hint_bboxes),
+                depth_hint=any(_bbox_center_within(raw_bbox, block.bbox) for raw_bbox in depth_hint_bboxes),
             )
         )
 
@@ -945,7 +1157,7 @@ def auto_balloon_page(
                 # OCR boxes are inherently ink-backed (Tesseract only reports
                 # boxes where it found glyphs), so no extra ink check needed.
                 bbox_pdf = rect_pixel_to_pdf(det.bbox, dpi)
-                if _bbox_in_regions(bbox_pdf, title_block_regions):
+                if _bbox_in_regions(bbox_pdf, excluded_regions):
                     continue  # inside the title block -- never a real characteristic
                 candidates.append(
                     Detection(bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text)
@@ -963,7 +1175,7 @@ def auto_balloon_page(
             frame_used_ocr = False
             cell_texts = []
             cell_boxes = [rect_pixel_to_pdf(cell, dpi) for cell in frame.cells]
-            if _bbox_in_regions(cell_boxes[0], title_block_regions):
+            if _bbox_in_regions(cell_boxes[0], excluded_regions):
                 continue
             for cell, box in zip(frame.cells, cell_boxes):
                 spans = [b for b in native_blocks if _bbox_center_within(b.bbox, box)]
@@ -1031,7 +1243,7 @@ def auto_balloon_page(
             parse_characteristics((SYMBOLS[det.gdt_symbol_hint] + " " if det.gdt_symbol_hint
                                    else "⏥ " if det.flatness_hint else "") + raw_text,
                                   diameter_hint=det.diameter_hint, gdt_frame_hint=det.gdt_frame_hint,
-                                  learned_symbols=learned_symbols)
+                                  depth_hint=det.depth_hint, learned_symbols=learned_symbols)
             if raw_text
             else [None]
         )

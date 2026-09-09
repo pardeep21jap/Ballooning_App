@@ -92,11 +92,14 @@ def test_balloon_lands_on_target_on_rotated_page(tmp_path):
     out_doc.close()
 
     # A default Balloon (source="manual", status="accepted") is filled with
-    # COLOR_MANUAL, a distinct blue -- isolate it from the page's own black
-    # "0.500" text and white background rather than matching any non-white
-    # pixel (which the source text itself would also satisfy).
-    blue_mask = (img[:, :, 2] > 150) & (img[:, :, 0] < 150)
-    ys, xs = np.where(blue_mask)
+    # COLOR_ACCEPTED, a distinct green -- isolate it from the page's own
+    # black "0.500" text and white background by requiring the green
+    # channel to clearly dominate (a gray anti-aliased text edge has all
+    # three channels roughly equal, so a plain "green channel is high"
+    # check alone isn't enough to exclude it).
+    g = img[:, :, 1].astype(int)
+    green_mask = (g - img[:, :, 0].astype(int) > 40) & (g - img[:, :, 2].astype(int) > 40)
+    ys, xs = np.where(green_mask)
     assert len(xs) > 0, "balloon circle was not drawn at all"
     drawn_x, drawn_y = xs.mean(), ys.mean()
 

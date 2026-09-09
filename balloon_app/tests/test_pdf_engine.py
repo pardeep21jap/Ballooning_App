@@ -206,6 +206,107 @@ class TestFindVectorDiameterSymbol:
         pdf_doc.close()
 
 
+class TestFindVectorDepthSymbol:
+    """Some CAD PDF exporters draw the "depth" glyph (a vertical stem with
+    a downward chevron/arrowhead at its foot) as vector line art rather
+    than a font character, so it never appears in extract_text_blocks'
+    output at all -- not even as a mangled substitute character.
+    find_vector_depth_symbol is the fallback: look for that stem+chevron
+    structure immediately left of a dimension's text bbox.
+    """
+
+    def _draw_depth_glyph(self, page, x_right, y_center, size=12.0):
+        """Draw the stem+chevron shape with its rightmost point at
+        ``x_right``, vertically centered on ``y_center`` -- matches the
+        real-world glyph geometry this method was reverse-engineered from
+        (see the PR that introduced it)."""
+        top = y_center - size / 2.0
+        bottom = y_center + size / 2.0
+        stem_x = x_right - size * 0.4
+        half_width = size * 0.4
+        page.draw_line(fitz.Point(stem_x - half_width, top), fitz.Point(x_right, top))
+        page.draw_line(fitz.Point(stem_x, top), fitz.Point(stem_x, bottom))
+        page.draw_line(fitz.Point(stem_x, bottom), fitz.Point(stem_x - half_width, bottom - size * 0.3))
+        page.draw_line(fitz.Point(stem_x, bottom), fitz.Point(x_right, bottom - size * 0.3))
+
+    def _text_bbox(self, path, text):
+        doc = fitz.open(str(path))
+        page = doc[0]
+        span = next(
+            span
+            for block in page.get_text("dict")["blocks"]
+            for line in block["lines"]
+            for span in line["spans"]
+            if span["text"].strip() == text
+        )
+        doc.close()
+        return tuple(span["bbox"])
+
+    def test_detects_stem_and_chevron_immediately_left_of_text(self, tmp_path):
+        pdf_path = tmp_path / "depth_glyph.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 190), "6 x O3.3", fontsize=12)
+        page.insert_text((112, 190), "12.0", fontsize=12)
+        bbox = tuple(
+            span["bbox"]
+            for block in page.get_text("dict")["blocks"]
+            for line in block["lines"]
+            for span in line["spans"]
+            if span["text"].strip() == "12.0"
+        )[0]
+        self._draw_depth_glyph(page, x_right=bbox[0] - 4.0, y_center=(bbox[1] + bbox[3]) / 2.0)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_depth_symbol(0, bbox) is True
+        pdf_doc.close()
+
+    def test_no_nearby_shape_returns_false(self, tmp_path):
+        pdf_path = tmp_path / "no_symbol.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((60, 200), "12.0", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        bbox = self._text_bbox(pdf_path, "12.0")
+        assert pdf_doc.find_vector_depth_symbol(0, bbox) is False
+        pdf_doc.close()
+
+    def test_bare_arrowhead_without_stem_is_not_mistaken_for_the_glyph(self, tmp_path):
+        """A plain dimension-line arrowhead is the same segment count and a
+        similar size as this glyph's chevron -- only the added stem
+        segment tells them apart. Two chevron-only lines with no stem must
+        not false-positive."""
+        pdf_path = tmp_path / "arrowhead.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 190), "6 x O3.3", fontsize=12)
+        page.insert_text((112, 190), "12.0", fontsize=12)
+        bbox = tuple(
+            span["bbox"]
+            for block in page.get_text("dict")["blocks"]
+            for line in block["lines"]
+            for span in line["spans"]
+            if span["text"].strip() == "12.0"
+        )[0]
+        x_right, y_center = bbox[0] - 4.0, (bbox[1] + bbox[3]) / 2.0
+        page.draw_line(fitz.Point(x_right - 4.0, y_center + 4.0), fitz.Point(x_right, y_center - 2.0))
+        page.draw_line(fitz.Point(x_right - 8.0, y_center + 4.0), fitz.Point(x_right - 4.0, y_center + 4.0))
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        assert pdf_doc.find_vector_depth_symbol(0, bbox) is False
+        pdf_doc.close()
+
+
 class TestFindVectorGdtFrame:
     """A GD&T feature control frame's symbol (flatness, straightness, etc.)
     is almost always drawn as vector line art, contributing no character at

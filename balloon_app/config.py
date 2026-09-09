@@ -84,20 +84,23 @@ RULES_OCR_MODEL_VERSION = "rules_ocr_v2_gdt"
 # ---------------------------------------------------------------------------
 COLOR_PENDING = (255, 165, 0, 255)       # orange - auto-proposed, pending review
 COLOR_ACCEPTED = (46, 160, 67, 255)      # green
-COLOR_MANUAL = (33, 110, 220, 255)       # blue - manually added
 COLOR_REJECTED = (170, 60, 60, 255)      # muted red
 COLOR_EDITED = (46, 160, 67, 255)        # treated visually like accepted
 COLOR_SELECTED_OUTLINE = (255, 0, 255, 255)  # magenta selection outline
 
 
 def status_color(source: str, status: str) -> tuple[int, int, int, int]:
-    """Return the RGBA display color for a balloon given its source/status."""
+    """Return the RGBA display color for a balloon given its source/status.
+
+    Color reflects review status only -- a manually added balloon that's
+    accepted looks identical to an auto-proposal that's accepted, since
+    "accepted" is meant to read as one consistent final state regardless of
+    how the balloon was created.
+    """
     if status == "rejected":
         return COLOR_REJECTED
     if status == "pending":
         return COLOR_PENDING
-    if source == "manual" and status == "accepted":
-        return COLOR_MANUAL
     if status in ("accepted", "edited"):
         return COLOR_ACCEPTED
     return COLOR_PENDING

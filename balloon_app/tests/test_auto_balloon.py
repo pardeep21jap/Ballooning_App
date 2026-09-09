@@ -11,8 +11,10 @@ import pytest
 
 from balloon_app.auto_balloon import (
     _bbox_has_ink,
+    _looks_like_characteristic,
     _merge_nearby_text_blocks,
     _merge_stacked_tolerance_fragments,
+    _revision_table_regions,
     auto_balloon_page,
 )
 from balloon_app.data_model import CharacteristicType
@@ -165,6 +167,102 @@ class TestCompoundThreadDepthCallout:
             CharacteristicType.DEPTH.value,
             CharacteristicType.THREAD.value,
         ])
+
+    def test_metric_thread_class_alone_is_not_discarded_by_prefilter(self):
+        # "M4-6H" (no pitch, no decimal number, no UNC/UNF keyword) has
+        # nothing a plain decimal/symbol pre-filter would recognize as a
+        # dimension -- it was previously discarded before ever reaching the
+        # parser, so no Thread balloon was produced for it at all (not
+        # misclassified -- entirely dropped).
+        assert _looks_like_characteristic("M4-6H")
+        assert _looks_like_characteristic("M4 - 6H")
+
+    def test_pipe_thread_alone_is_not_discarded_by_prefilter(self):
+        assert _looks_like_characteristic('G1/2" - 6H')
+
+    def test_bare_material_code_is_still_rejected_by_prefilter(self):
+        # "G10"/"G11" (fiberglass-laminate material codes) must not be
+        # swept up by the new pipe-thread hint -- it's restricted to a
+        # fractional size for exactly this reason.
+        assert not _looks_like_characteristic("G10")
+        assert not _looks_like_characteristic("G11")
+
+    def test_metric_thread_class_alone_on_its_own_line_produces_thread_balloon(self, tmp_path):
+        """Reproduces a real drawing's tapped-hole note: the thread's own
+        line has no pitch and no depth character at all (the depth glyph is
+        drawn as vector line art with no ToUnicode mapping, so it
+        contributes nothing to the extracted text) -- just "M4-6H" by
+        itself. That line must still produce its own Thread balloon rather
+        than being discarded entirely by the characteristic pre-filter.
+        """
+        pdf_path = tmp_path / "thread_class_alone.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 190), "6 x Ø3.3", fontsize=12)
+        page.insert_text((50, 210), "M4 - 6H", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        char_types = [b.char_type for b in result.balloons]
+        assert CharacteristicType.THREAD.value in char_types
+        thread = next(b for b in result.balloons if b.char_type == CharacteristicType.THREAD.value)
+        assert thread.thread_callout == "M4-6H"
+
+    def _draw_depth_glyph(self, page, x_right, y_center, size=12.0):
+        """Draw the ASME depth glyph (a vertical stem with a downward
+        chevron/arrowhead at its foot) as vector line art, matching how
+        some CAD PDF exporters draw it -- with no font character at all,
+        not even a mangled one."""
+        top, bottom = y_center - size / 2.0, y_center + size / 2.0
+        stem_x, half_width = x_right - size * 0.4, size * 0.4
+        page.draw_line(fitz.Point(stem_x - half_width, top), fitz.Point(x_right, top))
+        page.draw_line(fitz.Point(stem_x, top), fitz.Point(stem_x, bottom))
+        page.draw_line(fitz.Point(stem_x, bottom), fitz.Point(stem_x - half_width, bottom - size * 0.3))
+        page.draw_line(fitz.Point(stem_x, bottom), fitz.Point(x_right, bottom - size * 0.3))
+
+    def test_full_real_world_layout_produces_four_balloons(self, tmp_path):
+        """End-to-end reproduction of a real drawing's tapped-hole note:
+        "6 x Ø3.3 [depth-glyph] 12.0" on one line, "M4 - 6H [depth-glyph]
+        8.0" on the next, where the depth glyph is vector line art
+        contributing no character to the extracted text at all. Must
+        produce all four characteristics -- Diameter, Depth, Thread,
+        Depth -- not the "3 balloons for 4 dimensions" this drawing
+        originally triggered (a missing Thread balloon, plus its depth
+        misread as a bare Linear Dimension).
+        """
+        pdf_path = tmp_path / "full_real_world_layout.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((50, 190), "6 x Ø3.3", fontsize=12)
+        page.insert_text((112, 190), "12.0", fontsize=12)
+        self._draw_depth_glyph(page, x_right=104.0, y_center=186.0)
+        page.insert_text((50, 215), "M4 - 6H", fontsize=12)
+        page.insert_text((112, 215), "8.0", fontsize=12)
+        self._draw_depth_glyph(page, x_right=104.0, y_center=211.0)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        char_types = sorted(b.char_type for b in result.balloons)
+        assert char_types == sorted([
+            CharacteristicType.DIAMETER.value,
+            CharacteristicType.DEPTH.value,
+            CharacteristicType.THREAD.value,
+            CharacteristicType.DEPTH.value,
+        ])
+        thread = next(b for b in result.balloons if b.char_type == CharacteristicType.THREAD.value)
+        assert thread.thread_callout == "M4-6H"
+        depths = sorted(b.nominal for b in result.balloons if b.char_type == CharacteristicType.DEPTH.value)
+        assert depths == [pytest.approx(8.0), pytest.approx(12.0)]
 
 
 class TestDefaultTolerances:
@@ -386,6 +484,88 @@ class TestTitleBlockExclusion:
         assert any("0.750" in t for t in raw_texts)
         assert not any("BASE TUBE" in t or "A1151" in t or "A1153" in t for t in raw_texts)
 
+    def test_revision_history_table_is_not_ballooned(self, tmp_path):
+        """A revision-history table's REV/VER column is a bare 1-3
+        character code (often "01", "02", ...) that's textually
+        indistinguishable from a real whole-number dimension -- and unlike
+        the title block/parts list, it's conventionally drawn at the *top*
+        of the sheet, not the bottom, so it needs its own region check
+        rather than reusing _title_block_regions' bottom-half search.
+        """
+        pdf_path = tmp_path / "revision_table.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=600, height=800)
+        page.insert_text((250, 30), "REVISION HISTORY", fontsize=10)
+        page.insert_text((60, 50), "ZONE", fontsize=8)
+        page.insert_text((110, 50), "REV", fontsize=8)
+        page.insert_text((150, 50), "VER", fontsize=8)
+        page.insert_text((300, 50), "DESCRIPTION", fontsize=8)
+        page.insert_text((450, 50), "DATE", fontsize=8)
+        page.insert_text((520, 50), "APPROVED BY", fontsize=8)
+        rows = [
+            ("A", "01", "INITIAL RELEASE", "2026-07-24", "JRH"),
+            ("A", "02", "CHANGED TOLERANCES", "2026-08-10", "JRH"),
+            ("A", "03", "CHANGED GEOMETRY, TOLERANCES", "2026-08-28", "JRH"),
+        ]
+        y = 70
+        for rev, ver, desc, date, approved in rows:
+            page.insert_text((110, y), rev, fontsize=8)
+            page.insert_text((150, y), ver, fontsize=8)
+            page.insert_text((300, y), desc, fontsize=8)
+            page.insert_text((450, y), date, fontsize=8)
+            page.insert_text((520, y), approved, fontsize=8)
+            y += 20
+        # A real dimension elsewhere on the drawing, well below the table.
+        page.insert_text((100, 400), "2X Ø8.0", fontsize=12)
+        page.insert_text((100, 700), "75.0", fontsize=12)
+        doc.save(str(pdf_path))
+        doc.close()
+
+        pdf_doc = PdfDocument(pdf_path)
+        pdf_doc.open()
+        result = auto_balloon_page(pdf_doc, "drawing-1", 0, [], 1, dpi=200)
+        pdf_doc.close()
+
+        raw_texts = [b.raw_text for b in result.balloons]
+        assert any("8.0" in t for t in raw_texts)
+        assert any(t == "75.0" for t in raw_texts)
+        assert not any(t in ("01", "02", "03") for t in raw_texts)
+        assert not any("INITIAL RELEASE" in t or "2026-07-24" in t for t in raw_texts)
+
+    def test_revision_table_region_does_not_swallow_unrelated_content_below_it(self):
+        """Real-world case: a revision table's REV/VER column is narrow
+        (chosen specifically so unrelated content essentially never lands
+        in that exact x-slice -- see _revision_table_regions), but a
+        mangled dimensioning-symbol character (see ocr_parser's
+        mangled-symbol fallbacks) is just as narrow and can still
+        coincidentally fall there, close enough below the table's own last
+        row to fit within a single generous gap threshold. The excluded
+        region must stop at the table's actual last row regardless.
+        """
+        blocks = [
+            TextBlock(text="REVISION HISTORY", bbox=(920.70, 20.95, 990.78, 28.87)),
+            TextBlock(text="ZONE", bbox=(713.70, 38.41, 733.44, 46.33)),
+            TextBlock(text="REV", bbox=(752.58, 38.41, 766.67, 46.33)),
+            TextBlock(text="VER", bbox=(788.58, 38.41, 802.68, 46.33)),
+            TextBlock(text="DESCRIPTION", bbox=(932.76, 38.41, 982.50, 46.33)),
+            TextBlock(text="DATE", bbox=(1119.06, 38.41, 1138.26, 46.33)),
+            TextBlock(text="APPROVED BY", bbox=(1161.54, 33.73, 1200.03, 51.19)),
+            TextBlock(text="A", bbox=(757.26, 55.87, 762.01, 63.79)),
+            TextBlock(text="01", bbox=(791.28, 55.87, 799.92, 63.79)),
+            TextBlock(text="A", bbox=(757.26, 68.47, 762.01, 76.39)),
+            TextBlock(text="02", bbox=(791.28, 68.47, 799.92, 76.39)),
+            TextBlock(text="A", bbox=(757.26, 81.25, 762.01, 89.17)),
+            TextBlock(text="03", bbox=(791.28, 81.25, 799.92, 89.17)),
+            # A mangled diameter-symbol character, part of an unrelated
+            # dimension callout well below the table -- happens to land
+            # inside the REV column's narrow x-slice.
+            TextBlock(text="n", bbox=(749.70, 108.48, 756.02, 119.62)),
+        ]
+        regions = _revision_table_regions(blocks)
+        assert len(regions) == 1
+        _x0, _y0, _x1, y1 = regions[0]
+        assert y1 < 108.48  # the mangled "n" (and anything below it) is outside the region
+
     def test_no_title_block_keywords_leaves_page_unaffected(self, tmp_path):
         pdf_path = tmp_path / "no_title_block.pdf"
         doc = fitz.open()
@@ -430,6 +610,26 @@ class TestSameLineTextMergingDoesNotAbsorbIndependentValues:
         ]
         merged = _merge_nearby_text_blocks(blocks)
         assert [b.text for b in merged] == ["Ø8 0"]
+
+    def test_symbol_row_taller_than_value_row_still_merges_in_reading_order(self):
+        """Real-world case: a CAD PDF export draws a mangled dimensioning-
+        symbol glyph (see ocr_parser's mangled-symbol fallbacks) from a
+        different, taller custom symbol font than the digits beside it, so
+        its box starts a couple of points higher even though it's meant to
+        sit on the very same visual line as "⌀.130 ▽.50 MAX". Bucketing
+        blocks by top-edge position alone can sort the two mangled symbols
+        next to *each other* (both similarly tall) instead of each next to
+        its own value, merging into a meaningless "n x" while "n" never
+        meets the ".130" it belongs to -- and losing the whole callout.
+        """
+        blocks = [
+            TextBlock(text="n", bbox=(749.70, 108.48, 756.02, 119.62)),
+            TextBlock(text=".130", bbox=(756.18, 110.59, 774.14, 118.51)),
+            TextBlock(text="x", bbox=(774.00, 108.48, 780.58, 119.62)),
+            TextBlock(text=".50 MAX", bbox=(780.84, 110.59, 812.26, 118.51)),
+        ]
+        merged = _merge_nearby_text_blocks(blocks)
+        assert [b.text for b in merged] == ["n .130 x .50 MAX"]
 
     def test_chain_of_independent_values_does_not_merge(self):
         # Seven ordinate dimensions on one baseline, evenly and tightly
@@ -592,6 +792,44 @@ class TestStackedToleranceFragments:
         texts = {b.text for b in merged}
         assert "Ø6.38 +0.005" in texts
         assert "12.70" in texts
+
+    def test_fragment_prefers_a_narrow_overlapping_anchor_over_a_wide_closer_center(self):
+        # Real-world case: a wide, merged multi-value line's *center* can
+        # sit deceptively close to a tolerance fragment even though its own
+        # edge is comparatively far away -- while the fragment's true
+        # anchor (a short value it's immediately beside, sharing its row)
+        # has a farther-off center but the nearer edge. Distance must be
+        # measured edge-to-edge, not center-to-center, or the fragment
+        # attaches to -- and corrupts -- the unrelated wide line instead.
+        blocks = [
+            TextBlock(text="M4x0.7 - 6H x .449 MIN", bbox=(749.70, 118.56, 836.52, 129.70)),
+            TextBlock(text="v n .159", bbox=(749.70, 135.48, 786.60, 146.62)),  # true anchor
+            TextBlock(text="+.002", bbox=(788.04, 133.09, 809.10, 141.37)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        texts = {b.text for b in merged}
+        assert "v n .159 +.002" in texts
+        assert "M4x0.7 - 6H x .449 MIN" in texts  # untouched, not corrupted
+
+    def test_paired_plus_minus_fragments_resolve_to_the_same_anchor(self):
+        # "+.002" unambiguously resolves to "v n .159" (its edge is much
+        # closer than any other candidate's), but "-.000" -- stacked
+        # directly below "+.002" -- sits almost exactly between that same
+        # anchor and a *different*, unrelated line below it, fractionally
+        # closer to the unrelated one by pure edge-distance. Since the two
+        # fragments are each other's nearest sign-fragment neighbor (a
+        # stacked +/- pair for one tolerance), they must resolve together
+        # to "v n .159", not split across two different balloons.
+        blocks = [
+            TextBlock(text="v n .159", bbox=(749.70, 135.48, 786.60, 146.62)),
+            TextBlock(text="+.002", bbox=(788.04, 133.09, 809.10, 141.37)),
+            TextBlock(text="- .000", bbox=(789.48, 141.19, 809.10, 149.47)),
+            TextBlock(text="j Ø0.003 B C D", bbox=(758.70, 150.42, 827.61, 162.64)),
+        ]
+        merged = _merge_stacked_tolerance_fragments(blocks)
+        texts = {b.text for b in merged}
+        assert "v n .159 +.002 -.000" in texts
+        assert "j Ø0.003 B C D" in texts  # untouched
 
     def test_unilateral_tolerance_bare_zero_fills_the_missing_side(self):
         # A unilateral tolerance ("0 / +0.05"): the unsigned "0" -- already

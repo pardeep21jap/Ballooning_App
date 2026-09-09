@@ -25,6 +25,18 @@ from balloon_app.data_model import CharacteristicType
 # ---------------------------------------------------------------------------
 NUM = r"(?:\d+\.\d+|\.\d+|\d+)"
 
+# A thread's size-class separator ("M4-6H", "G1/2\" - 6H") is sometimes not
+# a plain ASCII hyphen-minus in the drawing's extracted text: word-processing
+# "smart typography" (and some CAD annotation editors built on it) silently
+# converts a space-hyphen-space sequence into an en dash as it's typed, so a
+# drawing authored with visible spaces around the dash ("M4 - 6H") commonly
+# ends up as "M4 \u2013 6H" in the actual PDF text. Every thread regex below
+# that uses "-" as a literal separator matches this whole class instead, so
+# that substitution doesn't silently make the thread unrecognizable.
+# Not prefixed with "_" -- also imported by auto_balloon.py's characteristic
+# pre-filter, which needs to recognize the same thread shapes this module parses.
+THREAD_DASH_CHARS = "\\-\u2010\u2011\u2012\u2013\u2014\u2212"
+
 _DIAMETER_SYMBOLS = "⌀ØΦ∅"
 _GDT_SYMBOLS: dict[str, str] = {
     "⏤": "Straightness",
@@ -45,7 +57,7 @@ _GDT_SYMBOLS: dict[str, str] = {
 }
 
 _THREAD_UNIFIED_RE = re.compile(
-    r"\b(\d+(?:/\d+)?|#\d+)\s*-\s*(\d+)\s*(UNC|UNF|UNEF|UN|NPT|NPTF)\b",
+    rf"\b(\d+(?:/\d+)?|#\d+)\s*[{THREAD_DASH_CHARS}]\s*(\d+)\s*(UNC|UNF|UNEF|UN|NPT|NPTF)\b",
     re.IGNORECASE,
 )
 _THREAD_METRIC_RE = re.compile(rf"\bM\s?(\d+\.?\d*)\s*[xX×]\s*({NUM})\b")
@@ -56,7 +68,7 @@ _THREAD_METRIC_RE = re.compile(rf"\bM\s?(\d+\.?\d*)\s*[xX×]\s*({NUM})\b")
 # internal thread, lowercase an external one -- meaningfully different, so
 # it must never be normalized.
 _THREAD_METRIC_CLASS_RE = re.compile(
-    rf"\bM\s?(\d+\.?\d*)\s*(?:[xX×]\s*({NUM})\s*)?-\s*(\d{{1,2}}[A-Za-z](?:\d{{1,2}}[A-Za-z])?)\b"
+    rf"\bM\s?(\d+\.?\d*)\s*(?:[xX×]\s*({NUM})\s*)?[{THREAD_DASH_CHARS}]\s*(\d{{1,2}}[A-Za-z](?:\d{{1,2}}[A-Za-z])?)\b"
 )
 # A parallel pipe thread (ISO 228 "G" designation, e.g. "G1/2\" - 6H"),
 # common on hydraulic/pneumatic fittings. Deliberately restricted to a
@@ -66,7 +78,7 @@ _THREAD_METRIC_CLASS_RE = re.compile(
 # Case-sensitive ("G" only, not "g") for the same reason "M" isn't matched
 # case-insensitively elsewhere -- a lowercase "g" is too common a unit
 # abbreviation (grams) to treat as a thread prefix.
-_THREAD_PIPE_RE = re.compile(rf"\bG(\d+/\d+)(\s*[\"'])?(?:\s*-\s*([A-Za-z0-9]{{1,3}})\b)?")
+_THREAD_PIPE_RE = re.compile(rf"\bG(\d+/\d+)(\s*[\"'])?(?:\s*[{THREAD_DASH_CHARS}]\s*([A-Za-z0-9]{{1,3}})\b)?")
 
 # A depth callout trailing a thread spec, e.g. "8-32 UNC-2B ▼0.500" (tapped
 # hole depth). CAD PDF exports draw the "depth" glyph from a custom
@@ -107,7 +119,11 @@ _ANGLE_HINT_RE = re.compile(r"°")
 # anywhere else (typically trailing a completed value) it's read as depth.
 # ↧ (downwards arrow from bar) is ASME's actual "depth" symbol and is
 # unambiguous -- unlike ⌵, it has no other meaning, so it's matched outright.
-_DEPTH_HINT_RE = re.compile(r"[▼↓⌵↧]|\bDEPTH\b|\bDEEP\b|\bDP\b", re.IGNORECASE)
+# ▽ (hollow/outline down-pointing triangle) is a further font/CAD-tool
+# variant of the same depth glyph as ▼ (filled) -- some drawing tools render
+# it unfilled instead, and it carries no other meaning on a mechanical
+# drawing, so it's matched the same way.
+_DEPTH_HINT_RE = re.compile(r"[▼▽↓⌵↧]|\bDEPTH\b|\bDEEP\b|\bDP\b", re.IGNORECASE)
 # Tolerance markup between a shape's value and a later trailing number --
 # ("Ø6.38 +0.005 -0.010") rules out reading that trailing number as a depth
 # via the symbol-agnostic fallback in _try_shape_with_secondary_value below.
@@ -574,6 +590,87 @@ def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteri
     return [primary, secondary]
 
 
+# A mangled shape-symbol marker (see _resolve_learned_marker) immediately
+# followed by its own value -- optionally preceded by a second mangled
+# marker letter (a shape modifier like counterbore mangled separately from
+# the diameter symbol it precedes, e.g. the "v" in "v n.159"). Unlike
+# _BARE_MANGLED_DIAMETER_RE (which anchors the marker+value as the *entire*
+# text), this only anchors the leading marker(s)+value, leaving whatever
+# follows -- a tolerance, then a trailing depth/angle -- for
+# _try_mangled_shape_with_secondary_value to inspect the same way
+# _try_shape_with_secondary_value does for a *real* shape symbol.
+_LEADING_MANGLED_MARKERS_RE = re.compile(
+    r"^(?![Rr])([A-Za-z])(?:\s+(?![Rr])([A-Za-z])(?!\s*[A-Za-z]))?\s*(\d+\.\d+|\.\d+)"
+)
+
+
+def _try_mangled_shape_with_secondary_value(
+    text: str, learned_symbols: Optional[dict[str, str]] = None
+) -> Optional[list[ParsedCharacteristic]]:
+    """Mirrors _try_shape_with_secondary_value, but for a shape symbol that
+    was itself mangled into an unrelated ASCII letter rather than a real
+    Ø/⌴/⌵/□/R -- e.g. "n.130 x.50 MAX" (Ø.130 ▽.50 MAX, both symbols
+    mangled) or "v n.159 +.002/-.000 x.167" (⌴Ø.159 +.002/-.000 ▽.167, a
+    counterbore whose own diameter symbol is *also* mangled).
+
+    Only returns a result when a genuine secondary depth value is found
+    trailing the primary -- a bare "marker+value" with nothing trailing is
+    left for _try_bare_mangled_diameter (tried after this), since that
+    fallback already handles the no-secondary-value case as the *entire*
+    text, and re-matching it here would just duplicate that path with a
+    different (unwarranted) confidence. A trailing *angle* is deliberately
+    not handled here either, even though the shape is superficially
+    similar: "<value> X <angle>°" is specifically the countersink notation
+    regardless of what (if anything) precedes the value, and
+    _try_bare_value_with_angle (tried later) already recognizes that
+    structural shape on its own with its own, better-founded confidence --
+    matching it here first would instead read the leading marker generically
+    (defaulting to diameter absent a learned mapping) and miss that it's
+    actually always a countersink.
+    """
+    m = _LEADING_MANGLED_MARKERS_RE.match(text)
+    if not m:
+        return None
+    marker, value = m.group(1), m.group(3)
+    char_type, confidence = _resolve_learned_marker(marker, learned_symbols)
+    nominal = float(value)
+
+    leading_tol = _extract_leading_tolerance(text, m.end(), nominal)
+    search_start = m.end() if leading_tol is None else leading_tol[4]
+
+    has_depth = bool(_DEPTH_HINT_RE.search(text[search_start:]))
+
+    secondary: Optional[ParsedCharacteristic] = None
+    depth_match = _TRAILING_DECIMAL_RE.search(text, search_start)
+    if depth_match:
+        gap = text[search_start : depth_match.start()]
+        if has_depth or not _DEPTH_BLOCKING_RE.search(gap):
+            secondary = ParsedCharacteristic(
+                char_type=CharacteristicType.DEPTH.value,
+                raw_text=text,
+                nominal=_round(float(depth_match.group(1))),
+                nominal_text=depth_match.group(1),
+                confidence=0.75 if has_depth else 0.55,
+            )
+    if secondary is None:
+        return None
+
+    symbol = _CANONICAL_SYMBOL_FOR_TYPE.get(char_type, "⌀")
+    primary = ParsedCharacteristic(
+        char_type=char_type,
+        raw_text=f"{symbol}{value}",
+        nominal=_round(nominal),
+        nominal_text=value,
+        tol_plus=leading_tol[0] if leading_tol else None,
+        tol_minus=leading_tol[1] if leading_tol else None,
+        lower_limit=leading_tol[2] if leading_tol else None,
+        upper_limit=leading_tol[3] if leading_tol else None,
+        confidence=max(confidence, 0.6),
+        guessed_symbol_marker=marker.strip().lower(),
+    )
+    return [primary, secondary]
+
+
 def _try_qty_prefixed_two_values(text: str) -> Optional[list[ParsedCharacteristic]]:
     """Structural fallback for a quantity-prefixed hole callout whose two
     dimension symbols are both unrecognized (see _QTY_TWO_VALUE_RE above).
@@ -939,6 +1036,7 @@ def parse_characteristics(
     text: str,
     diameter_hint: bool = False,
     gdt_frame_hint: bool = False,
+    depth_hint: bool = False,
     learned_symbols: Optional[dict[str, str]] = None,
 ) -> list[ParsedCharacteristic]:
     """Classify and parse a chunk of drawing text into one or more characteristics.
@@ -976,6 +1074,14 @@ def parse_characteristics(
     vector art alone, so this only prevents a bare tolerance value like
     "0.01" from being misread as a plain linear dimension; the specific
     symbol is left for the user to fill in during review.
+
+    ``depth_hint``: like ``diameter_hint``, but for the "depth" glyph (see
+    :meth:`balloon_app.pdf_engine.PdfDocument.find_vector_depth_symbol`) --
+    a bare number that would otherwise fall through to being read as an
+    unrelated plain linear dimension is instead classified as its feature's
+    depth. Same scope restriction as ``diameter_hint``: only affects the
+    bare-value fallback, not a callout that already matches something more
+    specific.
     """
     text = (text or "").strip()
     if not text:
@@ -994,6 +1100,10 @@ def parse_characteristics(
     if shape_and_secondary is not None:
         return shape_and_secondary
 
+    mangled_shape_and_secondary = _try_mangled_shape_with_secondary_value(text, learned_symbols)
+    if mangled_shape_and_secondary is not None:
+        return mangled_shape_and_secondary
+
     qty_two_values = _try_qty_prefixed_two_values(text)
     if qty_two_values is not None:
         return qty_two_values
@@ -1010,7 +1120,8 @@ def parse_characteristics(
     if mangled_diameter is not None:
         return [mangled_diameter]
 
-    is_depth = bool(_DEPTH_HINT_RE.search(text))
+    has_depth_text = bool(_DEPTH_HINT_RE.search(text))
+    is_depth = has_depth_text or depth_hint
     is_counterbore = bool(_COUNTERBORE_HINT_RE.search(text))
     is_countersink = bool(_COUNTERSINK_HINT_RE.search(text))
     is_square = bool(_SQUARE_HINT_RE.search(text))
@@ -1020,6 +1131,25 @@ def parse_characteristics(
     is_angle = bool(_ANGLE_HINT_RE.search(text))
 
     numeric = _extract_numeric_tolerance(text)
+
+    # No real symbol/keyword identified anything above -- as a last resort
+    # before falling all the way to a plain linear dimension, check whether
+    # the text is *shaped* like a mangled marker leading its own value (see
+    # _try_mangled_shape_with_secondary_value's docstring), e.g. "v n.159
+    # +.002 -.000" (a counterbore diameter with tolerance, both symbols
+    # mangled, no depth trailing it -- so the secondary-value fallback
+    # above declined it, but the type is still worth guessing at rather
+    # than defaulting to a plain dimension).
+    mangled_marker_match = None
+    if not (is_depth or is_counterbore or is_countersink or is_square or is_diameter or is_radius or is_angle):
+        mangled_marker_match = _LEADING_MANGLED_MARKERS_RE.match(text)
+    mangled_char_type: Optional[str] = None
+    mangled_confidence = 0.0
+    guessed_marker: Optional[str] = None
+    if mangled_marker_match is not None:
+        marker = mangled_marker_match.group(1)
+        mangled_char_type, mangled_confidence = _resolve_learned_marker(marker, learned_symbols)
+        guessed_marker = marker.strip().lower()
 
     # A hole-feature modifier symbol (depth/counterbore/countersink/square)
     # is more specific than a bare diameter/radius, so it wins when both are
@@ -1038,6 +1168,8 @@ def parse_characteristics(
         char_type = CharacteristicType.RADIUS.value
     elif is_angle:
         char_type = CharacteristicType.ANGLE.value
+    elif mangled_char_type is not None:
+        char_type = mangled_char_type
     elif gdt_frame_hint and numeric is not None:
         return [
             ParsedCharacteristic(
@@ -1057,10 +1189,27 @@ def parse_characteristics(
         confidence = numeric["confidence"]
         if is_diameter or is_radius or is_angle or is_depth or is_counterbore or is_countersink or is_square:
             confidence = max(confidence, 0.75) if numeric["confidence"] >= 0.8 else 0.6
-        # diameter_hint fired but the text itself never carried a Ø symbol
-        # (it was drawn as vector line art, not a character) -- rewrite
-        # raw_text so the review table shows what the drawing actually says.
-        raw_text_out = f"⌀{text}" if char_type == CharacteristicType.DIAMETER.value and not has_diameter_text else text
+        elif mangled_char_type is not None:
+            # The type itself is only a guess (a learned mapping, or the
+            # bare default) -- cap confidence at that guess's own, however
+            # confidently the value/tolerance itself was read.
+            confidence = min(confidence, mangled_confidence)
+        # diameter_hint/depth_hint fired but the text itself never carried
+        # its symbol (it was drawn as vector line art, not a character) --
+        # rewrite raw_text so the review table shows what the drawing
+        # actually says, using the type's canonical symbol. Likewise for a
+        # mangled leading marker resolved above: the mangled letter carries
+        # no real information, so showing it verbatim would only confuse
+        # review, not aid traceability.
+        if char_type == CharacteristicType.DIAMETER.value and not has_diameter_text and guessed_marker is None:
+            raw_text_out = f"⌀{text}"
+        elif char_type == CharacteristicType.DEPTH.value and not has_depth_text and guessed_marker is None:
+            raw_text_out = f"▼{text}"
+        elif guessed_marker is not None:
+            symbol = _CANONICAL_SYMBOL_FOR_TYPE.get(char_type, "⌀")
+            raw_text_out = symbol + text[mangled_marker_match.start(3):]
+        else:
+            raw_text_out = text
         return [
             ParsedCharacteristic(
                 char_type=char_type,
@@ -1072,6 +1221,7 @@ def parse_characteristics(
                 lower_limit=numeric["lower_limit"],
                 upper_limit=numeric["upper_limit"],
                 confidence=confidence,
+                guessed_symbol_marker=guessed_marker,
             )
         ]
 
@@ -1090,6 +1240,7 @@ def parse_characteristic(
     text: str,
     diameter_hint: bool = False,
     gdt_frame_hint: bool = False,
+    depth_hint: bool = False,
     learned_symbols: Optional[dict[str, str]] = None,
 ) -> ParsedCharacteristic:
     """Classify and parse a chunk of drawing text into a single characteristic.
@@ -1099,5 +1250,6 @@ def parse_characteristic(
     label for a detection) rather than every characteristic packed into it.
     """
     return parse_characteristics(
-        text, diameter_hint=diameter_hint, gdt_frame_hint=gdt_frame_hint, learned_symbols=learned_symbols
+        text, diameter_hint=diameter_hint, gdt_frame_hint=gdt_frame_hint, depth_hint=depth_hint,
+        learned_symbols=learned_symbols
     )[0]

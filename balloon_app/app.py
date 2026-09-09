@@ -292,20 +292,34 @@ def _toolbar_icon(kind: str, color: QColor, size: int = _TOOLBAR_ICON_SIZE) -> Q
     return QIcon(pixmap)
 
 
-def _status_chip_colors(source: str, status: str) -> tuple[QColor, QColor]:
-    """A pastel background + a matching dark foreground for the Status
-    column, blended from the same status_color used for the on-canvas
-    marker -- a lighter reading of the exact same semantic color, not a
-    separate palette to keep in sync."""
-    r, g, b, _a = status_color(source, status)
-    tint = 0.72
-    background = QColor(
-        round(r + (255 - r) * tint),
-        round(g + (255 - g) * tint),
-        round(b + (255 - b) * tint),
+def _status_badge_widget(source: str, status: str) -> QWidget:
+    """A small pill-shaped badge for the Status column, colored from the
+    same status_color used for the on-canvas balloon marker -- one semantic
+    palette, not a separate one to keep in sync. "Accepted"/"Edited" (a
+    reviewed, final state) are filled solid; "Pending"/"Rejected" are a
+    plain outline, so the reviewed state reads as visually more settled at
+    a glance across a long list.
+
+    Returned as a wrapper widget (not just the label) so the badge hugs its
+    text and stays centered in the cell via setCellWidget, rather than the
+    label stretching to fill the whole column width.
+    """
+    r, g, b = status_color(source, status)[:3]
+    color = f"rgb({r}, {g}, {b})"
+    filled = status in (ReviewStatus.ACCEPTED.value, ReviewStatus.EDITED.value)
+    label = QLabel(status.upper())
+    label.setStyleSheet(
+        f"background: {color if filled else '#ffffff'}; color: {'#ffffff' if filled else color}; "
+        f"border: 1px solid {color}; border-radius: 3px; padding: 2px 10px; "
+        "font-weight: 700; font-size: 10px;"
     )
-    foreground = QColor(r, g, b).darker(135)
-    return background, foreground
+    wrapper = QWidget()
+    layout = QHBoxLayout(wrapper)
+    layout.setContentsMargins(4, 2, 4, 2)
+    layout.addStretch()
+    layout.addWidget(label)
+    layout.addStretch()
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -1643,27 +1657,22 @@ class MainWindow(QMainWindow):
                 b.status.capitalize(),
             ]
             for col, value in enumerate(values):
-                # Column 6 is rendered by an editable QComboBox below. Keep
-                # its backing item text empty because the transparent combo
-                # otherwise paints over the same Method text and looks blurry.
-                item = QTableWidgetItem("" if col == 6 else value)
+                # Columns 6 and 7 are rendered by cell widgets below (an
+                # editable QComboBox, a status badge). Keep their backing
+                # item text empty -- otherwise it paints through/behind the
+                # widget and looks blurry.
+                item = QTableWidgetItem("" if col in (6, 7) else value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if col == 0:
                     item.setData(Qt.ItemDataRole.UserRole, b.id)
                     item.setIcon(_balloon_number_badge(b.number, b.source, b.status))
                     item.setText("")
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                elif col == 7:
-                    background, foreground = _status_chip_colors(b.source, b.status)
-                    item.setBackground(background)
-                    item.setForeground(foreground)
-                    chip_font = item.font()
-                    chip_font.setBold(True)
-                    item.setFont(chip_font)
                 item.setToolTip(str(value))
                 if col in (4, 5):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 table.setItem(row, col, item)
+            table.setCellWidget(row, 7, _status_badge_widget(b.source, b.status))
             method_combo = QComboBox(table)
             method_combo.addItems(COMMON_INSPECTION_METHODS)
             if method_combo.findText(b.inspection_method) < 0:
