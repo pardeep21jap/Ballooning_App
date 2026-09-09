@@ -930,7 +930,26 @@ def compute_limits(
 # might use (X.X, X.XX, ... up to X.XXXXXX); the run length of X's is the
 # decimal-place count, so this one pattern replaces a fixed per-count table.
 _DECIMAL_TOL_RE = re.compile(rf"X\.(X{{1,6}})\b\s*[:=]?\s*±?\s*({NUM})")
-_ANGULAR_TOL_RE = re.compile(rf"ANGLES?\s*[:=]?\s*±?\s*({NUM})\s*°?", re.IGNORECASE)
+
+# Some title blocks spell the same per-tier table out in words instead of
+# "X.X" placeholders, e.g. "ZERO PLACE DECIMAL ±0.5" / "TWO PLACE DECIMALS:
+# ±0.1" (a bare leading digit, "2 PLACE DECIMAL", also occurs).
+_PLACE_DECIMAL_WORD_TO_COUNT = {
+    "ZERO": 0,
+    "ONE": 1,
+    "TWO": 2,
+    "THREE": 3,
+    "FOUR": 4,
+    "FIVE": 5,
+    "SIX": 6,
+}
+_WORD_DECIMAL_TOL_RE = re.compile(
+    r"\b(ZERO|ONE|TWO|THREE|FOUR|FIVE|SIX|\d)\s*[- ]?PLACE\s*DECIMALS?\s*[:=]?\s*±?\s*("
+    + NUM
+    + r")",
+    re.IGNORECASE,
+)
+_ANGULAR_TOL_RE = re.compile(rf"(?:ANGULAR|ANGLES?)\s*[:=]?\s*±?\s*({NUM})\s*°?", re.IGNORECASE)
 
 _TOLERANCED_DIMENSION_TYPES = {
     CharacteristicType.LINEAR_DIMENSION.value,
@@ -985,7 +1004,9 @@ def decimal_places(nominal_text: Optional[str]) -> int:
 def parse_default_tolerances(page_text: str) -> DefaultTolerances:
     """Best-effort extraction of a drawing's general/default tolerance table
     from its title-block note (commonly headed "TOLERANCES UNLESS OTHERWISE
-    NOTED"), e.g. "X.XX: ±0.0100" / "X.XXX: ±0.0050" / "ANGLES: ±0.5°".
+    NOTED"), e.g. "X.XX: ±0.0100" / "X.XXX: ±0.0050" / "ANGLES: ±0.5°", or the
+    worded-tier convention "ZERO PLACE DECIMAL ±0.5" / "TWO PLACE DECIMAL
+    ±0.1" / "ANGULAR: ±1".
 
     Returns an empty ``DefaultTolerances`` if no such table is found --
     callers should let the user review/fill in the result either way, since
@@ -995,6 +1016,13 @@ def parse_default_tolerances(page_text: str) -> DefaultTolerances:
     for m in _DECIMAL_TOL_RE.finditer(page_text):
         places = len(m.group(1))
         result.by_decimal_places[places] = _round(float(m.group(2)))
+    for m in _WORD_DECIMAL_TOL_RE.finditer(page_text):
+        token = m.group(1).upper()
+        places = _PLACE_DECIMAL_WORD_TO_COUNT.get(token, None)
+        if places is None and token.isdigit():
+            places = int(token)
+        if places is not None:
+            result.by_decimal_places[places] = _round(float(m.group(2)))
     m = _ANGULAR_TOL_RE.search(page_text)
     if m:
         result.angular = _round(float(m.group(1)))

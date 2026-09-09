@@ -748,6 +748,28 @@ class TestParseDefaultTolerances:
         result = parse_default_tolerances("PIC PULLEY, BALL SCREW\nA1219")
         assert result.is_empty()
 
+    WORDED_TITLE_BLOCK = (
+        "UNLESS OTHERWISE SPECIFIED:\n"
+        "DIMENSIONS ARE IN MM\n"
+        "TOLERANCES:\n"
+        "ANGULAR: ± 1\n"
+        "ZERO PLACE DECIMAL ± 0.5\n"
+        "ONE PLACE DECIMAL ± 0.2\n"
+        "TWO PLACE DECIMAL ± 0.1\n"
+        "INTERPRET GD&T PER: ANSI Y14.5\n"
+    )
+
+    def test_worded_place_decimal_convention_and_angular(self):
+        result = parse_default_tolerances(self.WORDED_TITLE_BLOCK)
+        assert _close(result.by_decimal_places[0], 0.5)
+        assert _close(result.by_decimal_places[1], 0.2)
+        assert _close(result.by_decimal_places[2], 0.1)
+        assert _close(result.angular, 1)
+
+    def test_worded_place_decimal_convention_is_case_insensitive(self):
+        result = parse_default_tolerances("Two Place Decimal: ±0.1\n")
+        assert _close(result.by_decimal_places[2], 0.1)
+
 
 class TestApplyDefaultTolerance:
     DEFAULTS = DefaultTolerances(by_decimal_places={1: 0.1, 2: 0.01, 3: 0.005}, angular=0.5)
