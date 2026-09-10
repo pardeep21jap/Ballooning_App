@@ -36,6 +36,8 @@ class CharacteristicType(str, Enum):
     COUNTERBORE = "counterbore"
     COUNTERSINK = "countersink"
     SQUARE = "square"
+    CHAMFER_DIA = "chamfer_dia"
+    CHAMFER_ANGLE = "chamfer_angle"
     OTHER = "other"
 
     @classmethod
@@ -56,6 +58,8 @@ class CharacteristicType(str, Enum):
             cls.COUNTERBORE: "Counterbore",
             cls.COUNTERSINK: "Countersink",
             cls.SQUARE: "Square",
+            cls.CHAMFER_DIA: "Chamfer Dia",
+            cls.CHAMFER_ANGLE: "Chamfer Angle",
             cls.OTHER: "Other",
         }
         try:

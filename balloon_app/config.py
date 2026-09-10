@@ -127,6 +127,8 @@ CHARACTERISTIC_CLASSES: list[str] = [
     "counterbore",
     "countersink",
     "square",
+    "chamfer_dia",
+    "chamfer_angle",
 ]
 
 

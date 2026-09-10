@@ -26,7 +26,6 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='BalloonIQ',
-    icon='balloon_app/resources/balloonapp.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -37,6 +36,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['balloon_app/resources/balloonapp.ico'],
 )
 coll = COLLECT(
     exe,

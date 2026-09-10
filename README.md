@@ -170,11 +170,14 @@ the latest changes after it is rebuilt.
 ## How project data is stored
 
 - **Projects**: each project is a single portable SQLite file with the
-  `.bpdb` extension, stored by default under `projects/<project_name>/`.
-  You can also **Save Project As** anywhere, or use **File > (future)
-  JSON export/import** logic already implemented in `database.py`
-  (`ProjectDatabase.export_json` / `.import_json`) for a plain-text,
-  portable backup format.
+  `.bpdb` extension. When a new project is created via **File -> Add/Open
+  PDF Drawing...** (i.e. you had no project open yet), the `.bpdb` is
+  created in the same folder as the PDF you picked. When created via
+  **File -> New Project...** directly (before any PDF is chosen), it's
+  stored by default under `projects/<project_name>/`. You can also **Save
+  Project As** anywhere, or use **File > (future) JSON export/import**
+  logic already implemented in `database.py` (`ProjectDatabase.export_json`
+  / `.import_json`) for a plain-text, portable backup format.
 - **Original PDFs are never copied.** The project stores the source PDF's
   file path. If the file has moved, use **File -> Relink Current
   Drawing...** to point the project at its new location.
@@ -444,10 +447,7 @@ the entire test suite — not only tests for the newest change.
 
 A good prompt for future changes is:
 
-> Make only the smallest change needed for this issue. Preserve all
-> existing behavior. First add a regression test for the reported bug,
-> then implement the fix. Run the complete test suite, lint, and build.
-> Do not modify unrelated files.
+> Make only the smallest change needed for this issue. Preserve allexisting behavior. First add a regression test for the reported bug, then implement the fix. Run the complete test suite, lint, and build. Do not modify unrelated files.
 
 **Manual smoke-test checklist** for critical journeys:
 - App loads without console errors

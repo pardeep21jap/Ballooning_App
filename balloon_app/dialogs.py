@@ -509,7 +509,7 @@ class BalloonEditDialog(QDialog):
             return
 
         char_type = self.char_type_combo.currentData()
-        if char_type == CharacteristicType.ANGLE.value:
+        if char_type in (CharacteristicType.ANGLE.value, CharacteristicType.CHAMFER_ANGLE.value):
             tol = self._default_tolerances.angular
         else:
             tol = self._default_tolerances.for_decimal_places(decimal_places(self.nominal_edit.text().strip()))

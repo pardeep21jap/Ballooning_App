@@ -523,6 +523,7 @@ def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteri
     shape_char_type = _resolve_shape_char_type(text)
     if shape_char_type is None:
         return None
+    is_countersink_shape = shape_char_type == CharacteristicType.COUNTERSINK.value
 
     if shape_char_type == CharacteristicType.SQUARE.value:
         value_re = _SQUARE_VALUE_RE
@@ -567,7 +568,7 @@ def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteri
         angle_match = _TRAILING_ANGLE_RE.search(text, search_start)
         if angle_match:
             secondary = ParsedCharacteristic(
-                char_type=CharacteristicType.ANGLE.value,
+                char_type=CharacteristicType.CHAMFER_ANGLE.value if is_countersink_shape else CharacteristicType.ANGLE.value,
                 raw_text=text,
                 nominal=_round(float(angle_match.group(1))),
                 nominal_text=angle_match.group(1),
@@ -577,7 +578,7 @@ def _try_shape_with_secondary_value(text: str) -> Optional[list[ParsedCharacteri
         return None
 
     primary = ParsedCharacteristic(
-        char_type=shape_char_type,
+        char_type=CharacteristicType.CHAMFER_DIA.value if is_countersink_shape else shape_char_type,
         raw_text=text,
         nominal=_round(nominal),
         nominal_text=m.group(1),
@@ -761,14 +762,14 @@ def _try_bare_value_with_angle(text: str) -> Optional[list[ParsedCharacteristic]
     cleaned_text = f"⌵⌀{diameter_value} X {angle_value}°"
     return [
         ParsedCharacteristic(
-            char_type=CharacteristicType.COUNTERSINK.value,
+            char_type=CharacteristicType.CHAMFER_DIA.value,
             raw_text=cleaned_text,
             nominal=_round(float(diameter_value)),
             nominal_text=diameter_value,
             confidence=0.6,
         ),
         ParsedCharacteristic(
-            char_type=CharacteristicType.ANGLE.value,
+            char_type=CharacteristicType.CHAMFER_ANGLE.value,
             raw_text=cleaned_text,
             nominal=_round(float(angle_value)),
             nominal_text=angle_value,
@@ -959,6 +960,7 @@ _TOLERANCED_DIMENSION_TYPES = {
     CharacteristicType.COUNTERBORE.value,
     CharacteristicType.COUNTERSINK.value,
     CharacteristicType.SQUARE.value,
+    CharacteristicType.CHAMFER_DIA.value,
 }
 
 
@@ -1044,7 +1046,7 @@ def apply_default_tolerance(
     if defaults.is_empty():
         return parsed
 
-    if parsed.char_type == CharacteristicType.ANGLE.value:
+    if parsed.char_type in (CharacteristicType.ANGLE.value, CharacteristicType.CHAMFER_ANGLE.value):
         tol = defaults.angular
     elif parsed.char_type in _TOLERANCED_DIMENSION_TYPES:
         tol = defaults.for_decimal_places(decimal_places(parsed.nominal_text))
@@ -1187,7 +1189,7 @@ def parse_characteristics(
     elif is_counterbore:
         char_type = CharacteristicType.COUNTERBORE.value
     elif is_countersink:
-        char_type = CharacteristicType.COUNTERSINK.value
+        char_type = CharacteristicType.CHAMFER_DIA.value
     elif is_square:
         char_type = CharacteristicType.SQUARE.value
     elif is_diameter:

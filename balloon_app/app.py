@@ -110,6 +110,18 @@ def _sanitize_filename(name: str) -> str:
     return cleaned.replace(" ", "_") or "project"
 
 
+def _bpdb_path_beside_pdf(pdf_path: Path, project_name: str) -> Path:
+    """Pick a free .bpdb path in the same folder as the given PDF drawing."""
+    folder = pdf_path.parent
+    base_name = _sanitize_filename(project_name)
+    candidate = folder / f"{base_name}.bpdb"
+    counter = 1
+    while candidate.exists():
+        candidate = folder / f"{base_name}_{counter}.bpdb"
+        counter += 1
+    return candidate
+
+
 _BADGE_ICON_SIZE = 22
 
 
@@ -709,7 +721,6 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(0, 12, 0, 0)
         row.setSpacing(8)
         for label, callback in (("Accept", self._accept_selected),
-                                ("Reject", self._reject_selected),
                                 ("Edit", self._edit_selected_balloon),
                                 ("Delete", self._delete_selected_balloons)):
             button = QPushButton(label)
@@ -724,7 +735,6 @@ class MainWindow(QMainWindow):
         menu = QMenu(more)
         for label, callback in (
             ("Accept All Above Threshold...", self._accept_all_above_threshold),
-            ("Reject Selected/Pending", self._reject_all_selected_or_pending),
             (None, None),
             ("Add Manual", self._add_manual_balloon),
             ("Duplicate", self._duplicate_selected_balloon),
@@ -1137,6 +1147,29 @@ class MainWindow(QMainWindow):
         self._load_project_object(project, db_path)
         return True
 
+    def _new_project_beside_pdf(self, pdf_path: Path) -> bool:
+        """Like _new_project, but stores the new .bpdb next to a PDF the
+        user just picked instead of under PROJECTS_DIR."""
+        if not self._confirm_discard_changes():
+            return False
+        dialog = NewProjectDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return False
+        project = Project(**dialog.values())
+        db_path = _bpdb_path_beside_pdf(pdf_path, project.name)
+
+        try:
+            db = ProjectDatabase(db_path)
+            db.connect()
+            db.save_project(project)
+            db.close()
+        except Exception as exc:
+            QMessageBox.critical(self, "Could Not Create Project", str(exc))
+            return False
+
+        self._load_project_object(project, db_path)
+        return True
+
     def _open_project(self) -> None:
         if not self._confirm_discard_changes():
             return
@@ -1285,12 +1318,12 @@ class MainWindow(QMainWindow):
     # Drawing lifecycle
     # ------------------------------------------------------------------
     def _add_pdf_drawing(self) -> None:
-        if self.project is None:
-            if not self._new_project():
-                return
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF Drawing", "", "PDF Files (*.pdf)")
         if not path:
             return
+        if self.project is None:
+            if not self._new_project_beside_pdf(Path(path)):
+                return
         try:
             pdf_doc = PdfDocument(path)
             pdf_doc.open()
@@ -1723,9 +1756,6 @@ class MainWindow(QMainWindow):
     def _accept_selected(self) -> None:
         self._set_status_for(self._selected_balloon_ids(), ReviewStatus.ACCEPTED.value, "Accept Balloon(s)")
 
-    def _reject_selected(self) -> None:
-        self._set_status_for(self._selected_balloon_ids(), ReviewStatus.REJECTED.value, "Reject Balloon(s)")
-
     def _accept_all_above_threshold(self) -> None:
         if self.project is None or self.drawing is None:
             return
@@ -1739,18 +1769,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Nothing To Accept", "No pending proposals meet that confidence threshold.")
             return
         self._set_status_for(ids, ReviewStatus.ACCEPTED.value, "Accept All Above Threshold")
-
-    def _reject_all_selected_or_pending(self) -> None:
-        if self.project is None or self.drawing is None:
-            return
-        ids = self._selected_balloon_ids()
-        if not ids:
-            balloons = self.project.balloons_for(self.drawing.id)
-            ids = [b.id for b in balloons if b.status == ReviewStatus.PENDING.value]
-        if not ids:
-            QMessageBox.information(self, "Nothing To Reject", "No selected or pending balloons to reject.")
-            return
-        self._set_status_for(ids, ReviewStatus.REJECTED.value, "Reject Balloon(s)")
 
     def _edit_selected_balloon(self) -> None:
         ids = self._selected_balloon_ids()

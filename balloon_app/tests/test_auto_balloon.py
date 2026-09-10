@@ -313,7 +313,7 @@ class TestCountersinkDiameterAngleCallout:
     def test_countersink_diameter_and_angle_produce_two_balloons(self, tmp_path):
         """A countersink callout packs a diameter and an included angle into
         one line, e.g. "CSK Ø0.507 X 82°" -- must produce two balloons
-        (Countersink diameter, Angle) instead of dropping the angle.
+        (Chamfer Dia, Chamfer Angle) instead of dropping the angle.
         """
         pdf_path = tmp_path / "countersink.pdf"
         doc = fitz.open()
@@ -329,16 +329,16 @@ class TestCountersinkDiameterAngleCallout:
 
         assert len(result.balloons) == 2
         diameter, angle = result.balloons
-        assert diameter.char_type == CharacteristicType.COUNTERSINK.value
+        assert diameter.char_type == CharacteristicType.CHAMFER_DIA.value
         assert diameter.nominal == pytest.approx(0.507)
-        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert angle.char_type == CharacteristicType.CHAMFER_ANGLE.value
         assert angle.nominal == pytest.approx(82)
 
     def test_both_shape_symbols_mangled_still_splits_and_picks_diameter_default(self, tmp_path):
         """Real-world case: the countersink symbol extracted as "w" and the
         diameter symbol as "n" (both unrecognizable), leaving raw text
         "w n 0.507 X 82°". Must still produce two balloons (a value typed
-        as Countersink, and an Angle), with raw_text rewritten to the
+        as Chamfer Dia, and a Chamfer Angle), with raw_text rewritten to the
         canonical symbols -- and, critically, the diameter must pick up a
         *decimal-place* default tolerance, not the angular one (the bug
         that produced a nonsensical ±0.5 on a 0.507 diameter).
@@ -358,11 +358,11 @@ class TestCountersinkDiameterAngleCallout:
 
         assert len(result.balloons) == 2
         value, angle = result.balloons
-        assert value.char_type == CharacteristicType.COUNTERSINK.value
+        assert value.char_type == CharacteristicType.CHAMFER_DIA.value
         assert value.nominal == pytest.approx(0.507)
         assert value.raw_text == "⌵⌀0.507 X 82°"
         assert value.tol_plus == pytest.approx(0.005)  # decimal-place default, not angular
-        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert angle.char_type == CharacteristicType.CHAMFER_ANGLE.value
         assert angle.nominal == pytest.approx(82)
 
 

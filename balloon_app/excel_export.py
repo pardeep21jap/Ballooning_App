@@ -29,24 +29,25 @@ INSPECTION_SHEET_NAME = "Inspection Data"
 FORM_NUMBER = "QF1439"
 FORM_REV = "-"
 
-# Column order matches AS9102 Form 3 field numbering.
+# Column A is left blank as a margin (matches the standard AS9102 Form 3
+# layout); the form fields start at B, matching AS9102 field numbering.
 COLUMNS: list[tuple[str, str]] = [
-    ("A", "7.\nChar No."),
-    ("B", "7a.\nCharacteristic Designator"),
-    ("C", "8.\nRequirement"),
-    ("D", "8a.\nUoM"),
-    ("E", "±"),
-    ("F", "8b.\nUpper Limit"),
-    ("G", "8c.\nLower Limit"),
-    ("H", "9.\nResults"),
-    ("I", "10.\nGauge"),
-    ("J", "11.\nNonConformance Number"),
-    ("K", "12.\nNotes"),
+    ("B", "7.\nChar No."),
+    ("C", "7a.\nCharacteristic Designator"),
+    ("D", "8.\nRequirement"),
+    ("E", "8a.\nUoM"),
+    ("F", "±"),
+    ("G", "8b.\nUpper Limit"),
+    ("H", "8c.\nLower Limit"),
+    ("I", "9.\nResults"),
+    ("J", "10.\nGauge"),
+    ("K", "11.\nNonConformance Number"),
+    ("L", "12.\nNotes"),
 ]
 
 _COLUMN_WIDTHS: dict[str, float] = {
-    "A": 8, "B": 24, "C": 14, "D": 8, "E": 5, "F": 12, "G": 12,
-    "H": 10, "I": 16, "J": 18, "K": 20,
+    "A": 3, "B": 8, "C": 24, "D": 14, "E": 8, "F": 5, "G": 12, "H": 12,
+    "I": 10, "J": 16, "K": 18, "L": 20,
 }
 
 _LAST_COL = COLUMNS[-1][0]
@@ -107,7 +108,7 @@ def _requirement(balloon: Balloon, strip_leading_zero: bool) -> str:
 
 
 def _uom(balloon: Balloon, project_unit: str) -> str:
-    if balloon.char_type == CharacteristicType.ANGLE.value:
+    if balloon.char_type in (CharacteristicType.ANGLE.value, CharacteristicType.CHAMFER_ANGLE.value):
         return "deg"
     if balloon.nominal is not None:
         return project_unit
@@ -130,46 +131,46 @@ def _write_row(ws: Worksheet, row: int, balloon: Balloon, project_unit: str) -> 
     upper_delta, lower_delta = _tol_deltas(balloon)
 
     values = {
-        "A": balloon.number,
-        "B": _designator(balloon),
-        "C": _requirement(balloon, strip_leading_zero=strip_zero),
-        "D": _uom(balloon, project_unit),
-        "E": "+" if (upper_delta is not None or lower_delta is not None) else "",
-        "F": _fmt_number(upper_delta),
-        "G": _fmt_number(lower_delta),
-        "H": None,  # Results -- filled in by the inspector
-        "I": balloon.inspection_method,
-        "J": None,  # NonConformance Number -- filled in by the inspector
-        "K": None,  # Notes -- filled in by the inspector
+        "B": balloon.number,
+        "C": _designator(balloon),
+        "D": _requirement(balloon, strip_leading_zero=strip_zero),
+        "E": _uom(balloon, project_unit),
+        "F": "+" if (upper_delta is not None or lower_delta is not None) else "",
+        "G": _fmt_number(upper_delta),
+        "H": _fmt_number(lower_delta),
+        "I": None,  # Results -- filled in by the inspector
+        "J": balloon.inspection_method,
+        "K": None,  # NonConformance Number -- filled in by the inspector
+        "L": None,  # Notes -- filled in by the inspector
     }
     for col_letter, _title in COLUMNS:
         cell = ws[f"{col_letter}{row}"]
         cell.value = values.get(col_letter)
         cell.border = THIN_BORDER
         cell.alignment = Alignment(
-            horizontal="center" if col_letter in ("A", "D", "E", "F", "G", "H") else "left",
+            horizontal="center" if col_letter in ("B", "E", "F", "G", "H", "I") else "left",
             vertical="center",
-            wrap_text=col_letter in ("B", "C", "I", "K"),
+            wrap_text=col_letter in ("C", "D", "J", "L"),
         )
 
 
 def _write_title_block(ws: Worksheet) -> int:
     """Write the title rows and return the next free row number."""
-    ws.merge_cells(f"A1:{_LAST_COL}1")
-    ws["A1"] = "Sheet 1 of 1"
-    ws["A1"].alignment = Alignment(horizontal="right")
-    ws["A1"].font = Font(size=9, color="808080")
+    ws.merge_cells(f"B1:{_LAST_COL}1")
+    ws["B1"] = "Sheet 1 of 1"
+    ws["B1"].alignment = Alignment(horizontal="right")
+    ws["B1"].font = Font(size=9, color="808080")
 
-    ws.merge_cells(f"A2:{_LAST_COL}2")
-    ws["A2"] = "First Article Inspection Report"
-    ws["A2"].font = Font(size=14, bold=True)
-    ws["A2"].alignment = Alignment(horizontal="center")
+    ws.merge_cells(f"B2:{_LAST_COL}2")
+    ws["B2"] = "First Article Inspection Report"
+    ws["B2"].font = Font(size=14, bold=True)
+    ws["B2"].alignment = Alignment(horizontal="center")
     ws.row_dimensions[2].height = 22
 
-    ws.merge_cells(f"A3:{_LAST_COL}3")
-    ws["A3"] = "Form 3: Characteristic Accountability, Verification and Compatibility Evaluation"
-    ws["A3"].font = Font(size=11, bold=True)
-    ws["A3"].alignment = Alignment(horizontal="center")
+    ws.merge_cells(f"B3:{_LAST_COL}3")
+    ws["B3"] = "Form 3: Characteristic Accountability, Verification and Compatibility Evaluation"
+    ws["B3"].font = Font(size=11, bold=True)
+    ws["B3"].alignment = Alignment(horizontal="center")
     return 4
 
 
@@ -191,9 +192,9 @@ def _label_value(ws: Worksheet, row: int, col_letter: str, label: str, value: ob
 def _write_info_grid(ws: Worksheet, start_row: int, project: Project) -> int:
     row = start_row
 
-    _label_value(ws, row, "A", "1. Part Number", project.part_number)
-    _label_value(ws, row, "C", "2. Part Name", project.part_name or project.name)
-    _label_value(ws, row, "E", "3. Part Rev", project.revision)
+    _label_value(ws, row, "B", "1. Part Number", project.part_number)
+    _label_value(ws, row, "D", "2. Part Name", project.part_name or project.name)
+    _label_value(ws, row, "F", "3. Part Rev", project.revision)
 
     ws.row_dimensions[row].height = 18
     return row + 2  # one blank spacer row
@@ -201,9 +202,9 @@ def _write_info_grid(ws: Worksheet, start_row: int, project: Project) -> int:
 
 def _write_group_headers(ws: Worksheet, row: int) -> None:
     groups = [
-        ("A", "G", "Characteristic Accountability"),
-        ("H", "I", "Inspection / Test Results"),
-        ("J", "K", "Other Fields"),
+        ("B", "H", "Characteristic Accountability"),
+        ("I", "J", "Inspection / Test Results"),
+        ("K", "L", "Other Fields"),
     ]
     for start, end, title in groups:
         ws.merge_cells(f"{start}{row}:{end}{row}")
@@ -260,12 +261,9 @@ def build_inspection_workbook(
         _write_row(ws, row, balloon, project.unit or "in")
         row += 1
 
-    last_data_row = max(row - 1, header_row)
-    ws.auto_filter.ref = f"A{header_row}:{_LAST_COL}{last_data_row}"
-
     footer_row = row + 1
-    ws.merge_cells(f"I{footer_row}:{_LAST_COL}{footer_row}")
-    footer_cell = ws[f"I{footer_row}"]
+    ws.merge_cells(f"J{footer_row}:{_LAST_COL}{footer_row}")
+    footer_cell = ws[f"J{footer_row}"]
     footer_cell.value = f"Form {FORM_NUMBER} Rev {FORM_REV}"
     footer_cell.font = Font(size=9, italic=True, color="808080")
     footer_cell.alignment = Alignment(horizontal="right")

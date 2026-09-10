@@ -29,8 +29,8 @@ def test_thread_requirement_excludes_separate_depth(tmp_path, raw, callout):
     export_excel(project, drawing, balloons, output)
     workbook = openpyxl.load_workbook(output)
     sheet = workbook[INSPECTION_SHEET_NAME]
-    assert sheet["C8"].value == callout
-    assert str(sheet["C9"].value) == "18"
+    assert sheet["D8"].value == callout
+    assert str(sheet["D9"].value) == "18"
     assert balloons[0].raw_text == raw
     workbook.close()
 
@@ -82,7 +82,7 @@ def test_headers_match_spec(tmp_path: Path, sample_project_and_balloons):
     assert INSPECTION_SHEET_NAME in wb.sheetnames
 
     ws = wb[INSPECTION_SHEET_NAME]
-    header_row = [ws.cell(row=7, column=i + 1).value for i in range(len(COLUMNS))]
+    header_row = [ws[f"{letter}7"].value for letter, _title in COLUMNS]
     expected = [title for _letter, title in COLUMNS]
     assert header_row == expected
 
@@ -94,11 +94,11 @@ def test_title_block_and_info_grid(tmp_path: Path, sample_project_and_balloons):
 
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
-    assert ws["A2"].value == "First Article Inspection Report"
-    assert "Form 3" in ws["A3"].value
-    assert ws["B4"].value == "PN-123"
-    assert ws["D4"].value == "Camera Housing"
-    assert ws["F4"].value == "A"
+    assert ws["B2"].value == "First Article Inspection Report"
+    assert "Form 3" in ws["B3"].value
+    assert ws["C4"].value == "PN-123"
+    assert ws["E4"].value == "Camera Housing"
+    assert ws["G4"].value == "A"
 
 
 def test_default_export_excludes_pending_and_rejected(tmp_path: Path, sample_project_and_balloons):
@@ -109,7 +109,7 @@ def test_default_export_excludes_pending_and_rejected(tmp_path: Path, sample_pro
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
     # 2 rows expected: balloon #1 (accepted) and #4 (manual); #2 pending and #3 rejected excluded.
-    char_numbers = [ws.cell(row=r, column=1).value for r in range(8, ws.max_row + 1) if ws.cell(row=r, column=1).value]
+    char_numbers = [ws.cell(row=r, column=2).value for r in range(8, ws.max_row + 1) if ws.cell(row=r, column=2).value]
     assert char_numbers == [1, 4]
 
 
@@ -120,7 +120,7 @@ def test_include_pending_option(tmp_path: Path, sample_project_and_balloons):
 
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
-    char_numbers = [ws.cell(row=r, column=1).value for r in range(8, ws.max_row + 1) if ws.cell(row=r, column=1).value]
+    char_numbers = [ws.cell(row=r, column=2).value for r in range(8, ws.max_row + 1) if ws.cell(row=r, column=2).value]
     # Rejected (#3) must never be included, even with include_pending=True.
     assert 3 not in char_numbers
     assert 2 in char_numbers
@@ -134,13 +134,13 @@ def test_requirement_and_limits_formatting(tmp_path: Path, sample_project_and_ba
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
     # Balloon #1 -> row 8: Requirement = nominal, Upper/Lower = signed tolerance deltas.
-    assert ws["A8"].value == 1
-    assert ws["B8"].value == "Length"
-    assert ws["C8"].value == "50"
-    assert ws["D8"].value == "in"
-    assert ws["F8"].value == "0.05"
-    assert ws["G8"].value == "-0.05"
-    assert ws["I8"].value == "Caliper"
+    assert ws["B8"].value == 1
+    assert ws["C8"].value == "Length"
+    assert ws["D8"].value == "50"
+    assert ws["E8"].value == "in"
+    assert ws["G8"].value == "0.05"
+    assert ws["H8"].value == "-0.05"
+    assert ws["J8"].value == "Caliper"
 
 
 def test_form_footer_present(tmp_path: Path, sample_project_and_balloons):
@@ -150,11 +150,25 @@ def test_form_footer_present(tmp_path: Path, sample_project_and_balloons):
 
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
-    footer_values = [ws.cell(row=r, column=9).value for r in range(1, ws.max_row + 1)]
+    footer_values = [ws.cell(row=r, column=10).value for r in range(1, ws.max_row + 1)]
     assert any(v and FORM_NUMBER in v for v in footer_values)
 
 
-def test_header_frozen_and_autofilter(tmp_path: Path, sample_project_and_balloons):
+def test_column_a_is_left_blank_as_a_margin(tmp_path: Path, sample_project_and_balloons):
+    project, drawing, balloons = sample_project_and_balloons
+    out_path = tmp_path / "inspection.xlsx"
+    export_excel(project, drawing, balloons, out_path, include_pending=False)
+
+    wb = openpyxl.load_workbook(out_path)
+    ws = wb[INSPECTION_SHEET_NAME]
+    column_a_values = [ws.cell(row=r, column=1).value for r in range(1, ws.max_row + 1)]
+    assert all(v is None for v in column_a_values)
+    # Every column actually used by the form starts one column over, at B.
+    assert ws["B2"].value == "First Article Inspection Report"
+    assert COLUMNS[0][0] == "B"
+
+
+def test_header_frozen_and_no_autofilter(tmp_path: Path, sample_project_and_balloons):
     project, drawing, balloons = sample_project_and_balloons
     out_path = tmp_path / "inspection.xlsx"
     export_excel(project, drawing, balloons, out_path, include_pending=False)
@@ -162,4 +176,5 @@ def test_header_frozen_and_autofilter(tmp_path: Path, sample_project_and_balloon
     wb = openpyxl.load_workbook(out_path)
     ws = wb[INSPECTION_SHEET_NAME]
     assert ws.freeze_panes == "A8"
-    assert ws.auto_filter.ref is not None
+    # No Sort & Filter dropdowns on the header row.
+    assert ws.auto_filter.ref is None

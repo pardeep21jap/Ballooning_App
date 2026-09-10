@@ -237,17 +237,20 @@ class TestHoleFeatureModifiers:
 
     def test_countersink_symbol_with_diameter(self):
         result = parse_characteristic("⌵⌀0.500 X 82°")
-        assert result.char_type == CharacteristicType.COUNTERSINK.value
+        assert result.char_type == CharacteristicType.CHAMFER_DIA.value
 
     def test_countersink_diameter_with_angle_splits_into_two(self):
         # "⌵ Ø0.507 X 82°" -- a countersink's diameter and its included
         # angle, checked with different gauges, packed into one line.
+        # Typed as Chamfer Dia / Chamfer Angle rather than the generic
+        # Countersink/Angle types, so review/export can tell a countersink's
+        # two values apart from an unrelated plain diameter or angle.
         results = parse_characteristics("⌵Ø0.507 X 82°")
         assert len(results) == 2
         diameter, angle = results
-        assert diameter.char_type == CharacteristicType.COUNTERSINK.value
+        assert diameter.char_type == CharacteristicType.CHAMFER_DIA.value
         assert _close(diameter.nominal, 0.507)
-        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert angle.char_type == CharacteristicType.CHAMFER_ANGLE.value
         assert _close(angle.nominal, 82)
 
     def test_counterbore_diameter_with_angle_splits_into_two(self):
@@ -279,10 +282,10 @@ class TestHoleFeatureModifiers:
         results = parse_characteristics("w n 0.507 X 82°")
         assert len(results) == 2
         value, angle = results
-        assert value.char_type == CharacteristicType.COUNTERSINK.value
+        assert value.char_type == CharacteristicType.CHAMFER_DIA.value
         assert _close(value.nominal, 0.507)
         assert value.raw_text == "⌵⌀0.507 X 82°"
-        assert angle.char_type == CharacteristicType.ANGLE.value
+        assert angle.char_type == CharacteristicType.CHAMFER_ANGLE.value
         assert _close(angle.nominal, 82)
         assert angle.raw_text == "⌵⌀0.507 X 82°"
 
@@ -293,7 +296,7 @@ class TestHoleFeatureModifiers:
 
     def test_countersink_keyword(self):
         result = parse_characteristic("CSK 0.500 X 82")
-        assert result.char_type == CharacteristicType.COUNTERSINK.value
+        assert result.char_type == CharacteristicType.CHAMFER_DIA.value
 
     def test_square_symbol(self):
         result = parse_characteristic("□1.250")
