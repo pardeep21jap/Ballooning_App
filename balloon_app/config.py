@@ -34,6 +34,26 @@ def get_base_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def resource_path(*parts: str) -> Path:
+    """Return the path to a bundled read-only resource under
+    ``balloon_app/resources`` (icons, logo, spinner art).
+
+    Not the same lookup as ``get_base_dir()``: a PyInstaller one-folder
+    build unpacks ``--add-data`` resources under ``sys._MEIPASS`` (the
+    ``_internal`` folder next to the .exe as of PyInstaller 6), while
+    ``__file__`` for a frozen module resolves to nothing on disk since
+    pure-Python modules are stored inside the bundled archive, not
+    extracted as loose files next to a real ``resources`` folder --
+    building the path from ``__file__`` there silently yields a
+    nonexistent path, so QIcon/QPixmap just show nothing, with no error.
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(getattr(sys, "_MEIPASS", get_base_dir())) / "balloon_app"
+    else:
+        base = Path(__file__).resolve().parent
+    return base / "resources" / Path(*parts)
+
+
 BASE_DIR = get_base_dir()
 PROJECTS_DIR = BASE_DIR / "projects"
 DATASETS_DIR = BASE_DIR / "datasets"

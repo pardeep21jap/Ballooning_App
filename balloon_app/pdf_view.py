@@ -14,7 +14,6 @@ underlying page.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtCore import QEvent, QMutex, QObject, QPointF, QRectF, QThread, Qt, pyqtSignal
@@ -29,6 +28,7 @@ from balloon_app.config import (
     STAMP_FONT_SIZE_PDF_POINTS,
     STAMP_MARGIN_PDF_POINTS,
     STAMP_TEXT,
+    resource_path,
     status_color,
 )
 from balloon_app.data_model import Balloon, ReviewStatus
@@ -272,7 +272,7 @@ class PdfGraphicsView(QGraphicsView):
         self._pixmap_item: Optional[QGraphicsPixmapItem] = None
         self._pdf_doc: Optional[PdfDocument] = None
         self._page_number = 0
-        self._welcome_logo = QPixmap(str(Path(__file__).parent / "resources" / "balloonapp-logo.png"))
+        self._welcome_logo = QPixmap(str(resource_path("balloonapp-logo.png")))
         self._zoom_level = 1.0
         self._view_rotation = 0
         self.balloon_size_percent = 100

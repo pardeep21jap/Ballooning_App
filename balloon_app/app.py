@@ -53,7 +53,7 @@ from PyQt6.QtWidgets import (
 )
 
 from balloon_app.auto_balloon import AutoBalloonResult, auto_balloon_page
-from balloon_app.config import AppSettings, PROJECTS_DIR, setup_logging, status_color
+from balloon_app.config import AppSettings, PROJECTS_DIR, resource_path, setup_logging, status_color
 from balloon_app.data_model import (
     Balloon,
     BalloonSource,
@@ -590,7 +590,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("BalloonIQ")
-        self.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "balloonapp.ico")))
+        self.setWindowIcon(QIcon(str(resource_path("balloonapp.ico"))))
         self.resize(1440, 900)
 
         self.settings = AppSettings.load()
@@ -2322,7 +2322,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     apply_theme(app, AppSettings.load().theme)
     app.setApplicationName("BalloonIQ")
-    app.setWindowIcon(QIcon(str(Path(__file__).parent / "resources" / "balloonapp.ico")))
+    app.setWindowIcon(QIcon(str(resource_path("balloonapp.ico"))))
     window = MainWindow()
     window.show()
     return app.exec()

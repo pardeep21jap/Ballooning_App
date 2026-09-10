@@ -7,10 +7,10 @@ Every color used below is one flat value or an alpha-blend of it -- no
 per-widget one-offs -- so the whole app reads as one system.
 """
 
-from pathlib import Path
-
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication
+
+from balloon_app.config import resource_path
 
 # ---------------------------------------------------------------------------
 # "Modernist" light theme palette. Keep in sync with the RGBA tuples in
@@ -31,11 +31,10 @@ _BORDER_STRONG = "rgba(0, 32, 73, 0.4)"
 _LINE = "#d7d3d3"
 _DISABLED = "#9b9797"
 
-_RESOURCE_DIR = Path(__file__).parent / "resources"
-_SPIN_UP_LIGHT = (_RESOURCE_DIR / "spin-up-light.svg").as_posix()
-_SPIN_DOWN_LIGHT = (_RESOURCE_DIR / "spin-down-light.svg").as_posix()
-_SPIN_UP_DARK = (_RESOURCE_DIR / "spin-up-dark.svg").as_posix()
-_SPIN_DOWN_DARK = (_RESOURCE_DIR / "spin-down-dark.svg").as_posix()
+_SPIN_UP_LIGHT = resource_path("spin-up-light.svg").as_posix()
+_SPIN_DOWN_LIGHT = resource_path("spin-down-light.svg").as_posix()
+_SPIN_UP_DARK = resource_path("spin-up-dark.svg").as_posix()
+_SPIN_DOWN_DARK = resource_path("spin-down-dark.svg").as_posix()
 
 
 def apply_theme(app: QApplication, theme: str) -> None:

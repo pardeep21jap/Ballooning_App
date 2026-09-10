@@ -37,7 +37,7 @@ from PyQt6.QtWidgets import (
 )
 
 from balloon_app import __version__
-from balloon_app.config import AppSettings, DEFAULT_CONFIDENCE_THRESHOLD
+from balloon_app.config import AppSettings, DEFAULT_CONFIDENCE_THRESHOLD, resource_path
 from balloon_app.data_model import Balloon, CharacteristicType, ReviewStatus
 from balloon_app.ocr_parser import DefaultTolerances, compute_limits, decimal_places
 from balloon_app.training_export import TeachStats
@@ -840,7 +840,7 @@ class AboutDialog(QDialog):
 
         layout = QVBoxLayout(self)
         logo = QLabel()
-        logo.setPixmap(QPixmap(str(Path(__file__).parent / "resources" / "balloonapp-logo.png")).scaled(
+        logo.setPixmap(QPixmap(str(resource_path("balloonapp-logo.png"))).scaled(
             96, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
         ))
         logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
