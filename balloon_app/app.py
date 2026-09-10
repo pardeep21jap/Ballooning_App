@@ -8,7 +8,7 @@ import logging
 import re
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import math
 
@@ -304,13 +304,20 @@ def _toolbar_icon(kind: str, color: QColor, size: int = _TOOLBAR_ICON_SIZE) -> Q
     return QIcon(pixmap)
 
 
-def _status_badge_widget(source: str, status: str) -> QWidget:
+def _status_badge_widget(source: str, status: str, on_accept: Optional[Callable[[], None]] = None) -> QWidget:
     """A small pill-shaped badge for the Status column, colored from the
     same status_color used for the on-canvas balloon marker -- one semantic
     palette, not a separate one to keep in sync. "Accepted"/"Edited" (a
     reviewed, final state) are filled solid; "Pending"/"Rejected" are a
     plain outline, so the reviewed state reads as visually more settled at
     a glance across a long list.
+
+    When `on_accept` is given and the balloon is still pending, the badge
+    is a clickable button that accepts that single row directly -- so
+    accepting doesn't require selecting the row first (selecting a row by
+    clicking into this same column previously didn't work at all, since a
+    click on a cell widget like this one or the Method dropdown never
+    reaches the table's selection model).
 
     Returned as a wrapper widget (not just the label) so the badge hugs its
     text and stays centered in the cell via setCellWidget, rather than the
@@ -319,17 +326,28 @@ def _status_badge_widget(source: str, status: str) -> QWidget:
     r, g, b = status_color(source, status)[:3]
     color = f"rgb({r}, {g}, {b})"
     filled = status in (ReviewStatus.ACCEPTED.value, ReviewStatus.EDITED.value)
-    label = QLabel(status.upper())
-    label.setStyleSheet(
+    style = (
         f"background: {color if filled else '#ffffff'}; color: {'#ffffff' if filled else color}; "
         f"border: 1px solid {color}; border-radius: 3px; padding: 2px 10px; "
         "font-weight: 700; font-size: 10px;"
     )
+    badge: QWidget
+    if status == ReviewStatus.PENDING.value and on_accept is not None:
+        button = QPushButton(status.upper())
+        button.setStyleSheet(f"QPushButton {{ {style} }} QPushButton:hover {{ background: {color}; color: #ffffff; }}")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setToolTip("Click to accept")
+        button.clicked.connect(on_accept)
+        badge = button
+    else:
+        label = QLabel(status.upper())
+        label.setStyleSheet(style)
+        badge = label
     wrapper = QWidget()
     layout = QHBoxLayout(wrapper)
     layout.setContentsMargins(4, 2, 4, 2)
     layout.addStretch()
-    layout.addWidget(label)
+    layout.addWidget(badge)
     layout.addStretch()
     return wrapper
 
@@ -662,7 +680,7 @@ class MainWindow(QMainWindow):
         self.review_progress.setTextVisible(False)
         self.review_progress.setFixedHeight(6)
         layout.addWidget(self.review_progress)
-        self.review_legend = QLabel("0 accepted   \u00b7   0 edited   \u00b7   0 rejected   \u00b7   0 pending")
+        self.review_legend = QLabel("0 accepted   \u00b7   0 edited   \u00b7   0 pending")
         self.review_legend.setObjectName("mutedLabel")
         layout.addWidget(self.review_legend)
 
@@ -1674,7 +1692,7 @@ class MainWindow(QMainWindow):
         reviewed = total - pending
         self.review_count.setText(f"{reviewed} of {total} reviewed")
         self.review_progress.setValue(round(100 * reviewed / total) if total else 0)
-        self.review_legend.setText("   \u00b7   ".join(f"{counts.get(status, 0)} {status}" for status in ("accepted", "edited", "rejected", "pending")))
+        self.review_legend.setText("   \u00b7   ".join(f"{counts.get(status, 0)} {status}" for status in ("accepted", "edited", "pending")))
         table = self.review_table
         table.setColumnHidden(1, not self.drawing or self.drawing.page_count <= 1)
         table.setRowCount(len(balloons))
@@ -1705,7 +1723,13 @@ class MainWindow(QMainWindow):
                 if col in (4, 5):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 table.setItem(row, col, item)
-            table.setCellWidget(row, 7, _status_badge_widget(b.source, b.status))
+            table.setCellWidget(
+                row, 7,
+                _status_badge_widget(
+                    b.source, b.status,
+                    on_accept=lambda checked=False, balloon_id=b.id: self._accept_one(balloon_id),
+                ),
+            )
             method_combo = QComboBox(table)
             method_combo.addItems(COMMON_INSPECTION_METHODS)
             if method_combo.findText(b.inspection_method) < 0:
@@ -1735,6 +1759,18 @@ class MainWindow(QMainWindow):
     def _set_status_for(self, ids: list[str], status: str, text: str) -> None:
         if not ids or self.project is None:
             return
+        if status == ReviewStatus.ACCEPTED.value:
+            balloons = {bid: self._find_balloon(bid) for bid in ids}
+            blocked = [b.number for b in balloons.values() if b is not None and not b.inspection_method.strip()]
+            if blocked:
+                QMessageBox.warning(
+                    self, "Inspection Method Required",
+                    "Select an inspection method before accepting balloon(s) "
+                    + ", ".join(str(n) for n in sorted(blocked)) + ".",
+                )
+                ids = [bid for bid, b in balloons.items() if b is not None and b.inspection_method.strip()]
+                if not ids:
+                    return
         before, after = {}, {}
         for bid in ids:
             b = self._find_balloon(bid)
@@ -1755,6 +1791,9 @@ class MainWindow(QMainWindow):
 
     def _accept_selected(self) -> None:
         self._set_status_for(self._selected_balloon_ids(), ReviewStatus.ACCEPTED.value, "Accept Balloon(s)")
+
+    def _accept_one(self, balloon_id: str) -> None:
+        self._set_status_for([balloon_id], ReviewStatus.ACCEPTED.value, "Accept Balloon(s)")
 
     def _accept_all_above_threshold(self) -> None:
         if self.project is None or self.drawing is None:

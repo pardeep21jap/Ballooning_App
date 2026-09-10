@@ -15,6 +15,21 @@ one-click button. (The balloon Edit dialog's general-purpose "Review
 Status" field, which can set any status including Rejected, is out of
 scope -- it's what keeps a project's already-rejected balloons normally
 viewable/editable.)
+
+Bug 4: a pending balloon's Status-column cell held a plain (non-clickable)
+badge, and clicking into that column -- like clicking into the Method
+column's combo box -- never reached the table's selection model, since a
+cell widget swallows the mouse click before the view sees it. So a row
+whose last click landed on the Method or Status column wasn't selected,
+and the review panel's "Accept" button silently did nothing. The fix
+makes the pending Status badge itself a clickable "accept this row"
+button, so accepting no longer depends on row selection at all.
+
+Bug 5: the review panel's summary legend (e.g. "2 accepted · 0 edited ·
+0 rejected · 17 pending") still showed a "rejected" count even though the
+reject workflow was removed completely per Bug 3 above -- the count was
+always 0 and never actionable, so it was requested to be dropped from the
+legend text entirely.
 """
 from __future__ import annotations
 
@@ -25,8 +40,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from pathlib import Path
 
 from balloon_app.app import MainWindow, _bpdb_path_beside_pdf
+from balloon_app.data_model import Balloon, Drawing, Project, ReviewStatus
 from balloon_app.dialogs import NewProjectDialog
-from PyQt6.QtWidgets import QApplication, QDialog, QPushButton, QWidget
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox, QPushButton, QWidget
 
 
 def test_bpdb_path_beside_pdf_uses_pdf_folder(tmp_path: Path):
@@ -107,6 +123,110 @@ def test_review_more_menu_has_no_reject_option():
         # Unrelated More-menu actions must still be there.
         assert "Accept All Above Threshold..." in menu_labels
         assert "Add Manual" in menu_labels
+    finally:
+        window.close()
+        app.processEvents()
+
+
+class _FakeUndoStack:
+    """Stands in for QUndoStack so the test can push/redo a real
+    BalloonFieldChangeCommand without going through PyQt6's QUndoStack --
+    pushing onto the real one and then letting Python garbage-collect it
+    segfaults the interpreter on exit in this offscreen/headless test
+    environment (reproducible with a bare QUndoCommand, unrelated to
+    balloons or this fix), which is a pre-existing environment issue well
+    outside the scope of the Status-badge fix under test here."""
+
+    def push(self, cmd) -> None:
+        cmd.redo()
+
+    def isClean(self) -> bool:
+        return False
+
+
+def test_clicking_pending_status_badge_accepts_without_row_selection():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.undo_stack = _FakeUndoStack()
+    window._confirm_discard_changes = lambda: True
+    try:
+        drawing = Drawing(file_name="part.pdf", page_count=1)
+        balloon = Balloon(
+            drawing_id=drawing.id, number=1, status=ReviewStatus.PENDING.value,
+            inspection_method="Height Gauge",
+        )
+        project = Project(drawings=[drawing], balloons=[balloon])
+        window.project = project
+        window.drawing = drawing
+        window._refresh_review_table()
+
+        # Nothing selected -- clicking the toolbar Accept button would be a no-op.
+        assert window.review_table.selectionModel().selectedRows() == []
+
+        status_widget = window.review_table.cellWidget(0, 7)
+        accept_button = status_widget.findChild(QPushButton)
+        assert accept_button is not None
+        assert accept_button.text() == "PENDING"
+
+        accept_button.click()
+
+        assert balloon.status == ReviewStatus.ACCEPTED.value
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_accepting_without_an_inspection_method_is_blocked(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.undo_stack = _FakeUndoStack()
+    window._confirm_discard_changes = lambda: True
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        lambda *args, **kwargs: warnings.append(args) or QMessageBox.StandardButton.Ok,
+    )
+    try:
+        drawing = Drawing(file_name="part.pdf", page_count=1)
+        balloon = Balloon(drawing_id=drawing.id, number=1, status=ReviewStatus.PENDING.value)
+        assert balloon.inspection_method == ""
+        project = Project(drawings=[drawing], balloons=[balloon])
+        window.project = project
+        window.drawing = drawing
+        window._refresh_review_table()
+
+        status_widget = window.review_table.cellWidget(0, 7)
+        accept_button = status_widget.findChild(QPushButton)
+        assert accept_button is not None
+
+        accept_button.click()
+
+        assert balloon.status == ReviewStatus.PENDING.value
+        assert warnings, "expected a warning dialog when accepting without an inspection method"
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_review_legend_has_no_rejected_count():
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        # Before any project is open (the label's initial placeholder text).
+        assert "rejected" not in window.review_legend.text().lower()
+
+        drawing = Drawing(file_name="part.pdf", page_count=1)
+        balloon = Balloon(drawing_id=drawing.id, number=1, status=ReviewStatus.ACCEPTED.value)
+        project = Project(drawings=[drawing], balloons=[balloon])
+        window.project = project
+        window.drawing = drawing
+        window._refresh_review_table()
+
+        legend = window.review_legend.text()
+        assert "rejected" not in legend.lower()
+        assert "accepted" in legend.lower()
+        assert "edited" in legend.lower()
+        assert "pending" in legend.lower()
     finally:
         window.close()
         app.processEvents()
