@@ -3,7 +3,7 @@
 Produces a single-sheet workbook laid out like the standard AS9102 "Form 3:
 Characteristic Accountability, Verification and Compatibility Evaluation":
 a title block, a part/order info grid, then one row per ballooned
-characteristic under the Char No. / Characteristic Designator / Requirement /
+characteristic under the Char No. / Reference Location / Characteristic Designator / Requirement /
 UoM / Upper Limit / Lower Limit / Results / Gauge / NonConformance Number /
 Notes column set.
 """
@@ -32,25 +32,26 @@ FORM_REV = "-"
 # Column A is left blank as a margin (matches the standard AS9102 Form 3
 # layout); the form fields start at B, matching AS9102 field numbering.
 COLUMNS: list[tuple[str, str]] = [
-    ("B", "7.\nChar No."),
-    ("C", "7a.\nCharacteristic Designator"),
-    ("D", "8.\nRequirement"),
-    ("E", "8a.\nUoM"),
-    ("F", "±"),
-    ("G", "8b.\nUpper Limit"),
-    ("H", "8c.\nLower Limit"),
-    ("I", "9.\nResults"),
-    ("J", "10.\nGauge"),
-    ("K", "11.\nNonConformance Number"),
-    ("L", "12.\nNotes"),
+    ("B", "7. Char No."),
+    ("C", "6. Reference Location"),
+    ("D", "7a. Characteristic Designator"),
+    ("E", "8. Requirement"),
+    ("F", "8a. UoM"),
+    ("G", ""),
+    ("H", "8b. Upper Limit"),
+    ("I", "8c. Lower Limit"),
+    ("J", "9. Results"),
+    ("K", "10. Gauge"),
+    ("L", "11. Non-Conformance Number"),
+    ("M", "12. Notes"),
 ]
 
 _COLUMN_WIDTHS: dict[str, float] = {
-    "A": 3, "B": 8, "C": 24, "D": 14, "E": 8, "F": 5, "G": 12, "H": 12,
-    "I": 10, "J": 16, "K": 18, "L": 20,
+    "A": 3, "B": 8, "C": 18, "D": 24, "E": 14, "F": 8, "G": 5,
+    "H": 12, "I": 12, "J": 10, "K": 16, "L": 18, "M": 18, "N": 18,
 }
 
-_LAST_COL = COLUMNS[-1][0]
+_LAST_COL = "N"
 
 HEADER_FILL = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
 HEADER_FONT = Font(color="FFFFFF", bold=True)
@@ -132,79 +133,74 @@ def _write_row(ws: Worksheet, row: int, balloon: Balloon, project_unit: str) -> 
 
     values = {
         "B": balloon.number,
-        "C": _designator(balloon),
-        "D": _requirement(balloon, strip_leading_zero=strip_zero),
-        "E": _uom(balloon, project_unit),
-        "F": "+" if (upper_delta is not None or lower_delta is not None) else "",
-        "G": _fmt_number(upper_delta),
-        "H": _fmt_number(lower_delta),
-        "I": None,  # Results -- filled in by the inspector
-        "J": balloon.inspection_method,
-        "K": None,  # NonConformance Number -- filled in by the inspector
-        "L": None,  # Notes -- filled in by the inspector
+        "C": None,  # Reference location is not stored by the app
+        "D": _designator(balloon),
+        "E": _requirement(balloon, strip_leading_zero=strip_zero),
+        "F": _uom(balloon, project_unit),
+        "G": "+" if (upper_delta is not None or lower_delta is not None) else "",
+        "H": _fmt_number(upper_delta),
+        "I": _fmt_number(lower_delta),
+        "J": None,  # Results -- filled in by the inspector
+        "K": balloon.inspection_method,
+        "L": None,  # NonConformance Number -- filled in by the inspector
+        "M": None,  # Notes -- filled in by the inspector
     }
     for col_letter, _title in COLUMNS:
         cell = ws[f"{col_letter}{row}"]
         cell.value = values.get(col_letter)
         cell.border = THIN_BORDER
         cell.alignment = Alignment(
-            horizontal="center" if col_letter in ("B", "E", "F", "G", "H", "I") else "left",
+            horizontal="center" if col_letter in ("B", "F", "G", "H", "I", "J") else "left",
             vertical="center",
-            wrap_text=col_letter in ("C", "D", "J", "L"),
+            wrap_text=col_letter in ("D", "E", "K", "M"),
         )
+    ws.merge_cells(f"M{row}:N{row}")
 
 
 def _write_title_block(ws: Worksheet) -> int:
     """Write the title rows and return the next free row number."""
-    ws.merge_cells(f"B1:{_LAST_COL}1")
-    ws["B1"] = "Sheet 1 of 1"
-    ws["B1"].alignment = Alignment(horizontal="right")
-    ws["B1"].font = Font(size=9, color="808080")
-
-    ws.merge_cells(f"B2:{_LAST_COL}2")
-    ws["B2"] = "First Article Inspection Report"
-    ws["B2"].font = Font(size=14, bold=True)
-    ws["B2"].alignment = Alignment(horizontal="center")
-    ws.row_dimensions[2].height = 22
-
-    ws.merge_cells(f"B3:{_LAST_COL}3")
-    ws["B3"] = "Form 3: Characteristic Accountability, Verification and Compatibility Evaluation"
-    ws["B3"].font = Font(size=11, bold=True)
-    ws["B3"].alignment = Alignment(horizontal="center")
-    return 4
-
-
-def _label_value(ws: Worksheet, row: int, col_letter: str, label: str, value: object) -> None:
-    label_cell = ws[f"{col_letter}{row}"]
-    label_cell.value = label
-    label_cell.font = Font(bold=True, size=9)
-    label_cell.fill = LABEL_FILL
-    label_cell.border = THIN_BORDER
-    label_cell.alignment = Alignment(vertical="center")
-
-    value_col = chr(ord(col_letter) + 1)
-    value_cell = ws[f"{value_col}{row}"]
-    value_cell.value = value
-    value_cell.border = THIN_BORDER
-    value_cell.alignment = Alignment(vertical="center")
+    for row, title in (
+        (1, "First Article Inspection Report"),
+        (2, "Characteristic Accountability, Verification and Compatibility Evaluation"),
+    ):
+        ws.merge_cells(f"B{row}:{_LAST_COL}{row}")
+        ws[f"B{row}"] = title
+        ws[f"B{row}"].font = Font(size=14 if row == 1 else 11, bold=True)
+        ws[f"B{row}"].alignment = Alignment(horizontal="center")
+        ws.row_dimensions[row].height = 22
+    return 3
 
 
 def _write_info_grid(ws: Worksheet, start_row: int, project: Project) -> int:
-    row = start_row
-
-    _label_value(ws, row, "B", "1. Part Number", project.part_number)
-    _label_value(ws, row, "D", "2. Part Name", project.part_name or project.name)
-    _label_value(ws, row, "F", "3. Part Rev", project.revision)
-
-    ws.row_dimensions[row].height = 18
-    return row + 2  # one blank spacer row
+    fields = [
+        (start_row, "B", "D", "1. Part Number", project.part_number),
+        (start_row, "E", "L", "2. Part Name", project.part_name or project.name),
+        (start_row, "M", "M", "3. Serial/Lot Number", None),
+        (start_row, "N", "N", "4. FAI Report", None),
+        (start_row + 2, "B", "D", "5. Part Rev", project.revision),
+        (start_row + 2, "E", "I", "6. PO Number:", None),
+        (start_row + 2, "J", "L", "6a. Mfg WO#:", None),
+    ]
+    for row, first, last, label, value in fields:
+        for offset, text in enumerate((label, value)):
+            if first != last:
+                ws.merge_cells(f"{first}{row + offset}:{last}{row + offset}")
+            cell = ws[f"{first}{row + offset}"]
+            cell.value = text
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+            if offset == 0:
+                cell.font = Font(bold=True, size=9)
+                cell.fill = LABEL_FILL
+            ws.row_dimensions[row + offset].height = 28
+    return start_row + 4
 
 
 def _write_group_headers(ws: Worksheet, row: int) -> None:
     groups = [
-        ("B", "H", "Characteristic Accountability"),
-        ("I", "J", "Inspection / Test Results"),
-        ("K", "L", "Other Fields"),
+        ("B", "I", "Characteristic Accountability"),
+        ("J", "L", "Inspection / Test Results"),
+        ("M", "N", "Other Fields"),
     ]
     for start, end, title in groups:
         ws.merge_cells(f"{start}{row}:{end}{row}")
@@ -218,6 +214,8 @@ def _write_group_headers(ws: Worksheet, row: int) -> None:
 
 def _write_column_headers(ws: Worksheet, row: int) -> None:
     for col_letter, title in COLUMNS:
+        end_col = "N" if col_letter == "M" else col_letter
+        ws.merge_cells(f"{col_letter}{row}:{end_col}{row + 1}")
         cell = ws[f"{col_letter}{row}"]
         cell.value = title
         cell.fill = HEADER_FILL
@@ -254,19 +252,12 @@ def build_inspection_workbook(
     header_row = next_row + 1
     _write_group_headers(ws, group_row)
     _write_column_headers(ws, header_row)
-    ws.freeze_panes = f"A{header_row + 1}"
+    ws.freeze_panes = f"A{header_row + 2}"
 
-    row = header_row + 1
+    row = header_row + 2
     for balloon in exportable:
         _write_row(ws, row, balloon, project.unit or "in")
         row += 1
-
-    footer_row = row + 1
-    ws.merge_cells(f"J{footer_row}:{_LAST_COL}{footer_row}")
-    footer_cell = ws[f"J{footer_row}"]
-    footer_cell.value = f"Form {FORM_NUMBER} Rev {FORM_REV}"
-    footer_cell.font = Font(size=9, italic=True, color="808080")
-    footer_cell.alignment = Alignment(horizontal="right")
 
     return wb
 

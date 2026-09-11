@@ -111,18 +111,26 @@ def test_review_action_bar_has_no_reject_button():
         app.processEvents()
 
 
-def test_review_more_menu_has_no_reject_option():
+def test_review_actions_replace_more_menu_with_buttons(monkeypatch):
     app = QApplication.instance() or QApplication([])
+    calls = []
+    callbacks = [
+        ("Accept All Above Threshold...", "_accept_all_above_threshold"),
+        ("Add Manual", "_add_manual_balloon"),
+        ("Duplicate", "_duplicate_selected_balloon"),
+    ]
+    for label, method in callbacks:
+        monkeypatch.setattr(MainWindow, method, lambda self, checked=False, label=label: calls.append(label))
     window = MainWindow()
     try:
         action_bar = window.findChild(QWidget, "reviewActions")
-        more_button = next(b for b in action_bar.findChildren(QPushButton) if b.text() == "More")
-        menu_labels = [a.text() for a in more_button.menu().actions() if not a.isSeparator()]
-
-        assert not any("reject" in label.lower() for label in menu_labels)
-        # Unrelated More-menu actions must still be there.
-        assert "Accept All Above Threshold..." in menu_labels
-        assert "Add Manual" in menu_labels
+        buttons = action_bar.findChildren(QPushButton)
+        labels = [button.text() for button in buttons]
+        assert labels == ["Accept", "Edit", "Delete", *[label for label, _ in callbacks]]
+        assert all(button.menu() is None for button in buttons)
+        for button in buttons[3:]:
+            button.click()
+        assert calls == [label for label, _ in callbacks]
     finally:
         window.close()
         app.processEvents()
@@ -227,6 +235,56 @@ def test_review_legend_has_no_rejected_count():
         assert "accepted" in legend.lower()
         assert "edited" in legend.lower()
         assert "pending" in legend.lower()
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_app_has_no_renumber_action():
+    from PyQt6.QtGui import QAction
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        assert not any("renumber" in action.text().lower() for action in window.findChildren(QAction))
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_delete_balloons_renumbers_drawing_and_undo_restores_numbers():
+    from balloon_app.app import DeleteBalloonsCommand
+
+    app = QApplication.instance() or QApplication([])
+    balloons = [Balloon(drawing_id="drawing", number=n, page_number=n % 2) for n in range(1, 6)]
+    other = Balloon(drawing_id="other", number=9)
+    project = Project(balloons=[balloons[4], other, *balloons[:4]])
+    original = {b.id: b.number for b in project.balloons}
+    refreshed = []
+    command = DeleteBalloonsCommand(project, [balloons[1], balloons[3]], lambda: refreshed.append(True))
+    command.redo()
+    assert [b.number for b in (balloons[0], balloons[2], balloons[4])] == [1, 2, 3]
+    assert other.number == 9
+    assert {b.id for b in project.balloons} == {balloons[0].id, balloons[2].id, balloons[4].id, other.id}
+    command.undo()
+    assert {b.id: b.number for b in project.balloons} == original
+    command.redo()
+    assert [b.number for b in (balloons[0], balloons[2], balloons[4])] == [1, 2, 3]
+    assert other.number == 9
+    assert len(refreshed) == 3
+    app.processEvents()
+
+
+def test_app_has_no_split_balloon_action():
+    from PyQt6.QtGui import QAction
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    try:
+        labels = [action.text() for action in window.findChildren(QAction)]
+        assert not any("split balloon" in label.lower() for label in labels)
+        assert "Duplicate" in [button.text() for button in window.findChildren(QPushButton)]
+        assert "Delete Balloon" in labels
     finally:
         window.close()
         app.processEvents()

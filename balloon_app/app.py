@@ -429,10 +429,18 @@ class DeleteBalloonsCommand(QUndoCommand):
         self.project = project
         self.balloons = list(balloons)
         self.refresh_cb = refresh_cb
+        self.drawing_ids = {b.drawing_id for b in self.balloons}
+        self.original_numbers = {
+            b.id: b.number for b in project.balloons if b.drawing_id in self.drawing_ids
+        }
 
     def redo(self) -> None:
         ids = {b.id for b in self.balloons}
         self.project.balloons = [b for b in self.project.balloons if b.id not in ids]
+        for drawing_id in self.drawing_ids:
+            remaining = sorted(self.project.balloons_for(drawing_id), key=lambda b: b.number)
+            for number, balloon in enumerate(remaining, start=1):
+                balloon.number = number
         self.refresh_cb()
 
     def undo(self) -> None:
@@ -440,6 +448,9 @@ class DeleteBalloonsCommand(QUndoCommand):
         for b in self.balloons:
             if b.id not in existing_ids:
                 self.project.balloons.append(b)
+        for balloon in self.project.balloons:
+            if balloon.id in self.original_numbers:
+                balloon.number = self.original_numbers[balloon.id]
         self.refresh_cb()
 
 
@@ -740,7 +751,10 @@ class MainWindow(QMainWindow):
         row.setSpacing(8)
         for label, callback in (("Accept", self._accept_selected),
                                 ("Edit", self._edit_selected_balloon),
-                                ("Delete", self._delete_selected_balloons)):
+                                ("Delete", self._delete_selected_balloons),
+                                ("Accept All Above Threshold...", self._accept_all_above_threshold),
+                                ("Add Manual", self._add_manual_balloon),
+                                ("Duplicate", self._duplicate_selected_balloon)):
             button = QPushButton(label)
             button.setMinimumHeight(34)
             if label == "Accept":
@@ -748,24 +762,6 @@ class MainWindow(QMainWindow):
             button.clicked.connect(callback)
             row.addWidget(button)
         row.addStretch()
-        more = QPushButton("More")
-        more.setMinimumHeight(34)
-        menu = QMenu(more)
-        for label, callback in (
-            ("Accept All Above Threshold...", self._accept_all_above_threshold),
-            (None, None),
-            ("Add Manual", self._add_manual_balloon),
-            ("Duplicate", self._duplicate_selected_balloon),
-            ("Split Balloon", self._split_selected_balloon),
-            (None, None),
-            ("Renumber...", self._show_renumber_dialog),
-        ):
-            if label is None:
-                menu.addSeparator()
-            else:
-                menu.addAction(label).triggered.connect(callback)
-        more.setMenu(menu)
-        row.addWidget(more)
         layout.addWidget(action_bar)
 
         return panel
@@ -853,18 +849,10 @@ class MainWindow(QMainWindow):
         duplicate_act.triggered.connect(self._duplicate_selected_balloon)
         edit_menu.addAction(duplicate_act)
 
-        split_act = QAction("Split Balloon", self)
-        split_act.triggered.connect(self._split_selected_balloon)
-        edit_menu.addAction(split_act)
-
         delete_act = QAction("Delete Balloon", self)
         delete_act.setShortcut(QKeySequence("Delete"))
         delete_act.triggered.connect(self._delete_selected_balloons)
         edit_menu.addAction(delete_act)
-
-        renumber_act = QAction("Renumber Balloons...", self)
-        renumber_act.triggered.connect(self._show_renumber_dialog)
-        edit_menu.addAction(renumber_act)
 
         # View menu
         view_menu = menu_bar.addMenu("&View")
