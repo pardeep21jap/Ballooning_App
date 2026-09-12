@@ -253,6 +253,7 @@ class PdfGraphicsView(QGraphicsView):
     balloonDoubleClicked = pyqtSignal(str)
     newBalloonRequested = pyqtSignal(float, float)
     leaderPointPicked = pyqtSignal(str, float, float)
+    characteristicRegionPicked = pyqtSignal(str, object)
     leaderHandleMoved = pyqtSignal(str, float, float)
     leaderHandleDragFinished = pyqtSignal(str)
     emptySpaceClicked = pyqtSignal()
@@ -287,6 +288,9 @@ class PdfGraphicsView(QGraphicsView):
 
         self.add_balloon_mode = False
         self.leader_mode_balloon_id: Optional[str] = None
+        self._region_balloon_id = None
+        self._region_start = None
+        self._region_item = None
 
         self._panning = False
         self._pan_start_pos = None
@@ -339,6 +343,7 @@ class PdfGraphicsView(QGraphicsView):
     # Document / page loading
     # ------------------------------------------------------------------
     def load_document(self, pdf_doc: Optional[PdfDocument]) -> None:
+        self.cancel_characteristic_region()
         # Invalidate queued results before clearing the scene. A render from
         # the previous document must not put its page back after closing.
         self._request_counter += 1
@@ -368,6 +373,7 @@ class PdfGraphicsView(QGraphicsView):
         self.renderFinished.emit()
 
     def set_page(self, page_number: int, balloons: list[Balloon], preserve_view: bool = False) -> None:
+        self.cancel_characteristic_region()
         self._page_number = page_number
         self._current_balloons = balloons
         self._request_render(preserve_view=preserve_view)
@@ -490,6 +496,7 @@ class PdfGraphicsView(QGraphicsView):
             return  # stale result from a superseded zoom/page change
         self._latest_request_id = request_id
         self._current_render_dpi = dpi
+        self.cancel_characteristic_region()
 
         image = QImage(data, width, height, width * 3, QImage.Format.Format_RGB888)
         pixmap = QPixmap.fromImage(image.copy())
@@ -683,7 +690,45 @@ class PdfGraphicsView(QGraphicsView):
     # ------------------------------------------------------------------
     # Mouse interaction: manual panning + add-balloon / leader picking
     # ------------------------------------------------------------------
+    def start_characteristic_region(self, balloon_id: str) -> None:
+        self.cancel_characteristic_region()
+        if self._pixmap_item is None:
+            return
+        self._region_balloon_id = balloon_id
+        self.setFocus()
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.statusMessage.emit("Drag around the characteristic. Esc or right-click cancels.")
+
+    def cancel_characteristic_region(self) -> None:
+        if self._region_item is not None:
+            self._scene.removeItem(self._region_item)
+        if self._region_balloon_id is not None:
+            self.unsetCursor()
+            self.statusMessage.emit("")
+        self._region_balloon_id = None
+        self._region_start = None
+        self._region_item = None
+
+    def _characteristic_rect(self, position) -> QRectF:
+        return QRectF(self._region_start, self.mapToScene(position)).normalized().intersected(
+            self._pixmap_item.boundingRect()
+        )
+
+    def keyPressEvent(self, event) -> None:
+        if self._region_balloon_id is not None and event.key() == Qt.Key.Key_Escape:
+            self.cancel_characteristic_region()
+            return
+        super().keyPressEvent(event)
+
     def mousePressEvent(self, event) -> None:  # noqa: D102
+        if self._region_balloon_id is not None:
+            if event.button() == Qt.MouseButton.RightButton:
+                self.cancel_characteristic_region()
+            elif event.button() == Qt.MouseButton.LeftButton:
+                self._region_start = self.mapToScene(event.pos())
+                self._region_item = self._scene.addRect(QRectF(), QPen(QColor(*COLOR_SELECTED_OUTLINE)))
+                self._region_item.setZValue(1000)
+            return
         if event.button() == Qt.MouseButton.LeftButton:
             scene_pos = self.mapToScene(event.pos())
             item = self.itemAt(event.pos())
@@ -711,6 +756,10 @@ class PdfGraphicsView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: D102
+        if self._region_balloon_id is not None:
+            if self._region_start is not None:
+                self._region_item.setRect(self._characteristic_rect(event.pos()))
+            return
         if self._panning and self._pan_start_pos is not None:
             delta = event.pos() - self._pan_start_pos
             self._pan_start_pos = event.pos()
@@ -722,6 +771,17 @@ class PdfGraphicsView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: D102
+        if self._region_balloon_id is not None:
+            if event.button() == Qt.MouseButton.LeftButton and self._region_start is not None:
+                rect = self._characteristic_rect(event.pos())
+                balloon_id = self._region_balloon_id
+                dpi = self._last_render_dpi()
+                self.cancel_characteristic_region()
+                if rect.isValid():
+                    box = (*pixel_to_pdf(rect.left(), rect.top(), dpi),
+                           *pixel_to_pdf(rect.right(), rect.bottom(), dpi))
+                    self.characteristicRegionPicked.emit(balloon_id, box)
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._panning:
             self._panning = False
             self.setCursor(Qt.CursorShape.ArrowCursor)

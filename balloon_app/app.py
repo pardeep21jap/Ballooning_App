@@ -646,6 +646,7 @@ class MainWindow(QMainWindow):
         self.pdf_view.balloonDragFinished.connect(self._on_balloon_drag_finished)
         self.pdf_view.newBalloonRequested.connect(self._on_new_balloon_requested)
         self.pdf_view.leaderPointPicked.connect(self._on_leader_point_picked)
+        self.pdf_view.characteristicRegionPicked.connect(self._on_characteristic_region_picked)
         self.pdf_view.leaderHandleMoved.connect(self._on_leader_handle_moved)
         self.pdf_view.leaderHandleDragFinished.connect(self._on_leader_handle_drag_finished)
         self.pdf_view.emptySpaceClicked.connect(self._on_empty_space_clicked)
@@ -848,6 +849,9 @@ class MainWindow(QMainWindow):
 
         leader_act = QAction("Set Leader Point for Selected Balloon", self)
         leader_act.triggered.connect(self._start_leader_pick)
+        region_act = QAction("Set Characteristic Region...", self)
+        region_act.triggered.connect(self._start_characteristic_region)
+        edit_menu.addAction(region_act)
         edit_menu.addAction(leader_act)
 
         duplicate_act = QAction("Duplicate Balloon", self)
@@ -1481,6 +1485,38 @@ class MainWindow(QMainWindow):
             return
         self.pdf_view.leader_mode_balloon_id = ids[0]
         self.statusBar().showMessage("Click on the drawing to set the leader line start point.")
+
+    def _start_characteristic_region(self) -> None:
+        ids = self._selected_balloon_ids()
+        balloon = self._find_balloon(ids[0]) if len(ids) == 1 else None
+        if balloon is None or balloon.source != BalloonSource.MANUAL.value:
+            QMessageBox.information(self, "Select Manual Balloon", "Select one manually added balloon first.")
+            return
+        if balloon.page_number != self.current_page:
+            self._load_page(balloon.page_number)
+            return  # Let the requested page finish rendering before selecting a region.
+        self.pdf_view.start_characteristic_region(balloon.id)
+
+    def _on_characteristic_region_picked(self, balloon_id: str, box: tuple) -> None:
+        balloon = self._find_balloon(balloon_id)
+        if (balloon is None or self.project is None or self.drawing is None or self.pdf_doc is None
+                or balloon.source != BalloonSource.MANUAL.value
+                or balloon.drawing_id != self.drawing.id or balloon.page_number != self.current_page):
+            return
+        if len(box) != 4 or not all(math.isfinite(value) for value in box):
+            return
+        width, height = self.pdf_doc.page_size_pdf(self.current_page)
+        x0, y0, x1, y1 = box
+        x0, x1 = max(0, min(width, x0)), max(0, min(width, x1))
+        y0, y1 = max(0, min(height, y0)), max(0, min(height, y1))
+        if x1 <= x0 or y1 <= y0:
+            return
+        fields = ("bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1")
+        before = {balloon_id: {field: getattr(balloon, field) for field in fields}}
+        after = {balloon_id: dict(zip(fields, (x0, y0, x1, y1)))}
+        self.undo_stack.push(BalloonFieldChangeCommand(
+            self.project, [balloon_id], before, after, self._refresh_all, text="Set Characteristic Region",
+        ))
 
     def _on_new_balloon_requested(self, pdf_x: float, pdf_y: float) -> None:
         if self.project is None or self.drawing is None:
