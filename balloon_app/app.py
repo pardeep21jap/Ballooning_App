@@ -2314,6 +2314,8 @@ class MainWindow(QMainWindow):
         )
         if result.skipped_drawings:
             message += f"\n\nSkipped (source PDF not found): {', '.join(result.skipped_drawings)}"
+        if result.skipped_annotations:
+            message += f"\n\nSkipped annotations: {len(result.skipped_annotations)}. See manifest skip_reason and application log for details."
         self.statusBar().showMessage("Training dataset export complete.", 6000)
         QMessageBox.information(self, "Export Complete", message)
 

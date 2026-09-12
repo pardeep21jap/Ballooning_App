@@ -20,6 +20,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import os
 import tempfile
 from dataclasses import dataclass, field
@@ -97,6 +98,7 @@ class TrainingExportResult:
     manifest_csv_path: Optional[Path] = None
     classes_path: Optional[Path] = None
     skipped_drawings: list[str] = field(default_factory=list)
+    skipped_annotations: list[str] = field(default_factory=list)
 
 
 def _is_positive_label(balloon: Balloon) -> bool:
@@ -105,6 +107,24 @@ def _is_positive_label(balloon: Balloon) -> bool:
     if balloon.status in (ReviewStatus.ACCEPTED.value, ReviewStatus.EDITED.value):
         return True
     return balloon.source == BalloonSource.MANUAL.value
+
+
+def _validated_pixel_box(balloon: Balloon, dpi: float, width: int, height: int) -> tuple:
+    if not balloon.has_bbox():
+        raise ValueError("Missing bounding box")
+    box = balloon.bbox()
+    if not all(not isinstance(value, bool) and math.isfinite(value) for value in box):
+        raise ValueError("Bounding box coordinates must be finite numbers")
+    if box[2] <= box[0] or box[3] <= box[1]:
+        raise ValueError("Bounding box width and height must be positive")
+    px0, py0, px1, py1 = rect_pdf_to_pixel(box, dpi)
+    if not all(math.isfinite(value) for value in (px0, py0, px1, py1)):
+        raise ValueError("Rendered bounding box must be finite")
+    px0, px1 = max(0, min(width, px0)), max(0, min(width, px1))
+    py0, py1 = max(0, min(height, py0)), max(0, min(height, py1))
+    if px1 - px0 < 2 or py1 - py0 < 2:
+        raise ValueError("Clipped bounding box is smaller than 2 x 2 rendered pixels")
+    return px0, py0, px1, py1
 
 
 def _write_classes_files(manifests_dir: Path) -> Path:
@@ -210,26 +230,42 @@ def export_training_dataset(
                 result.image_count += 1
 
                 label_lines: list[str] = []
+                seen_labels: set[str] = set()
                 for balloon in page_balloons:
                     crop_rel_path = None
-                    if balloon.has_bbox():
-                        px0, py0, px1, py1 = rect_pdf_to_pixel(balloon.bbox(), dpi)  # type: ignore[arg-type]
-                        px0, px1 = sorted((max(0, min(width, px0)), max(0, min(width, px1))))
-                        py0, py1 = sorted((max(0, min(height, py0)), max(0, min(height, py1))))
-                        if px1 - px0 >= 2 and py1 - py0 >= 2:
-                            crop = image.crop((int(px0), int(py0), int(px1), int(py1)))
-                            crop_name = f"{stem}_b{balloon.number}_{balloon.id[:8]}.png"
-                            crop.save(crops_dir / crop_name)
-                            crop_rel_path = str((crops_dir / crop_name).relative_to(output_root)).replace("\\", "/")
-                            result.crop_count += 1
+                    exported = False
+                    skip_reason = ""
+                    try:
+                        px0, py0, px1, py1 = _validated_pixel_box(balloon, dpi, width, height)
+                        crop = image.crop((int(px0), int(py0), int(px1), int(py1)))
+                        crop_name = f"{stem}_b{balloon.number}_{balloon.id[:8]}.png"
+                        crop.save(crops_dir / crop_name)
+                        crop_rel_path = str((crops_dir / crop_name).relative_to(output_root)).replace("\\", "/")
+                        result.crop_count += 1
 
-                            if _is_positive_label(balloon):
-                                class_id = CLASS_TO_ID.get(balloon.char_type, CLASS_TO_ID.get("other", len(CHARACTERISTIC_CLASSES) - 1))
-                                x_center = ((px0 + px1) / 2.0) / width
-                                y_center = ((py0 + py1) / 2.0) / height
-                                box_w = (px1 - px0) / width
-                                box_h = (py1 - py0) / height
-                                label_lines.append(f"{class_id} {x_center:.6f} {y_center:.6f} {box_w:.6f} {box_h:.6f}")
+                        if _is_positive_label(balloon):
+                            class_id = CLASS_TO_ID.get(balloon.char_type)
+                            if type(class_id) is not int or not 0 <= class_id < len(CHARACTERISTIC_CLASSES):
+                                raise ValueError("Invalid characteristic class")
+                            x_center = ((px0 + px1) / 2.0) / width
+                            y_center = ((py0 + py1) / 2.0) / height
+                            box_w = (px1 - px0) / width
+                            box_h = (py1 - py0) / height
+                            values = (x_center, y_center, box_w, box_h)
+                            if not all(math.isfinite(value) and 0 <= value <= 1 for value in values):
+                                raise ValueError("Normalized label values must be within 0–1")
+                            label = f"{class_id} {x_center:.6f} {y_center:.6f} {box_w:.6f} {box_h:.6f}"
+                            if label in seen_labels:
+                                raise ValueError("Duplicate label on page")
+                            seen_labels.add(label)
+                            label_lines.append(label)
+                            exported = True
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        if _is_positive_label(balloon):
+                            skip_reason = str(exc)
+                            report = f"Drawing {drawing.id}, page {page_number + 1}, balloon {balloon.number} ({balloon.id}): {skip_reason}"
+                            result.skipped_annotations.append(report)
+                            logger.warning("Skipped training annotation: %s", report)
 
                     manifest_rows.append(
                         _manifest_row(
@@ -238,6 +274,8 @@ def export_training_dataset(
                             crop_rel_path=crop_rel_path,
                         )
                     )
+                    manifest_rows[-1]["exported_as_positive_label"] = exported
+                    manifest_rows[-1]["skip_reason"] = skip_reason
 
                 label_path = labels_dir / f"{stem}.txt"
                 label_path.write_text("\n".join(label_lines) + ("\n" if label_lines else ""), encoding="utf-8")
@@ -267,7 +305,7 @@ def _write_manifest_csv(path: Path, rows: list[dict]) -> None:
         "predicted_type", "final_type", "raw_text", "final_nominal", "final_tol_plus",
         "final_tol_minus", "final_lower_limit", "final_upper_limit", "final_gdt_symbol",
         "final_gdt_tolerance", "final_datums", "status", "source", "confidence",
-        "model_version", "exported_as_positive_label",
+        "model_version", "exported_as_positive_label", "skip_reason",
     ]
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_", suffix=".csv")
     try:
