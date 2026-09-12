@@ -1023,6 +1023,26 @@ class AutoBalloonResult:
     message: str = ""
 
 
+def _duplicate_detection(a: Detection, b: Detection) -> bool:
+    """Require strong overlap, and stronger evidence for conflicting known types."""
+    unknown_types = ("", CharacteristicType.OTHER.value, None)
+    conflicting = a.label not in unknown_types and b.label not in unknown_types and a.label != b.label
+    a, b = a.bbox, b.bbox
+    intersection = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+        0.0, min(a[3], b[3]) - max(a[1], b[1])
+    )
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - intersection
+    smaller_area = min(area_a, area_b)
+    if smaller_area <= 0 or union <= 0:
+        return False
+    iou = intersection / union
+    if conflicting:
+        return iou >= 0.90
+    return iou >= 0.50 or intersection / smaller_area >= 0.80
+
+
 def auto_balloon_page(
     pdf_doc: PdfDocument,
     drawing_id: str,
@@ -1246,16 +1266,20 @@ def auto_balloon_page(
             if message == "OCR ran but found no recognizable dimensions/tolerances on this page.":
                 message = ""
 
-    # Supplement the completed native/OCR pass without merging its candidates.
+    # Prefer text-backed candidates when YOLO covers the same region.
     if isinstance(detector, YoloDetector) and detector.available and rendered_image is not None:
+        rules_candidates = list(candidates)
         for det in detector.detect(rendered_image):
             bbox_pdf = rect_pixel_to_pdf(det.bbox, dpi)
             if _bbox_in_regions(bbox_pdf, excluded_regions):
                 continue
-            candidates.append(Detection(
+            yolo_candidate = Detection(
                 bbox=bbox_pdf, label=det.label, confidence=det.confidence,
                 raw_text=det.raw_text, model_version="yolo",
-            ))
+            )
+            if any(_duplicate_detection(yolo_candidate, candidate) for candidate in rules_candidates):
+                continue
+            candidates.append(yolo_candidate)
             if message == "OCR ran but found no recognizable dimensions/tolerances on this page.":
                 message = ""
 

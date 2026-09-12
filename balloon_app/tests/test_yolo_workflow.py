@@ -107,13 +107,12 @@ def test_native_text_unchanged_without_available_yolo(tmp_path, enabled):
 @pytest.mark.parametrize("has_boxes", [False, True])
 def test_yolo_supplements_existing_detections(monkeypatch, tmp_path, native, has_boxes):
     fallback = Mock(available=True)
-    # Deliberately overlapping boxes: combining detectors must not deduplicate.
     fallback.detect.return_value = [auto_balloon.Detection((40, 40, 90, 60), "linear_dimension", .8, "12.50")]
     factory = Mock(return_value=fallback)
     monkeypatch.setattr(auto_balloon, "RulesOcrDetector", factory)
     detector = auto_balloon.YoloDetector.__new__(auto_balloon.YoloDetector)
     detector.available = True
-    detector.detect = Mock(return_value=[auto_balloon.Detection((40, 40, 90, 60), "diameter", .8)] if has_boxes else [])
+    detector.detect = Mock(return_value=[auto_balloon.Detection((100, 40, 150, 60), "diameter", .8)] if has_boxes else [])
     result = _run_page(tmp_path, detector, native=native)
     detector.detect.assert_called_once()
     if native:
@@ -131,3 +130,60 @@ def test_yolo_supplements_existing_detections(monkeypatch, tmp_path, native, has
         assert len(yolo) == 1
         assert yolo[0].char_type == "diameter"
     assert not result.message
+
+
+@pytest.mark.parametrize("rules_box,yolo_box,enabled,expected", [
+    ((40, 40, 100, 60), (40, 40, 100, 60), True, 1),
+    ((40, 40, 100, 60), (60, 40, 120, 60), True, 1),  # IoU exactly 0.5
+    ((40, 40, 100, 60), (61, 40, 121, 60), True, 2),  # below 0.5
+    ((40, 40, 100, 60), (95, 40, 155, 60), True, 2),  # nearby, slight overlap
+    ((40, 40, 100, 60), (102, 40, 162, 60), True, 2),  # nearby, separate
+    (None, (40, 40, 100, 60), True, 1),
+    ((40, 40, 100, 60), None, True, 1),
+    ((40, 40, 100, 60), (40, 40, 100, 60), False, 1),
+])
+def test_yolo_overlap_prefers_rules(monkeypatch, tmp_path, rules_box, yolo_box, enabled, expected,
+                                  yolo_type="linear_dimension"):
+    fallback = Mock(available=True)
+    fallback.detect.return_value = (
+        [auto_balloon.Detection(rules_box, "linear_dimension", .8, "12.50 \u00b10.10")]
+        if rules_box else []
+    )
+    monkeypatch.setattr(auto_balloon, "RulesOcrDetector", Mock(return_value=fallback))
+    detector = auto_balloon.YoloDetector.__new__(auto_balloon.YoloDetector)
+    detector.available = True
+    detector.detect = Mock(return_value=(
+        [auto_balloon.Detection(yolo_box, yolo_type, .95)] if yolo_box else []
+    ))
+    result = _run_page(tmp_path, detector if enabled else None)
+    assert len(result.balloons) == expected
+    rules = [b for b in result.balloons if b.model_version == RULES_OCR_MODEL_VERSION]
+    if rules_box:
+        assert len(rules) == 1
+        assert rules[0].raw_text == "12.50 \u00b10.10"
+        assert rules[0].nominal == 12.5
+        assert rules[0].tol_plus == .1
+        assert rules[0].char_type == "linear_dimension"
+    else:
+        assert result.balloons[0].model_version == "yolo"
+    if not enabled:
+        detector.detect.assert_not_called()
+
+
+@pytest.mark.parametrize("rules_box,yolo_box,yolo_type,expected", [
+    ((40, 40, 100, 60), (20, 20, 140, 80), "linear_dimension", 1),
+    ((20, 20, 140, 80), (40, 40, 100, 60), "linear_dimension", 1),
+    ((40, 40, 100, 60), (52, 20, 172, 80), "linear_dimension", 1),  # containment 0.80
+    ((40, 40, 100, 60), (53, 20, 173, 80), "linear_dimension", 2),  # below 0.80
+    ((40, 40, 100, 60), (95, 20, 215, 80), "linear_dimension", 2),
+    ((40, 40, 100, 60), (20, 20, 140, 80), "diameter", 2),
+    ((20, 20, 140, 80), (40, 40, 100, 60), "diameter", 2),
+    ((40, 40, 100, 60), (45, 40, 105, 60), "diameter", 2),  # IoU 0.846
+    ((40, 40, 100, 60), (40, 40, 94, 60), "diameter", 1),  # IoU 0.90
+    ((40, 40, 100, 60), (20, 20, 140, 80), "other", 1),
+    ((40, 40, 100, 60), (20, 20, 140, 80), "", 1),
+])
+def test_yolo_containment_and_type_compatibility(monkeypatch, tmp_path, rules_box, yolo_box,
+                                               yolo_type, expected):
+    test_yolo_overlap_prefers_rules(monkeypatch, tmp_path, rules_box, yolo_box, True, expected,
+                                  yolo_type=yolo_type)
