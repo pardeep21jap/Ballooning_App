@@ -93,24 +93,41 @@ def _run_page(tmp_path, detector, native=False):
         doc.close()
 
 
-def test_native_text_still_takes_priority(tmp_path):
-    detector = Mock(available=True)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_native_text_unchanged_without_available_yolo(tmp_path, enabled):
+    detector = auto_balloon.YoloDetector(tmp_path / "missing.pt") if enabled else None
     result = _run_page(tmp_path, detector, native=True)
-    detector.detect.assert_not_called()
+    assert len(result.balloons) == 1
     assert result.balloons[0].nominal == 12.5
     assert result.balloons[0].model_version == RULES_OCR_MODEL_VERSION
     assert not result.used_ocr
 
 
+@pytest.mark.parametrize("native", [False, True])
 @pytest.mark.parametrize("has_boxes", [False, True])
-def test_yolo_results_are_not_identified_as_ocr(tmp_path, has_boxes):
+def test_yolo_supplements_existing_detections(monkeypatch, tmp_path, native, has_boxes):
+    fallback = Mock(available=True)
+    # Deliberately overlapping boxes: combining detectors must not deduplicate.
+    fallback.detect.return_value = [auto_balloon.Detection((40, 40, 90, 60), "linear_dimension", .8, "12.50")]
+    factory = Mock(return_value=fallback)
+    monkeypatch.setattr(auto_balloon, "RulesOcrDetector", factory)
     detector = auto_balloon.YoloDetector.__new__(auto_balloon.YoloDetector)
     detector.available = True
     detector.detect = Mock(return_value=[auto_balloon.Detection((40, 40, 90, 60), "diameter", .8)] if has_boxes else [])
-    result = _run_page(tmp_path, detector)
-    assert not result.used_ocr
-    if has_boxes:
-        assert result.balloons[0].char_type == "diameter"
-        assert result.balloons[0].model_version == "yolo"
+    result = _run_page(tmp_path, detector, native=native)
+    detector.detect.assert_called_once()
+    if native:
+        factory.assert_not_called()
     else:
-        assert "YOLO" in result.message
+        fallback.detect.assert_called_once()
+    assert result.used_ocr is (not native)
+    assert len(result.balloons) == (2 if has_boxes else 1)
+    rules = [b for b in result.balloons if b.model_version == RULES_OCR_MODEL_VERSION]
+    assert len(rules) == 1
+    assert rules[0].nominal == 12.5
+    assert [b.number for b in result.balloons] == list(range(1, len(result.balloons) + 1))
+    if has_boxes:
+        yolo = [b for b in result.balloons if b.model_version == "yolo"]
+        assert len(yolo) == 1
+        assert yolo[0].char_type == "diameter"
+    assert not result.message

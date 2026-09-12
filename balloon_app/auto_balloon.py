@@ -1172,11 +1172,10 @@ def auto_balloon_page(
     message = ""
 
     if not candidates:
-        active_detector = detector or RulesOcrDetector(tesseract_path)
-        if isinstance(active_detector, YoloDetector) and not active_detector.available:
-            logger.warning("%s Falling back to rules/OCR.", active_detector.error)
-            active_detector = RulesOcrDetector(tesseract_path)
-        using_yolo = isinstance(active_detector, YoloDetector)
+        active_detector = (
+            RulesOcrDetector(tesseract_path) if isinstance(detector, YoloDetector)
+            else detector or RulesOcrDetector(tesseract_path)
+        )
         if not active_detector.available:
             ocr_available = False
             message = active_detector.error or (
@@ -1184,9 +1183,9 @@ def auto_balloon_page(
                 "Add balloons manually for this page."
             )
         elif rendered_image is None:
-            message = "Failed to render this page for YOLO." if using_yolo else "Failed to render this page for OCR."
+            message = "Failed to render this page for OCR."
         else:
-            used_ocr = not using_yolo
+            used_ocr = True
             raw_detections = active_detector.detect(rendered_image)
             for det in raw_detections:
                 # OCR boxes are inherently ink-backed (Tesseract only reports
@@ -1197,14 +1196,10 @@ def auto_balloon_page(
                 candidates.append(
                     Detection(
                         bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text,
-                        model_version="yolo" if using_yolo else RULES_OCR_MODEL_VERSION,
                     )
                 )
             if not raw_detections:
-                message = (
-                    "YOLO ran but found no candidate regions on this page." if using_yolo else
-                    "OCR ran but found no recognizable dimensions/tolerances on this page."
-                )
+                message = "OCR ran but found no recognizable dimensions/tolerances on this page."
 
     # Read symbols from the rendered ink as well as the text layer. This
     # covers CAD vector paths, unmapped fonts, and scanned feature frames.
@@ -1247,6 +1242,19 @@ def auto_balloon_page(
                 confidence=min(frame.confidence, 0.55 if any(not t for t in cell_texts)
                                else 0.75 if frame_used_ocr else 0.9),
                 raw_text=raw_text, gdt_frame_hint=True, gdt_symbol_hint=frame.symbol,
+            ))
+            if message == "OCR ran but found no recognizable dimensions/tolerances on this page.":
+                message = ""
+
+    # Supplement the completed native/OCR pass without merging its candidates.
+    if isinstance(detector, YoloDetector) and detector.available and rendered_image is not None:
+        for det in detector.detect(rendered_image):
+            bbox_pdf = rect_pixel_to_pdf(det.bbox, dpi)
+            if _bbox_in_regions(bbox_pdf, excluded_regions):
+                continue
+            candidates.append(Detection(
+                bbox=bbox_pdf, label=det.label, confidence=det.confidence,
+                raw_text=det.raw_text, model_version="yolo",
             ))
             if message == "OCR ran but found no recognizable dimensions/tolerances on this page.":
                 message = ""
