@@ -17,6 +17,8 @@ env/
 ## PyInstaller
 *.manifest
 *.spec.bak
+/_scratch/*-build*/
+/_scratch/*-dist*/
 
 ## Logs
 *.log
