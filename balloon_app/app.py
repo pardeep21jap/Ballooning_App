@@ -52,7 +52,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from balloon_app.auto_balloon import AutoBalloonResult, auto_balloon_page
+from balloon_app.auto_balloon import AutoBalloonResult, YoloDetector, auto_balloon_page
 from balloon_app.config import AppSettings, PROJECTS_DIR, resource_path, setup_logging, status_color
 from balloon_app.data_model import (
     Balloon,
@@ -361,14 +361,17 @@ def _auto_balloon_page_task(
     start_number: int, dpi: float, tesseract_path: Optional[str],
     default_tolerances: Optional[DefaultTolerances] = None,
     learned_symbols: Optional[dict[str, str]] = None,
+    use_yolo_if_available: bool = False,
+    yolo_model_path: str = "",
 ) -> AutoBalloonResult:
     doc = PdfDocument(source_path)
     doc.open()
     try:
+        detector = YoloDetector(yolo_model_path) if use_yolo_if_available else None
         return auto_balloon_page(
             doc, drawing_id, page_number, existing, start_number, dpi=dpi,
             tesseract_path=tesseract_path, default_tolerances=default_tolerances,
-            learned_symbols=learned_symbols,
+            learned_symbols=learned_symbols, detector=detector,
         )
     finally:
         doc.close()
@@ -379,18 +382,21 @@ def _auto_balloon_drawing_task(
     start_number: int, dpi: float, tesseract_path: Optional[str],
     default_tolerances: Optional[DefaultTolerances] = None,
     learned_symbols: Optional[dict[str, str]] = None,
+    use_yolo_if_available: bool = False,
+    yolo_model_path: str = "",
 ) -> list[AutoBalloonResult]:
     doc = PdfDocument(source_path)
     doc.open()
     results: list[AutoBalloonResult] = []
     try:
+        detector = YoloDetector(yolo_model_path) if use_yolo_if_available else None
         number = start_number
         running_existing = list(existing)
         for page_number in range(page_count):
             result = auto_balloon_page(
                 doc, drawing_id, page_number, running_existing, number, dpi=dpi,
                 tesseract_path=tesseract_path, default_tolerances=default_tolerances,
-                learned_symbols=learned_symbols,
+                learned_symbols=learned_symbols, detector=detector,
             )
             results.append(result)
             running_existing = running_existing + result.balloons
@@ -2125,6 +2131,7 @@ class MainWindow(QMainWindow):
             source_path, self.drawing.id, self.current_page, existing, start_number,
             self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(), default_tolerances,
             self.settings.learned_symbols,
+            self.settings.use_yolo_if_available, self.settings.yolo_model_path,
         )
 
     def _on_auto_balloon_page_done(self, result: AutoBalloonResult) -> None:
@@ -2163,6 +2170,7 @@ class MainWindow(QMainWindow):
             source_path, self.drawing.id, self.drawing.page_count, existing, start_number,
             self.settings.auto_balloon_dpi, self.settings.effective_tesseract_path(), default_tolerances,
             self.settings.learned_symbols,
+            self.settings.use_yolo_if_available, self.settings.yolo_model_path,
         )
 
     def _on_auto_balloon_drawing_done(self, results: list[AutoBalloonResult]) -> None:

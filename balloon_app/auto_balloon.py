@@ -390,6 +390,7 @@ class Detection:
     flatness_hint: bool = False
     depth_hint: bool = False
     gdt_symbol_hint: Optional[str] = None
+    model_version: str = RULES_OCR_MODEL_VERSION
 
 
 class BaseDetector(ABC):
@@ -511,7 +512,7 @@ class YoloDetector(BaseDetector):
         self.confidence_threshold = confidence_threshold
 
         model_path = Path(model_path)
-        if not model_path.exists():
+        if not model_path.is_file():
             self.error = f"YOLO model file not found: {model_path}"
             return
         try:
@@ -1172,6 +1173,10 @@ def auto_balloon_page(
 
     if not candidates:
         active_detector = detector or RulesOcrDetector(tesseract_path)
+        if isinstance(active_detector, YoloDetector) and not active_detector.available:
+            logger.warning("%s Falling back to rules/OCR.", active_detector.error)
+            active_detector = RulesOcrDetector(tesseract_path)
+        using_yolo = isinstance(active_detector, YoloDetector)
         if not active_detector.available:
             ocr_available = False
             message = active_detector.error or (
@@ -1179,9 +1184,9 @@ def auto_balloon_page(
                 "Add balloons manually for this page."
             )
         elif rendered_image is None:
-            message = "Failed to render this page for OCR."
+            message = "Failed to render this page for YOLO." if using_yolo else "Failed to render this page for OCR."
         else:
-            used_ocr = True
+            used_ocr = not using_yolo
             raw_detections = active_detector.detect(rendered_image)
             for det in raw_detections:
                 # OCR boxes are inherently ink-backed (Tesseract only reports
@@ -1190,10 +1195,16 @@ def auto_balloon_page(
                 if _bbox_in_regions(bbox_pdf, excluded_regions):
                     continue  # inside the title block -- never a real characteristic
                 candidates.append(
-                    Detection(bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text)
+                    Detection(
+                        bbox=bbox_pdf, label=det.label, confidence=det.confidence, raw_text=det.raw_text,
+                        model_version="yolo" if using_yolo else RULES_OCR_MODEL_VERSION,
+                    )
                 )
             if not raw_detections:
-                message = "OCR ran but found no recognizable dimensions/tolerances on this page."
+                message = (
+                    "YOLO ran but found no candidate regions on this page." if using_yolo else
+                    "OCR ran but found no recognizable dimensions/tolerances on this page."
+                )
 
     # Read symbols from the rendered ink as well as the text layer. This
     # covers CAD vector paths, unmapped fonts, and scanned feature frames.
@@ -1320,7 +1331,7 @@ def auto_balloon_page(
                 guessed_symbol_marker=parsed.guessed_symbol_marker if parsed else None,
                 note=(parsed.note if parsed else "") or ("Detected by ML model; please fill in details." if not raw_text else ""),
                 source=BalloonSource.AUTO.value,
-                model_version=RULES_OCR_MODEL_VERSION,
+                model_version=det.model_version,
                 confidence=round(max(0.0, min(1.0, confidence)), 3),
                 status=ReviewStatus.PENDING.value,
             )
