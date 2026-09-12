@@ -61,10 +61,33 @@ def test_save_and_load_roundtrip(tmp_path: Path, populated_project: Project):
     assert balloon.status == ReviewStatus.ACCEPTED.value
     assert balloon.original_prediction == {"char_type": "diameter", "nominal": 10.0}
     assert balloon.guessed_symbol_marker == "n"
+    assert balloon.source == "auto"
+    assert balloon.model_version == "rules_ocr_v1"  # Preserve legacy version strings.
 
     critical_balloon = next(b for b in loaded.balloons if b.number == 2)
     assert critical_balloon.critical is True
     assert critical_balloon.source == BalloonSource.MANUAL.value
+    assert critical_balloon.model_version is None
+
+
+@pytest.mark.parametrize("version", [None, "yolo", "rules_ocr_v2_gdt", "ballooniq_yolo_v1:custom.pt"])
+def test_provenance_roundtrip(tmp_path, populated_project, version):
+    populated_project.balloons[0].model_version = version
+    db = ProjectDatabase(tmp_path / "provenance.bpdb")
+    db.connect()
+    try:
+        db.save_project(populated_project)
+    finally:
+        db.close()
+    db = ProjectDatabase(tmp_path / "provenance.bpdb")
+    db.connect()
+    try:
+        loaded = db.load_project()
+    finally:
+        db.close()
+    balloon = next(b for b in loaded.balloons if b.number == 1)
+    assert balloon.model_version == version
+    assert balloon.source == "auto"
 
 
 def test_save_overwrites_previous_state(tmp_path: Path, populated_project: Project):

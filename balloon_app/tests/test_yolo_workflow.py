@@ -33,6 +33,28 @@ def test_actions_forward_yolo_settings(monkeypatch, whole_drawing, enabled):
     assert args[-2:] == (enabled, "custom.pt")
 
 
+def test_yolo_model_filename_provenance(monkeypatch, tmp_path):
+    import numpy as np
+
+    path = tmp_path / "ballooniq_custom_v3.pt"
+    path.touch()
+    box = SimpleNamespace(xyxy=np.array([[40, 40, 90, 60]]), cls=[1], conf=[.9])
+    model = Mock()
+    model.predict.return_value = [SimpleNamespace(boxes=[box])]
+    monkeypatch.setitem(sys.modules, "ultralytics", SimpleNamespace(YOLO=Mock(return_value=model)))
+    detector = auto_balloon.YoloDetector(path)
+    expected = "ballooniq_yolo_v1:ballooniq_custom_v3.pt"
+    detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))[0]
+    assert detection.model_version == expected
+    fallback = Mock(available=True)
+    fallback.detect.return_value = []
+    monkeypatch.setattr(auto_balloon, "RulesOcrDetector", Mock(return_value=fallback))
+    balloon = _run_page(tmp_path, detector).balloons[0]
+    assert balloon.source == "auto"
+    assert balloon.model_version == expected
+    assert balloon.original_prediction["model_version"] == expected
+
+
 @pytest.mark.parametrize("whole_drawing", [False, True])
 @pytest.mark.parametrize("enabled", [False, True])
 def test_workers_create_and_reuse_detector(monkeypatch, whole_drawing, enabled):
@@ -126,7 +148,7 @@ def test_yolo_supplements_existing_detections(monkeypatch, tmp_path, native, has
     assert rules[0].nominal == 12.5
     assert [b.number for b in result.balloons] == list(range(1, len(result.balloons) + 1))
     if has_boxes:
-        yolo = [b for b in result.balloons if b.model_version == "yolo"]
+        yolo = [b for b in result.balloons if b.model_version == "ballooniq_yolo_v1"]
         assert len(yolo) == 1
         assert yolo[0].char_type == "diameter"
     assert not result.message
@@ -165,7 +187,7 @@ def test_yolo_overlap_prefers_rules(monkeypatch, tmp_path, rules_box, yolo_box, 
         assert rules[0].tol_plus == .1
         assert rules[0].char_type == "linear_dimension"
     else:
-        assert result.balloons[0].model_version == "yolo"
+        assert result.balloons[0].model_version == "ballooniq_yolo_v1"
     if not enabled:
         detector.detect.assert_not_called()
 

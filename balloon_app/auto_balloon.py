@@ -505,6 +505,8 @@ class YoloDetector(BaseDetector):
     casing.
     """
 
+    model_version = "ballooniq_yolo_v1"
+
     def __init__(self, model_path: Path | str, confidence_threshold: float = 0.25):
         self.available = False
         self.error = None
@@ -512,6 +514,7 @@ class YoloDetector(BaseDetector):
         self.confidence_threshold = confidence_threshold
 
         model_path = Path(model_path)
+        self.model_version = f"ballooniq_yolo_v1:{model_path.name}" if model_path.name else "ballooniq_yolo_v1"
         if not model_path.is_file():
             self.error = f"YOLO model file not found: {model_path}"
             return
@@ -554,7 +557,10 @@ class YoloDetector(BaseDetector):
                     if 0 <= cls_id < len(CHARACTERISTIC_CLASSES)
                     else CharacteristicType.OTHER.value
                 )
-                detections.append(Detection(bbox=tuple(xyxy), label=label, confidence=conf, raw_text=None))
+                detections.append(Detection(
+                    bbox=tuple(xyxy), label=label, confidence=conf, raw_text=None,
+                    model_version=self.model_version,
+                ))
         return detections
 
 
@@ -1275,7 +1281,7 @@ def auto_balloon_page(
                 continue
             yolo_candidate = Detection(
                 bbox=bbox_pdf, label=det.label, confidence=det.confidence,
-                raw_text=det.raw_text, model_version="yolo",
+                raw_text=det.raw_text, model_version=detector.model_version,
             )
             if any(_duplicate_detection(yolo_candidate, candidate) for candidate in rules_candidates):
                 continue
